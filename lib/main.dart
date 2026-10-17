@@ -1,0 +1,133 @@
+import 'package:flutter/material.dart';
+
+import 'gateway/service.dart';
+import 'pages.dart';
+
+void main() {
+  final service = GatewayService();
+  service.start();
+  runApp(ZeroApiApp(service));
+}
+
+class ZeroApiApp extends StatelessWidget {
+  final GatewayService service;
+  const ZeroApiApp(this.service, {super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'ZeroApi',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        fontFamily: 'LXGWWenKaiLite',
+        colorSchemeSeed: const Color(0xFF4F6BED),
+        brightness: Brightness.light,
+      ),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        fontFamily: 'LXGWWenKaiLite',
+        colorSchemeSeed: const Color(0xFF4F6BED),
+        brightness: Brightness.dark,
+      ),
+      themeMode: ThemeMode.system,
+      home: HomePage(service: service),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  final GatewayService service;
+  const HomePage({super.key, required this.service});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  int _index = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.service;
+    return AnimatedBuilder(
+      animation: s,
+      builder: (context, _) {
+        final cs = Theme.of(context).colorScheme;
+        final pages = [
+          UpstreamsPage(service: s),
+          ModelsPage(service: s),
+          UsagePage(service: s),
+          SettingsPage(service: s),
+        ];
+        return Scaffold(
+          appBar: AppBar(
+            title: Row(
+              children: [
+                const Text('ZeroApi',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(width: 12),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color:
+                        s.running ? cs.secondaryContainer : cs.errorContainer,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(children: [
+                    Icon(s.running ? Icons.check_circle : Icons.error,
+                        size: 14,
+                        color: s.running ? Colors.green : cs.error),
+                    const SizedBox(width: 6),
+                    Text(s.running ? '网关运行中' : '未运行',
+                        style: const TextStyle(fontSize: 12)),
+                  ]),
+                ),
+              ],
+            ),
+            actions: [
+              IconButton(
+                tooltip: '立即刷新供应商与路由',
+                icon: const Icon(Icons.refresh),
+                onPressed: () => s.refreshRoutesNow(),
+              ),
+              const SizedBox(width: 8),
+            ],
+          ),
+          body: Row(
+            children: [
+              NavigationRail(
+                selectedIndex: _index,
+                onDestinationSelected: (i) => setState(() => _index = i),
+                labelType: NavigationRailLabelType.all,
+                extended: MediaQuery.of(context).size.width > 900,
+                minExtendedWidth: 150,
+                destinations: const [
+                  NavigationRailDestination(
+                      icon: Icon(Icons.dns_outlined),
+                      selectedIcon: Icon(Icons.dns),
+                      label: Text('供应商')),
+                  NavigationRailDestination(
+                      icon: Icon(Icons.view_list_outlined),
+                      selectedIcon: Icon(Icons.view_list),
+                      label: Text('模型')),
+                  NavigationRailDestination(
+                      icon: Icon(Icons.query_stats_outlined),
+                      selectedIcon: Icon(Icons.query_stats),
+                      label: Text('用量')),
+                  NavigationRailDestination(
+                      icon: Icon(Icons.settings_outlined),
+                      selectedIcon: Icon(Icons.settings),
+                      label: Text('设置')),
+                ],
+              ),
+              const VerticalDivider(width: 1),
+              Expanded(child: pages[_index]),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
