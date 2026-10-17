@@ -16,7 +16,14 @@ param(
 $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")
 
-$winArch = if ("$env:PROCESSOR_ARCHITECTURE$env:PROCESSOR_ARCHITEW6432" -match "ARM") { "arm64" } else { "x64" }
+# 版本号单一来源：lib/version.dart
+$appVersion = (Select-String -Path "lib\version.dart" -Pattern "kAppVersion = '([^']+)'" | Select-Object -First 1).Matches[0].Groups[1].Value
+if (-not $appVersion) { $appVersion = "0.0.0" }
+Write-Host "版本: $appVersion" -ForegroundColor Cyan
+
+# 真实硬件架构（环境变量在 ARM Windows 的 x64 模拟层下会误报 AMD64）
+$winArch = if ((Get-CimInstance Win32_Processor).Architecture -eq 12) { "arm64" } elseif ("$env:PROCESSOR_ARCHITECTURE$env:PROCESSOR_ARCHITEW6432" -match "ARM") { "arm64" } else { "x64" }
+Write-Host "构建主机架构: $winArch"
 
 $Matrix = [ordered]@{
   "windows"       = @{ Cmd = @("flutter","build","windows","--release"); Host = "win"; Out = "build\windows\$winArch\runner\Release" }
@@ -86,9 +93,9 @@ foreach ($p in $Platforms) {
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
       if ($iscc) {
-        & $iscc "/DMyArch=$arch" "/DMyVersion=1.0.0" "packaging\zeroapi.iss"
+        & $iscc "/DMyArch=$arch" "/DMyVersion=$appVersion" "packaging\zeroapi.iss"
         if ($LASTEXITCODE -eq 0) {
-          Write-Host "  安装包: installer\zeroapi-setup-$arch-1.0.0.exe" -ForegroundColor Green
+          Write-Host "  安装包: installer\zeroapi-setup-$arch-$appVersion.exe" -ForegroundColor Green
         } else { $failed += "$p-installer" }
       } else {
         Write-Host "  未找到 ISCC.exe（Inno Setup），跳过安装包" -ForegroundColor Yellow

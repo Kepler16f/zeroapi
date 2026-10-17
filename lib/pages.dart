@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../gateway/config.dart';
+import '../gateway/proxy.dart';
 import '../gateway/service.dart';
 import '../gateway/upstream.dart';
+import '../version.dart';
 
 // ---------------- 供应商页 ----------------
 
@@ -76,9 +78,22 @@ class _UpstreamCard extends StatelessWidget {
               children: [
                 Icon(Icons.circle, size: 10, color: healthColor),
                 const SizedBox(width: 8),
-                Text(d.id,
+                Flexible(
+                  child: Text(
+                    d.label.isNotEmpty ? d.label : d.id,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.bold)),
+                        fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                if (d.label.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  Text('id: ${d.id}',
+                      style: TextStyle(
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                          color: cs.onSurfaceVariant)),
+                ],
                 const SizedBox(width: 8),
                 Chip(
                   label: Text(d.type == 'managed' ? '托管' : '远端',
@@ -105,12 +120,6 @@ class _UpstreamCard extends StatelessWidget {
                 ),
               ],
             ),
-            if (d.label.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text(d.label,
-                    style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13)),
-              ),
             const SizedBox(height: 6),
             Text(d.baseUrl,
                 style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
@@ -298,57 +307,184 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
 
 // ---------------- 模型页 ----------------
 
-class ModelsPage extends StatelessWidget {
+class ModelsPage extends StatefulWidget {
   final GatewayService service;
   const ModelsPage({super.key, required this.service});
 
   @override
+  State<ModelsPage> createState() => _ModelsPageState();
+}
+
+class _ModelsPageState extends State<ModelsPage> {
+  /// false = 按模型聚合（默认）；true = 按来源聚合
+  bool _bySource = false;
+
+  static String _fmtCtx(int? n) {
+    if (n == null) return '';
+    if (n >= 1048576 && n % 1048576 == 0) return '${n ~/ 1048576}M';
+    if (n >= 1024) return '${(n / 1024).toStringAsFixed(n % 1024 == 0 ? 0 : 1)}K';
+    return '$n';
+  }
+
+  /// 去重：同一模型在路由表里有 `id/model` 与裸名两条，只展示一条
+  List<ModelRoute> _uniqueModels() {
+    final seen = <String>{};
+    final out = <ModelRoute>[];
+    final routes = widget.service.registry.all.toList()
+      ..sort((a, b) => a.upstreamModel.compareTo(b.upstreamModel));
+    for (final r in routes) {
+      if (seen.add('${r.upstream.id}|${r.upstreamModel}')) out.add(r);
+    }
+    return out;
+  }
+
+  Widget _capChips(ModelRoute r) {
+    final info = r.upstream.modelInfo[r.upstreamModel];
+    final tags = <String>[
+      if (info?.contextWindow != null) '上下文 ${_fmtCtx(info!.contextWindow)}',
+      if (info?.maxOutputTokens != null) '输出 ${_fmtCtx(info!.maxOutputTokens)}',
+      if (info?.inputModalities.contains('image') ?? false) '视觉',
+      if (info?.inputModalities.contains('audio') ?? false) '音频',
+      if (info?.inputModalities.contains('video') ?? false) '视频',
+      if (info?.inputModalities.contains('pdf') ?? false) 'PDF',
+      if (info?.reasoning ?? false) '推理',
+      if (info?.toolCall ?? false) '工具调用',
+      if (info?.structuredOutput ?? false) '结构化输出',
+      if (info?.free ?? false) '免费',
+    ];
+    if (tags.isEmpty) return const SizedBox.shrink();
+    return Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      children: [
+        for (final t in tags)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(t, style: const TextStyle(fontSize: 10.5)),
+          ),
+      ],
+    );
+  }
+
+  Widget _tile(ModelRoute r, {bool showAlias = true}) {
+    final info = r.upstream.modelInfo[r.upstreamModel];
+    final alias = r.bare ? '${r.upstream.id}/${r.upstreamModel}' : (widget.service.registry.resolve(r.upstreamModel) != null ? r.upstreamModel : null);
+    return ListTile(
+      dense: true,
+      leading: Icon(
+          Icons.circle,
+          size: 10,
+          color: r.upstream.health == UpstreamHealth.healthy
+              ? Colors.green
+              : Colors.grey),
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            info?.displayName != null && info!.displayName != r.upstreamModel
+                ? '${r.publicName}  · ${info.displayName}'
+                : r.publicName,
+            style: const TextStyle(
+                fontFamily: 'monospace', fontSize: 13.5)),
+          const SizedBox(height: 3),
+          _capChips(r),
+        ],
+      ),
+      subtitle: (showAlias && alias != null)
+          ? Text('别名可直用：$alias', style: const TextStyle(fontSize: 11))
+          : null,
+      trailing: IconButton(
+        icon: const Icon(Icons.copy, size: 16),
+        tooltip: '复制模型名',
+        onPressed: () {
+          Clipboard.setData(ClipboardData(text: r.publicName));
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('已复制 ${r.publicName}'),
+              duration: const Duration(milliseconds: 800)));
+        },
+      ),
+      onLongPress: () {
+        Clipboard.setData(ClipboardData(text: r.publicName));
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('已复制'), duration: Duration(milliseconds: 600)));
+      },
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final service = widget.service;
     return AnimatedBuilder(
       animation: service,
       builder: (context, _) {
-        final routes = service.registry.all
-          ..sort((a, b) => a.upstream.id.compareTo(b.upstream.id));
-        if (routes.isEmpty) {
-          return const Center(
-              child: Text('暂无模型 — 供应商未就绪或未启用，稍候自动刷新',
-                  style: TextStyle(color: Colors.grey)));
-        }
-        return ListView.builder(
-          padding: const EdgeInsets.all(8),
-          itemCount: routes.length,
-          itemBuilder: (context, i) {
-            final r = routes[i];
-            return ListTile(
-              dense: true,
-              leading: Icon(
-                  r.bare ? Icons.circle : Icons.circle_outlined,
-                  size: 10,
-                  color: r.upstream.health == UpstreamHealth.healthy
-                      ? Colors.green
-                      : Colors.grey),
-              title: Text(r.publicName,
-                  style: const TextStyle(
-                      fontFamily: 'monospace', fontSize: 13.5)),
-              subtitle: Text(
-                  '← ${r.upstream.id} / ${r.upstreamModel}',
-                  style: const TextStyle(fontSize: 11.5)),
-              trailing: IconButton(
-                icon: const Icon(Icons.copy, size: 16),
-                tooltip: '复制模型名',
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: r.publicName));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('已复制 ${r.publicName}'), duration: const Duration(milliseconds: 800)));
-                },
+        final routes = _uniqueModels();
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 2),
+              child: Row(
+                children: [
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('按模型')),
+                      ButtonSegment(value: true, label: Text('按来源')),
+                    ],
+                    selected: {_bySource},
+                    onSelectionChanged: (s) =>
+                        setState(() => _bySource = s.first),
+                  ),
+                  const Spacer(),
+                  Text('${routes.length} 个模型',
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                ],
               ),
-              onLongPress: () {
-                Clipboard.setData(ClipboardData(text: r.publicName));
-                ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('已复制'), duration: Duration(milliseconds: 600)));
-              },
-            );
-          },
+            ),
+            Expanded(
+              child: routes.isEmpty
+                  ? const Center(
+                      child: Text('暂无模型 — 供应商未就绪或未启用，稍候自动刷新',
+                          style: TextStyle(color: Colors.grey)))
+                  : !_bySource
+                      ? ListView.builder(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          itemCount: routes.length,
+                          itemBuilder: (context, i) => _tile(routes[i]),
+                        )
+                      : ListView(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          children: [
+                            for (final u in service.upstreams
+                                .where((u) => u.def.enabled)) ...[
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
+                                child: Row(children: [
+                                  Text(
+                                      u.def.label.isNotEmpty ? u.def.label : u.id,
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.bold)),
+                                  const SizedBox(width: 8),
+                                  Text('id: ${u.id}',
+                                      style: const TextStyle(
+                                          fontSize: 11, fontFamily: 'monospace')),
+                                  const Spacer(),
+                                  Text('${u.models.length} 个',
+                                      style: const TextStyle(fontSize: 11)),
+                                ]),
+                              ),
+                              const Divider(height: 1, indent: 14, endIndent: 14),
+                              for (final r in routes.where((r) => r.upstream.id == u.id))
+                                _tile(r),
+                            ],
+                          ],
+                        ),
+            ),
+          ],
         );
       },
     );
@@ -468,6 +604,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController apiKey =
       TextEditingController(text: widget.service.config.apiKey);
   bool _obscure = true;
+  String _protocol = 'openai';
 
   @override
   Widget build(BuildContext context) {
@@ -476,10 +613,11 @@ class _SettingsPageState extends State<SettingsPage> {
       animation: s,
       builder: (context, _) {
         final cs = Theme.of(context).colorScheme;
+        final anthropicOn = s.config.anthropicEnabled;
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            const Text('网关接入信息（任何 OpenAI 客户端填这两项即可）',
+            const Text('网关接入信息',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Card(
@@ -488,10 +626,35 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    SegmentedButton<String>(
+                      segments: [
+                        const ButtonSegment(
+                            value: 'openai', label: Text('OpenAI 格式')),
+                        ButtonSegment(
+                            value: 'anthropic',
+                            label: Text(anthropicOn
+                                ? 'Anthropic 格式'
+                                : 'Anthropic 格式（已关闭）'),
+                            enabled: anthropicOn),
+                      ],
+                      selected: {_protocol},
+                      onSelectionChanged: (sel) =>
+                          setState(() => _protocol = sel.first),
+                    ),
+                    const SizedBox(height: 10),
                     SelectableText(
-                      'Base URL  http://${s.config.host}:${s.config.port}/v1',
+                      'Base URL  http://${s.config.host}:${s.config.port}${_protocol == 'anthropic' ? '' : '/v1'}',
                       style: const TextStyle(fontFamily: 'monospace'),
                     ),
+                    if (_protocol == 'anthropic')
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          'Claude Code 等 Anthropic 客户端设 ANTHROPIC_BASE_URL=http://${s.config.host}:${s.config.port} 即可，对话端点为 /v1/messages',
+                          style: TextStyle(
+                              fontSize: 11.5, color: cs.onSurfaceVariant),
+                        ),
+                      ),
                     const SizedBox(height: 6),
                     Row(children: [
                       Expanded(
@@ -559,6 +722,36 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ]),
             const SizedBox(height: 24),
+            const Text('外观', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'system', label: Text('跟随系统'), icon: Icon(Icons.brightness_auto)),
+                ButtonSegment(value: 'light', label: Text('浅色'), icon: Icon(Icons.light_mode_outlined)),
+                ButtonSegment(value: 'dark', label: Text('深色'), icon: Icon(Icons.dark_mode_outlined)),
+              ],
+              selected: {s.config.themeMode},
+              onSelectionChanged: (sel) => s.setThemeMode(sel.first),
+            ),
+            const SizedBox(height: 24),
+            const Text('协议适配', style: TextStyle(fontWeight: FontWeight.bold)),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Anthropic 格式接口',
+                  style: TextStyle(fontSize: 14)),
+              subtitle: Text(
+                '暴露 /v1/messages，自动与 OpenAI 格式互相转换，供 Claude Code 等客户端接入',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+              value: anthropicOn,
+              onChanged: (v) async {
+                await s.setAnthropicEnabled(v);
+                if (!v && _protocol == 'anthropic') {
+                  if (context.mounted) setState(() => _protocol = 'openai');
+                }
+              },
+            ),
+            const SizedBox(height: 8),
             Text('配置文件', style: TextStyle(color: cs.onSurfaceVariant)),
             const SizedBox(height: 4),
             SelectableText(_configPath(),
@@ -567,10 +760,13 @@ class _SettingsPageState extends State<SettingsPage> {
             const Text('关于',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 4),
+            Text('版本 $kAppVersion',
+                style: const TextStyle(fontFamily: 'monospace')),
+            const SizedBox(height: 4),
             Text(
-              'ZeroApi — 零汇聚合网关。把多个 OpenAI 兼容供应商（Opencode Zen Free、'
-              'Qoder2API-Hub、niceboat…）聚合为一个统一入口；托管型供应商由本应用'
-              '负责拉起与守护。模型命名：供应商id/模型名；跨供应商不重名时可直接用裸名。',
+              'ZeroApi — 零汇聚合网关。把多个 OpenAI 兼容供应商聚合为一个统一入口；'
+              '托管型供应商由本应用负责拉起与守护。'
+              '模型命名：供应商id/模型名；跨供应商不重名时可直接用裸名。',
               style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
             ),
           ],

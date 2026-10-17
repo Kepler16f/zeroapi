@@ -52,12 +52,18 @@ class GatewayConfig {
   int port;
   String apiKey;
   List<UpstreamDef> upstreams;
+  /// system | light | dark
+  String themeMode;
+  /// 网关是否暴露 /v1/messages（Anthropic 格式适配）
+  bool anthropicEnabled;
 
   GatewayConfig({
     this.host = '127.0.0.1',
     this.port = 8123,
     required this.apiKey,
     this.upstreams = const [],
+    this.themeMode = 'system',
+    this.anthropicEnabled = true,
   });
 
   static File _file() {
@@ -101,11 +107,14 @@ class GatewayConfig {
       cfg.host = (g['host'] ?? cfg.host) as String;
       cfg.port = (g['port'] ?? cfg.port) as int;
       cfg.apiKey = (g['apiKey'] ?? 'sk-pg-${_rand()}') as String;
+      cfg.themeMode = (g['themeMode'] ?? cfg.themeMode) as String;
+      cfg.anthropicEnabled = (g['anthropicEnabled'] ?? cfg.anthropicEnabled) as bool;
       cfg.upstreams = ((j['upstreams'] ?? []) as List)
           .map((e) => UpstreamDef.fromJson(e as Map<String, dynamic>))
           .toList();
       for (final u in cfg.upstreams) {
         _resolvePlaceholders(u);
+        _normalizeZenLabel(u);
       }
       if (cfg.upstreams.isEmpty) cfg.upstreams = [defaultZengate()];
     } catch (_) {
@@ -118,9 +127,23 @@ class GatewayConfig {
   void save() {
     _file().writeAsStringSync(
         const JsonEncoder.withIndent('  ').convert({
-      'gateway': {'host': host, 'port': port, 'apiKey': apiKey},
+      'gateway': {
+        'host': host,
+        'port': port,
+        'apiKey': apiKey,
+        'themeMode': themeMode,
+        'anthropicEnabled': anthropicEnabled,
+      },
       'upstreams': upstreams.map((u) => u.toJson()).toList(),
     }));
+  }
+
+  /// 存量配置里的旧显示名统一为 OpenCode Zen Free（大小写不敏感匹配 opencode zen）
+  static void _normalizeZenLabel(UpstreamDef u) {
+    final l = u.label.toLowerCase();
+    if (u.id == 'zen' && l.contains('opencode') && l.contains('zen')) {
+      u.label = 'OpenCode Zen Free';
+    }
   }
 
   /// 默认供应商：本机 zengate（npm 全局安装检测），开箱即用
@@ -128,7 +151,7 @@ class GatewayConfig {
     final u = UpstreamDef(
       id: 'zen',
       type: 'remote',
-      label: 'Opencode Zen Free',
+      label: 'OpenCode Zen Free',
       baseUrl: 'http://127.0.0.1:8083/v1',
       apiKey: '',
     );

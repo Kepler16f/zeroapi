@@ -15,23 +15,30 @@ class ZeroApiApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'ZeroApi',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        fontFamily: 'LXGWWenKaiLite',
-        colorSchemeSeed: const Color(0xFF4F6BED),
-        brightness: Brightness.light,
+    return AnimatedBuilder(
+      animation: service,
+      builder: (context, _) => MaterialApp(
+        title: 'ZeroApi',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          useMaterial3: true,
+          fontFamily: 'LXGWWenKaiLite',
+          colorSchemeSeed: const Color(0xFF4F6BED),
+          brightness: Brightness.light,
+        ),
+        darkTheme: ThemeData(
+          useMaterial3: true,
+          fontFamily: 'LXGWWenKaiLite',
+          colorSchemeSeed: const Color(0xFF4F6BED),
+          brightness: Brightness.dark,
+        ),
+        themeMode: switch (service.config.themeMode) {
+          'light' => ThemeMode.light,
+          'dark' => ThemeMode.dark,
+          _ => ThemeMode.system,
+        },
+        home: HomePage(service: service),
       ),
-      darkTheme: ThemeData(
-        useMaterial3: true,
-        fontFamily: 'LXGWWenKaiLite',
-        colorSchemeSeed: const Color(0xFF4F6BED),
-        brightness: Brightness.dark,
-      ),
-      themeMode: ThemeMode.system,
-      home: HomePage(service: service),
     );
   }
 }

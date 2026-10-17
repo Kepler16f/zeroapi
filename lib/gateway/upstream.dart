@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'config.dart';
+import 'modelsdev.dart';
 
 enum UpstreamHealth { unknown, checking, healthy, down }
 
@@ -11,6 +12,8 @@ class UpstreamRuntime {
   final UpstreamDef def;
   UpstreamHealth health = UpstreamHealth.unknown;
   List<String> models = [];
+  /// 模型能力元数据（上游 /v1/models 条目 + models.dev 目录合并）
+  final Map<String, ModelInfo> modelInfo = {};
   String? lastError;
   Process? child;
   int requests = 0, promptTokens = 0, completionTokens = 0, errors = 0;
@@ -42,10 +45,18 @@ class UpstreamRuntime {
       if (resp.statusCode != 200) throw HttpException('HTTP ${resp.statusCode}');
       final j = jsonDecode(body) as Map<String, dynamic>;
       final data = (j['data'] as List?) ?? const [];
-      models = data
-          .map((m) => (m as Map<String, dynamic>)['id'])
-          .whereType<String>()
+      final entries = data
+          .map((m) => m as Map<String, dynamic>)
+          .where((m) => m['id'] is String)
           .toList();
+      models = entries.map((m) => m['id'] as String).toList();
+      // 元数据 = 上游条目自带字段（若有，优先） + models.dev 目录（兜底补充）
+      modelInfo.clear();
+      for (final e in entries) {
+        final id = e['id'] as String;
+        modelInfo[id] = ModelInfo.fromMaps(
+            e, ModelsDev.instance.lookup((e['owned_by'] ?? def.id) as String?, id));
+      }
       health = UpstreamHealth.healthy;
       lastError = null;
       _backoffMs = 1000;

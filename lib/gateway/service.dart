@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'config.dart';
+import 'modelsdev.dart';
 import 'proxy.dart';
 import 'upstream.dart';
 
@@ -21,13 +22,20 @@ class GatewayService extends ChangeNotifier {
   Future<void> start() async {
     if (running) return;
     startError = null;
+    ModelsDev.instance.onUpdated = () {
+      for (final u in _runtimes) {
+        if (u.def.enabled) unawaited(u.probe().then((_) => registry.rebuild(_runtimes)).then((_) => notifyListeners()));
+      }
+    };
+    unawaited(ModelsDev.instance.start());
     _runtimes.clear();
     for (final def in config.upstreams) {
       final rt = UpstreamRuntime(def);
       _runtimes.add(rt);
       rt.startPeriodicProbe();
     }
-    server = ProxyServer(config.host, config.port, config.apiKey, registry);
+    server = ProxyServer(config.host, config.port, config.apiKey, registry,
+        anthropicEnabled: config.anthropicEnabled);
     try {
       await server!.start();
       running = true;
@@ -141,8 +149,21 @@ class GatewayService extends ChangeNotifier {
     unawaited(restartServer());
   }
 
+  void setThemeMode(String mode) {
+    config.themeMode = mode;
+    config.save();
+    notifyListeners();
+  }
+
+  Future<void> setAnthropicEnabled(bool enabled) async {
+    config.anthropicEnabled = enabled;
+    config.save();
+    await restartServer();
+  }
+
   @override
   void dispose() {
+    ModelsDev.instance.stop();
     _refreshTimer?.cancel();
     for (final u in _runtimes) {
       u.stop();

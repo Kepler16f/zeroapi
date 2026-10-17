@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'anthropic.dart';
+import 'modelsdev.dart';
 import 'upstream.dart';
 
 class ModelRoute {
@@ -61,6 +63,7 @@ class ProxyServer {
   final int port;
   final String apiKey;
   final ModelRegistry registry;
+  final bool anthropicEnabled;
   final UsageStats usageToday = UsageStats();
   HttpServer? _server;
   IOSink? _usageSink;
@@ -71,7 +74,8 @@ class ProxyServer {
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
   }
 
-  ProxyServer(this.host, this.port, this.apiKey, this.registry);
+  ProxyServer(this.host, this.port, this.apiKey, this.registry,
+      {this.anthropicEnabled = true});
 
   List<String> get logs => List.unmodifiable(_logLines);
 
@@ -94,7 +98,8 @@ class ProxyServer {
     try {
       req.response.headers
         ..set('Access-Control-Allow-Origin', '*')
-        ..set('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+        ..set('Access-Control-Allow-Headers',
+            'Authorization, Content-Type, X-Api-Key, Anthropic-Version')
         ..set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       if (req.method == 'OPTIONS') {
         req.response.statusCode = 204;
@@ -116,7 +121,10 @@ class ProxyServer {
       }
 
       final auth = req.headers.value('authorization') ?? '';
-      if (auth != 'Bearer $apiKey') {
+      final xkey = req.headers.value('x-api-key') ?? '';
+      // Anthropic 系客户端（Claude Code/SDK）默认带 anthropic-version + x-api-key，
+      // 两种头任一匹配即可
+      if (auth != 'Bearer $apiKey' && xkey != apiKey) {
         return _json(req, {'error': {'message': '无效的网关 API key'}}, 401);
       }
 
@@ -124,17 +132,23 @@ class ProxyServer {
         return _json(req, {
           'object': 'list',
           'data': registry.all
-              .map((r) => {
-                    'id': r.publicName,
-                    'object': 'model',
-                    'created': 0,
-                    'owned_by': r.upstream.id,
-                    'zeroapi': {
-                      'bare': r.bare,
-                      'upstream_model': r.upstreamModel,
-                      'healthy': r.upstream.health == UpstreamHealth.healthy,
-                    },
-                  })
+              .map((r) {
+                final info = r.upstream.modelInfo[r.upstreamModel] ??
+                    ModelInfo.fromMaps({},
+                        ModelsDev.instance.lookup(r.upstream.def.id, r.upstreamModel));
+                return {
+                  'id': r.publicName,
+                  'object': 'model',
+                  'created': 0,
+                  'owned_by': r.upstream.id,
+                  'zeroapi': {
+                    'bare': r.bare,
+                    'upstream_model': r.upstreamModel,
+                    'healthy': r.upstream.health == UpstreamHealth.healthy,
+                    ...info.toJson(),
+                  },
+                };
+              })
               .toList(),
         });
       }
@@ -146,6 +160,17 @@ class ProxyServer {
 
       if (path == '/v1/responses' && req.method == 'POST') {
         await _responses(req);
+        return;
+      }
+
+      if (path == '/v1/messages' && req.method == 'POST') {
+        if (!anthropicEnabled) {
+          return _json(req, {
+            'type': 'error',
+            'error': {'type': 'not_found_error', 'message': 'Anthropic 适配已在设置中关闭'}
+          }, 404);
+        }
+        await _messages(req);
         return;
       }
 
@@ -170,28 +195,21 @@ class ProxyServer {
 
   /// 解析模型路由并确保供应商可用；失败时写回 404/503 并返回 null
   Future<ModelRoute?> _resolveRoute(
-      Map<String, dynamic> body, HttpRequest req) async {
+      Map<String, dynamic> body, HttpRequest req, {bool anthropicErrors = false}) async {
     final publicName = (body['model'] ?? '') as String;
     final route = registry.resolve(publicName);
+    void fail(String msg, String openaiType, String anthropicType, int status) => anthropicErrors
+        ? _json(req, {'type': 'error', 'error': {'message': msg, 'type': anthropicType}}, status)
+        : _json(req, {'error': {'message': msg, 'type': openaiType}}, status);
     if (route == null) {
-      _json(req, {
-        'error': {'message': '未知模型 $publicName，见 GET /v1/models', 'type': 'unknown_model'}
-      }, 404);
+      fail('未知模型 $publicName，见 GET /v1/models', 'unknown_model', 'not_found_error', 404);
       return null;
     }
     final u = route.upstream;
     if (u.health != UpstreamHealth.healthy) {
       final ok = await u.probe();
       if (!ok) {
-        _json(
-            req,
-            {
-              'error': {
-                'message': '供应商 ${u.id} 不可用: ${u.lastError ?? "未知"}',
-                'type': 'upstream_down'
-              }
-            },
-            503);
+        fail('供应商 ${u.id} 不可用: ${u.lastError ?? "未知"}', 'upstream_down', 'overloaded_error', 503);
         return null;
       }
     }
@@ -220,6 +238,21 @@ class ProxyServer {
         isStream: body['stream'] == true, responsesApi: true);
   }
 
+  /// Anthropic Messages API（/v1/messages）适配：请求体翻译成 OpenAI 格式
+  /// 走上游 chat/completions，响应/SSE 再翻译回 Anthropic 事件格式。
+  Future<void> _messages(HttpRequest req) async {
+    final aBody = await _readJson(req);
+    if (aBody == null) return;
+    final publicName = (aBody['model'] ?? '') as String;
+    final route = await _resolveRoute(aBody, req, anthropicErrors: true);
+    if (route == null) return;
+    final isStream = aBody['stream'] == true;
+    final oai = AnthropicAdapter.toOpenAIRequest(aBody);
+    if (isStream) oai['stream_options'] = {'include_usage': true};
+    await _forward(req, route, publicName, 'chat/completions', oai,
+        isStream: isStream, anthropic: true);
+  }
+
   Future<void> _forward(
     HttpRequest req,
     ModelRoute route,
@@ -228,10 +261,18 @@ class ProxyServer {
     Map<String, dynamic> body, {
     required bool isStream,
     bool responsesApi = false,
+    bool anthropic = false,
   }) async {
     final u = route.upstream;
     body['model'] = route.upstreamModel;
-    final tag = responsesApi ? ' [responses]' : '';
+    final tag = responsesApi
+        ? ' [responses]'
+        : anthropic
+            ? ' [anthropic]'
+            : '';
+    void failJson(Map<String, dynamic> err, int status) => anthropic
+        ? _json(req, {'type': 'error', 'error': err}, status)
+        : _json(req, {'error': err}, status);
 
     final HttpClient client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15);
@@ -252,12 +293,58 @@ class ProxyServer {
         _log('$publicName ← 供应商 ${u.id} HTTP ${uresp.statusCode}');
         usageToday.add(publicName, 0, 0, true);
         _usageLine(publicName, u.id, 0, 0, true);
-        return _json(req, err.isNotEmpty ? _safeJson(err) : {
-          'error': {'message': '供应商 ${u.id} HTTP ${uresp.statusCode}'}
-        }, uresp.statusCode);
+        final parsed = err.isNotEmpty ? _safeJson(err) : null;
+        final errMsg = (parsed?['error']?['message'] ??
+            parsed?['message'] ??
+            '供应商 ${u.id} HTTP ${uresp.statusCode}') as String;
+        final errType = anthropic ? 'upstream_error' : (parsed?['error']?['type'] ?? 'upstream_error') as String;
+        return failJson({'message': errMsg, 'type': errType}, uresp.statusCode);
       }
 
-      if (isStream) {
+      if (isStream && anthropic) {
+        // Anthropic 模式：OpenAI chunk 逐条翻译成 Claude SSE 事件
+        req.response.headers
+          ..contentType = ContentType('text', 'event-stream')
+          ..set('Cache-Control', 'no-cache')
+          ..set('x-zeroapi-upstream', u.id);
+        req.response.statusCode = 200;
+        int prompt = 0, completion = 0;
+        final aStream = AnthropicAdapter.streamTransformer(route.upstreamModel);
+        var buf = '';
+        await for (final chunk in uresp) {
+          buf += utf8.decode(chunk, allowMalformed: true);
+          int idx;
+          while ((idx = buf.indexOf('\n')) >= 0) {
+            final line = buf.substring(0, idx).trim();
+            buf = buf.substring(idx + 1);
+            if (!line.startsWith('data:')) continue;
+            final data = line.substring(5).trim();
+            List<String> evs;
+            if (data == '[DONE]') {
+              evs = aStream.finish();
+            } else if (data.isEmpty) {
+              continue;
+            } else {
+              evs = aStream.feed(data);
+              try {
+                final us = (jsonDecode(data) as Map)['usage'] as Map?;
+                if (us != null) {
+                  prompt = (us['prompt_tokens'] ?? prompt) as int;
+                  completion = (us['completion_tokens'] ?? completion) as int;
+                }
+              } catch (_) {}
+            }
+            for (final ev in evs) {
+              req.response.write(ev);
+            }
+            await req.response.flush();
+          }
+        }
+        await req.response.close();
+        usageToday.add(publicName, prompt, completion, false);
+        _usageLine(publicName, u.id, prompt, completion, false);
+        _log('$publicName ✓ stream ${u.id}$tag');
+      } else if (isStream) {
         req.response.headers
           ..contentType = ContentType('text', 'event-stream')
           ..set('Cache-Control', 'no-cache')
@@ -324,7 +411,12 @@ class ProxyServer {
           ..contentType = ContentType.json
           ..set('x-zeroapi-upstream', u.id);
         req.response.statusCode = 200;
-        req.response.write(data);
+        if (anthropic) {
+          req.response.write(jsonEncode(AnthropicAdapter.toAnthropicResponse(
+              jsonDecode(data) as Map<String, dynamic>)));
+        } else {
+          req.response.write(data);
+        }
         await req.response.close();
       }
       client.close(force: true);
@@ -335,9 +427,7 @@ class ProxyServer {
       _usageLine(publicName, u.id, 0, 0, true);
       _log('$publicName ✗ ${u.id}: $e');
       try {
-        _json(req, {
-          'error': {'message': '供应商 ${u.id} 请求失败: $e', 'type': 'upstream_error'}
-        }, 502);
+        failJson({'message': '供应商 ${u.id} 请求失败: $e', 'type': anthropic ? 'api_error' : 'upstream_error'}, 502);
       } catch (_) {}
       client.close(force: true);
     }
