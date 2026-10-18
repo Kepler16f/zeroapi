@@ -643,6 +643,18 @@ class ProxyServer {
         ? _json(req, {'type': 'error', 'error': err}, status)
         : _json(req, {'error': err}, status);
 
+    // IP 级滥用封锁静默窗口：彻底不碰上游，直到窗口结束再放一个请求探测
+    final ipBan = _zenIpBanUntil;
+    if (ipBan != null && ipBan.isAfter(DateTime.now())) {
+      _account(publicName, u.id, 0, 0, true);
+      return failJson({
+        'message':
+            'OpenCode 检测到本机 IP 滥用流量并临时封锁免费通道（多为短时风控，'
+            '继续请求会延长封锁）。静默至 ${_fmtClock(ipBan)}，届时自动恢复。',
+        'type': anthropic ? 'rate_limit_error' : 'rate_limited',
+        'code': 'ip_abuse_backoff',
+      }, 429);
+    }
     // 熔断打开：该端点冷却中 → 快速失败并如实报错。绝不静默转投其他模型：
     // 用户指定的模型必须原样执行，换模型出答案等于伪造结果
     final target = route.upstreamModel;
@@ -661,6 +673,11 @@ class ProxyServer {
   }
 
   final ModelBreaker _breaker = ModelBreaker();
+
+  /// 上游 IP 级滥用封锁（403 abusive traffic）后的全局静默窗口：
+  /// 期间暂停一切 zen 请求。单模型熔断不够——换任何模型都会再撞一次风控，
+  /// 继续撞只会延长封锁；彻底沉默才给 IP 解封留机会。
+  DateTime? _zenIpBanUntil;
 
   /// 单次 zen 请求尝试：发送→探流→提交→泵流；可重试错误在提交前发生。
   Future<void> _zenTurn(HttpRequest req, ModelRoute route, String publicName,
@@ -743,6 +760,16 @@ class ProxyServer {
     if (uresp == null) {
       final retryable = errStatus == null || errStatus == 429 || errStatus >= 500;
       if (retryable) return retryOrFail('HTTP ${errStatus ?? 'conn'}');
+      // 403=上游滥用风控：单模型立即冷却 90s；若错误是 IP 级「abusive
+      // traffic」封锁（区别于指纹格式错误），再设全局静默窗口 5 分钟，
+      // 让本进程彻底沉默，避免换模型继续撞风控延长封锁
+      if (errStatus == 403) {
+        _breaker.onFailure(route.upstreamModel,
+            retryAfter: const Duration(seconds: 90));
+        if ((errBody ?? '').contains('abusive traffic')) {
+          _zenIpBanUntil = DateTime.now().add(const Duration(minutes: 5));
+        }
+      }
       final parsed = (errBody ?? '').isNotEmpty ? _safeJson(errBody!) : null;
       // 走到这里 errStatus 必非空（4xx 非 429）
       final msg = (parsed?['error']?['message'] ??
@@ -927,6 +954,10 @@ class ProxyServer {
     _account(publicName, route.upstream.id, prompt, completion, false);
     _log('$publicName ✓ zen ${route.upstream.id}${anthropic ? ' [anthropic]' : ''}');
   }
+
+  /// HH:MM 时刻显示（本地时区），用于提示静默窗口结束时间
+  static String _fmtClock(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
 
   Map<String, dynamic> _safeJson(String s) {
     try {

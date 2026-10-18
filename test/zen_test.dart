@@ -35,6 +35,14 @@ void main() {
     test('自定义 key 覆盖 public', () {
       expect(Zen.headers('sk-xx')['authorization'], 'Bearer sk-xx');
     });
+    test('会话复用：窗口内同 session、request 逐次唯一（防滥用风控）', () {
+      final h1 = Zen.headers('');
+      final h2 = Zen.headers('');
+      // 同一时间窗内 session 必须复用（真人一段对话一个 ses_）
+      expect(h2['x-opencode-session'], h1['x-opencode-session']);
+      // 请求 id 必须逐次不同
+      expect(h2['x-opencode-request'] == h1['x-opencode-request'], false);
+    });
   });
 
   group('诱饵工具补齐', () {

@@ -715,7 +715,8 @@ List<Color> _tokenPalette(BuildContext context) {
   ];
 }
 
-/// 柱状图：按模型词元用量排序/柱高，次数与 token 数并列显示
+/// 横向条形图：每行一个模型——左侧模型名，中间条形长度=词元用量，
+/// 行尾标注「词元·次数」。按用量降序。
 class _TokenBarChart extends StatelessWidget {
   final UsageStats stats;
   const _TokenBarChart({required this.stats});
@@ -727,50 +728,55 @@ class _TokenBarChart extends StatelessWidget {
     if (entries.isEmpty) return const SizedBox.shrink();
     final max = entries.first.value;
     final palette = _tokenPalette(context);
-    return SizedBox(
-      height: 230,
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          for (var i = 0; i < entries.length; i++)
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    Text(_fmtTokens(entries[i].value),
-                        style: const TextStyle(fontSize: 10, height: 1.2)),
-                    Text('${stats.byModel[entries[i].key] ?? 0} 次',
-                        style: const TextStyle(
-                            fontSize: 9.5, color: Colors.grey, height: 1.2)),
-                    const SizedBox(height: 3),
-                    FractionallySizedBox(
-                      alignment: Alignment.bottomCenter,
-                      heightFactor: max == 0
-                          ? 0.02
-                          : (entries[i].value / max).clamp(0.03, 0.72),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (var i = 0; i < entries.length; i++)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 132,
+                  child: Text(entries[i].key,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.end,
+                      style: const TextStyle(
+                          fontSize: 11, fontFamily: 'monospace')),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: LayoutBuilder(builder: (context, cx) {
+                    final w = max == 0
+                        ? 6.0
+                        : (entries[i].value / max * cx.maxWidth).clamp(6.0, cx.maxWidth);
+                    return Align(
+                      alignment: Alignment.centerLeft,
                       child: Container(
+                        height: 14,
+                        width: w,
                         decoration: BoxDecoration(
                           color: palette[i % palette.length],
                           borderRadius:
-                              const BorderRadius.vertical(top: Radius.circular(4)),
+                              const BorderRadius.horizontal(right: Radius.circular(4)),
                         ),
                       ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(entries[i].key,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                            fontSize: 9.5, fontFamily: 'monospace')),
-                  ],
+                    );
+                  }),
                 ),
-              ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 110,
+                  child: Text(
+                    '${_fmtTokens(entries[i].value)} 词元 · ${stats.byModel[entries[i].key] ?? 0} 次',
+                    style: const TextStyle(fontSize: 10.5, height: 1.2),
+                  ),
+                ),
+              ],
             ),
-        ],
-      ),
+          ),
+      ],
     );
   }
 }

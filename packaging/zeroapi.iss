@@ -9,7 +9,7 @@
 #ifdef MyVersion
   #define MyAppVersion MyVersion
 #else
-  #define MyAppVersion "0.1.7"
+  #define MyAppVersion "0.1.8"
 #endif
 #ifndef MyArch
   #define MyArch "arm64"
