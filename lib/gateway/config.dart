@@ -35,8 +35,9 @@ class UpstreamDef {
   /// 统一展示名：有备注用备注，否则用 id
   String get displayName => label.isNotEmpty ? label : id;
 
-  /// UI 类型标签：内置 / 自定义
-  String get typeLabel => isManaged ? '内置' : '自定义';
+  /// UI 类型标签：Zen 直连 / 内置 / 自定义
+  String get typeLabel =>
+      type == 'zen' ? 'Zen 直连' : (isManaged ? '内置' : '自定义');
 
   factory UpstreamDef.fromJson(Map<String, dynamic> j) => UpstreamDef(
         id: j['id'] as String,
@@ -117,7 +118,6 @@ class GatewayConfig {
     if (!f.existsSync()) {
       cfg.apiKey = 'sk-pg-${_rand()}';
       cfg.upstreams = [defaultZengate()];
-      _migrateZengateKey(cfg.upstreams.first);
       cfg.save();
       return cfg;
     }
@@ -133,12 +133,17 @@ class GatewayConfig {
       cfg.upstreams = ((j['upstreams'] ?? []) as List)
           .map((e) => UpstreamDef.fromJson(e as Map<String, dynamic>))
           .toList();
+      var migrated = false;
       for (final u in cfg.upstreams) {
         _resolvePlaceholders(u);
         _normalizeZenLabel(u);
-        _ensureZenEnv(u);
+        if (_migrateZenToNative(u)) migrated = true;
       }
-      if (cfg.upstreams.isEmpty) cfg.upstreams = [defaultZengate()];
+      if (cfg.upstreams.isEmpty) {
+        cfg.upstreams = [defaultZengate()];
+        migrated = true;
+      }
+      if (migrated) cfg.save();
     } catch (_) {
       cfg.apiKey = 'sk-pg-${_rand()}';
       cfg.upstreams = [defaultZengate()];
@@ -169,110 +174,36 @@ class GatewayConfig {
     }
   }
 
-  /// 存量内置 zen 配置补默认 env；用户已显式设置的键不覆盖
-  static void _ensureZenEnv(UpstreamDef u) {
-    if (u.id != 'zen' || !u.isManaged) return;
-    if (!u.env.containsKey('REQUEST_TIMEOUT_MS')) {
-      u.env = {'REQUEST_TIMEOUT_MS': '3600000', ...u.env};
-    }
-  }
+  /// 默认供应商：OpenCode Zen 免费档直连（原生实现，见 zen.dart）。
+  /// 不依赖 zengate/opencode 本地进程：直接按客户端指纹调
+  /// https://opencode.ai/inference/v1 ，只暴露 free 档模型（付费默认隐藏）。
+  static UpstreamDef defaultZengate() => UpstreamDef(
+        id: 'zen',
+        type: 'zen',
+        label: 'OpenCode Zen Free',
+        baseUrl: 'https://opencode.ai/inference/v1',
+        apiKey: '',
+      );
 
-  /// 默认供应商：zengate（内置随包 → 数据目录 → npm 全局），开箱即用。
-  /// env 注入：
-  /// - REQUEST_TIMEOUT_MS：zengate 默认 300s 是总时长硬上限，流式生成中途也会被杀；
-  ///   免费模型思考/排队几分钟是常态，直接放到 SPEC 允许的最大值 1h
-  ///   （挂死请求的兜底是客户端断开自动释放，不靠这个超时）
-  /// - OPENCODE_PATH：优先本机兼容版 opencode（v1.x API）；v2 与 zengate 的
-  ///   /health JSON 协议不兼容（实测返回 HTML），绝不注入；否则用安装目录内置版
-  static UpstreamDef defaultZengate() {
-    final u = UpstreamDef(
-      id: 'zen',
-      type: 'remote',
-      label: 'OpenCode Zen Free',
-      baseUrl: 'http://127.0.0.1:8083/v1',
-      apiKey: '',
-      env: {'REQUEST_TIMEOUT_MS': '3600000'},
-    );
-    final zg = _zengateEntry();
-    if (zg != null) {
-      // Windows 下 Platform.executable 可能是应用自身的别名，必须优先找 node.exe
-      final node = _findNodeExecutable();
-      if (node != null) {
-        u.type = 'managed';
-        u.command = node;
-        u.args = [zg];
-      }
+  /// 存量 zen 供应商迁移：zengate/opencode 本地代理链路（remote/managed 且指向
+  /// 127.0.0.1:8083）整体替换为原生 zen 直连；保留用户的 zen apiKey（若填过）。
+  static bool _migrateZenToNative(UpstreamDef u) {
+    if (u.id != 'zen') return false;
+    final isLocalProxy =
+        u.baseUrl.contains('127.0.0.1:8083') || u.baseUrl.contains('localhost:8083');
+    if (u.type != 'zen' && isLocalProxy) {
+      final key = u.apiKey;
+      u.type = 'zen';
+      u.baseUrl = 'https://opencode.ai/inference/v1';
+      u.label = 'OpenCode Zen Free';
+      u.command = null;
+      u.args = [];
+      u.env = {};
+      // zengate 的 key（sk-zg-*）对直连无意义，只有用户自己填的 Zen key 才保留
+      u.apiKey = key.startsWith('sk-zg-') ? '' : key;
+      return true;
     }
-    final oc = _compatibleOpencodePath();
-    if (oc != null) u.env['OPENCODE_PATH'] = oc;
-    return u;
-  }
-
-  /// 应用安装目录的 vendor 根（installer 把内置 zengate/opencode 放这里）；
-  /// 开发模式（flutter run）下该目录不存在，返回 null 走后续候选
-  static String? _vendorRoot() {
-    final exe = Platform.resolvedExecutable;
-    final dir = Directory('${File(exe).parent.path}/vendor');
-    return dir.existsSync() ? dir.path : null;
-  }
-
-  /// 本机可用的 opencode 可执行文件（按兼容性排序）：
-  /// 1) 安装目录 vendor/opencode/（installer 随包分发，版本与 zengate 匹配）
-  /// 2) PATH 及常见安装位置的本地 opencode，主版本必须 <2
-  ///    （opencode v2 的 /health 返回 HTML，zengate 的 JSON 健康检查无法通过）
-  /// 检测失败/不兼容返回 null，交给 zengate 自带的 opencode-ai 依赖兜底
-  static String? _compatibleOpencodePath() {
-    final cached = _opencodePathCache;
-    if (cached != null) return cached.isEmpty ? null : cached;
-    final candidates = <String>[];
-    final vendor = _vendorRoot();
-    if (vendor != null) candidates.add('$vendor/opencode/opencode.exe');
-    if (Platform.isWindows) {
-      final pathDirs = (Platform.environment['PATH'] ?? '').split(';');
-      for (final d in pathDirs) {
-        if (d.isEmpty) continue;
-        candidates.addAll([
-          '$d\\opencode.exe',
-          '$d\\node_modules\\@opencode\\cli\\bin\\opencode.exe',
-          '$d\\node_modules\\opencode-ai\\bin\\opencode.exe',
-        ]);
-      }
-      final local = Platform.environment['LOCALAPPDATA'] ?? '';
-      if (local.isNotEmpty) {
-        candidates.addAll([
-          '$local\\opencode\\opencode.exe',
-          '$local\\Programs\\opencode\\opencode.exe',
-        ]);
-      }
-    } else {
-      candidates.addAll(['/usr/local/bin/opencode', '/usr/bin/opencode']);
-      final home = Platform.environment['HOME'] ?? '';
-      if (home.isNotEmpty) candidates.add('$home/.local/bin/opencode');
-    }
-    for (final c in candidates) {
-      if (c.isEmpty || !File(c).existsSync()) continue;
-      if (c.contains('/vendor/opencode/') || c.contains('\\vendor\\opencode\\')) {
-        // 内置版由打包脚本保证与 zengate 匹配，无需检测
-        return _opencodePathCache = c;
-      }
-      final v = _opencodeMajorVersion(c);
-      if (v != null && v < 2) return _opencodePathCache = c;
-    }
-    return _opencodePathCache = '';
-  }
-
-  static String? _opencodePathCache;
-
-  /// 跑 `--version` 解析主版本（"opencode v1.18.34" / "2.0.18"）；失败返回 null
-  static int? _opencodeMajorVersion(String exe) {
-    try {
-      final r = Process.runSync(exe, ['--version'],
-          stdoutEncoding: utf8, stderrEncoding: utf8);
-      final m = RegExp(r'(\d+)\.\d+\.\d+').firstMatch(r.stdout.toString());
-      return m == null ? null : int.parse(m.group(1)!);
-    } catch (_) {
-      return null;
-    }
+    return false;
   }
 
   static String? _findNodeExecutable() {
@@ -293,63 +224,6 @@ class GatewayConfig {
       if (File(c).existsSync()) return c;
     }
     return null;
-  }
-
-  /// zengate 入口，按优先级：
-  /// 1) 安装目录内置 vendor/zengate（installer 随包分发，开箱即用）
-  /// 2) 数据目录 vendor/zengate（%APPDATA%/zeroapi/vendor，便携/开发场景）
-  /// 3) npm 全局安装（历史用户的既有路径）
-  static String? _zengateEntry() {
-    final candidates = <String>[];
-    final vendor = _vendorRoot();
-    if (vendor != null) candidates.add('$vendor/zengate/index.js');
-    final base = Platform.isWindows
-        ? Platform.environment['APPDATA']!
-        : '${Platform.environment['HOME']}/.config';
-    candidates.add('$base/zeroapi/vendor/zengate/index.js');
-    if (Platform.isWindows) {
-      final appdata = Platform.environment['APPDATA'];
-      if (appdata != null) {
-        candidates.add('$appdata\\npm\\node_modules\\zengate\\index.js');
-      }
-    } else {
-      final home = Platform.environment['HOME'] ?? '/';
-      candidates.addAll([
-        '$home/.npm-global/lib/node_modules/zengate/index.js',
-        '/usr/lib/node_modules/zengate/index.js',
-      ]);
-    }
-    for (final p in candidates) {
-      if (File(p).existsSync()) return p;
-    }
-    return null;
-  }
-
-  /// 从 zengate 自己的配置里读 API key（开箱即用，不要求用户手填）
-  static void _migrateZengateKey(UpstreamDef u) {
-    for (final p in _zengateConfigPaths()) {
-      try {
-        final f = File(p);
-        if (!f.existsSync()) continue;
-        final j = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
-        final key = j['API_KEY'] ?? j['apiKey'] ?? j['api_key'];
-        if (key is String && key.isNotEmpty) {
-          u.apiKey = key;
-          return;
-        }
-      } catch (_) {}
-    }
-  }
-
-  static List<String> _zengateConfigPaths() {
-    final home = Platform.environment['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        '.';
-    if (Platform.isWindows) {
-      final appdata = Platform.environment['APPDATA'] ?? '$home/AppData/Roaming';
-      return ['$appdata/zengate/config.json', '$home/.config/zengate/config.json'];
-    }
-    return ['$home/.config/zengate/config.json'];
   }
 
   static void _resolvePlaceholders(UpstreamDef u) {

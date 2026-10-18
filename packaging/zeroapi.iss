@@ -9,7 +9,7 @@
 #ifdef MyVersion
   #define MyAppVersion MyVersion
 #else
-  #define MyAppVersion "0.1.3"
+  #define MyAppVersion "0.1.4"
 #endif
 #ifndef MyArch
   #define MyArch "arm64"
@@ -44,6 +44,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\build\windows\{#MyArch}\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; 旧版本随包分发的 zengate/opencode vendor（约 176MB）：直连实现后升级时彻底清理
+Type: filesandordirs; Name: "{app}\vendor"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

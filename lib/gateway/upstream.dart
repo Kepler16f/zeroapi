@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'config.dart';
 import 'modelsdev.dart';
+import 'zen.dart';
 
 enum UpstreamHealth { unknown, checking, healthy, down }
 
@@ -29,6 +30,8 @@ class UpstreamRuntime {
 
   String get id => def.id;
   bool get isManaged => def.type == 'managed';
+  /// OpenCode Zen 免费层直连（原生实现，无本地进程）
+  bool get isZen => def.type == 'zen';
   /// 内置供应商刚拉起、子进程尚未就绪的预热窗口：
   /// 期间连接拒绝是预期噪声，不显示为错误
   bool _warming = false;
@@ -41,6 +44,7 @@ class UpstreamRuntime {
       };
 
   Future<bool> probe() async {
+    if (isZen) return _probeZen();
     try {
       final uri = Uri.parse('${def.baseUrl.replaceAll(RegExp(r'/+$'), '')}/models');
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
@@ -77,6 +81,41 @@ class UpstreamRuntime {
         health = UpstreamHealth.down;
         lastError = e.toString();
       }
+      return false;
+    }
+  }
+
+  /// zen：直连 OpenCode Zen inference API，列 free 档模型（无本地进程）
+  Future<bool> _probeZen() async {
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+      final req = await client.getUrl(Uri.parse('${Zen.base}/models'));
+      Zen.headers(def.apiKey).forEach((k, v) => req.headers.set(k, v));
+      final resp = await req.close().timeout(const Duration(seconds: 15));
+      final body = await resp.transform(utf8.decoder).join();
+      client.close(force: true);
+      if (resp.statusCode != 200) throw HttpException('HTTP ${resp.statusCode}');
+      final j = jsonDecode(body) as Map<String, dynamic>;
+      final data = (j['data'] as List?) ?? const [];
+      // 只保留免费档：big-pickle / *-free；付费模型默认隐藏（用户要求）
+      final entries = data
+          .map((m) => m as Map<String, dynamic>)
+          .where((m) => m['id'] is String && Zen.isFreeModel(m['id'] as String))
+          .toList();
+      models = entries.map((m) => m['id'] as String).toList();
+      modelInfo.clear();
+      for (final e in entries) {
+        final id = e['id'] as String;
+        modelInfo[id] = ModelInfo.fromMaps(
+            e, ModelsDev.instance.lookup('opencode', id));
+      }
+      health = UpstreamHealth.healthy;
+      lastError = null;
+      _backoffMs = 1000;
+      return true;
+    } catch (e) {
+      health = UpstreamHealth.down;
+      lastError = e.toString();
       return false;
     }
   }

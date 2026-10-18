@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'anthropic.dart';
 import 'modelsdev.dart';
 import 'upstream.dart';
+import 'zen.dart';
 
 class ModelRoute {
   final String publicName;
@@ -307,9 +309,11 @@ class ProxyServer {
     }
   }
 
-  /// 解析模型路由并确保供应商可用；失败时写回 404/503 并返回 null
+  /// 解析模型路由并确保供应商可用；失败时写回 404/503 并返回 null。
+  /// [forResponses]：调用来自 /v1/responses——Zen 直连上游实测不支持该端点，需拒绝。
   Future<ModelRoute?> _resolveRoute(
-      Map<String, dynamic> body, HttpRequest req, {bool anthropicErrors = false}) async {
+      Map<String, dynamic> body, HttpRequest req,
+      {bool anthropicErrors = false, bool forResponses = false}) async {
     final publicName = (body['model'] ?? '') as String;
     var route = registry.resolve(publicName);
     void fail(String msg, String openaiType, String anthropicType, int status) => anthropicErrors
@@ -343,6 +347,12 @@ class ProxyServer {
         return null;
       }
     }
+    // Zen 免费通道只支持 chat 系列端点（实测 /responses 无指纹/带 tools 均 403）
+    if (u.isZen && forResponses) {
+      fail('Zen 免费通道仅支持 chat 系列端点（/v1/chat/completions、/v1/messages）',
+          'unsupported_endpoint', 'invalid_request_error', 404);
+      return null;
+    }
     return route;
   }
 
@@ -362,7 +372,7 @@ class ProxyServer {
     final body = await _readJson(req);
     if (body == null) return;
     final publicName = (body['model'] ?? '') as String;
-    final route = await _resolveRoute(body, req);
+    final route = await _resolveRoute(body, req, forResponses: true);
     if (route == null) return;
     await _forward(req, route, publicName, 'responses', body,
         isStream: body['stream'] == true, responsesApi: true);
@@ -395,6 +405,11 @@ class ProxyServer {
   }) async {
     final u = route.upstream;
     body['model'] = route.upstreamModel;
+    if (u.isZen) {
+      await _forwardZen(req, route, publicName, body,
+          clientWantsStream: isStream, anthropic: anthropic);
+      return;
+    }
     final tag = responsesApi
         ? ' [responses]'
         : anthropic
@@ -560,6 +575,218 @@ class ProxyServer {
       } catch (_) {}
       client.close(force: true);
     }
+  }
+
+  /// Zen 直连转发：复刻免费层客户端指纹、强制 stream:true + 诱饵工具，
+  /// 回传时剔除模型对诱饵工具的调用。429/5xx/连接错误指数退避重试（仅首字节
+  /// 前，流式已提交后不可重试）。客户端 stream 决定是否把上游 SSE 聚合成非流式。
+  Future<void> _forwardZen(HttpRequest req, ModelRoute route, String publicName,
+      Map<String, dynamic> body,
+      {required bool clientWantsStream, bool anthropic = false}) async {
+    final u = route.upstream;
+    final injected = <String>{};
+    final sent = Map<String, dynamic>.from(body)
+      ..['stream'] = true
+      ..['stream_options'] = {'include_usage': true}
+      ..['tools'] = Zen.ensureFreeTools(body['tools'], injected);
+
+    void failJson(Map<String, dynamic> err, int status) => anthropic
+        ? _json(req, {'type': 'error', 'error': err}, status)
+        : _json(req, {'error': err}, status);
+
+    const maxAttempts = 3;
+    final rnd = Random();
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+      HttpClientResponse? uresp;
+      int? errStatus;
+      String? errBody;
+      try {
+        final ureq = await client
+            .openUrl('POST', Uri.parse('${Zen.base}/chat/completions'));
+        Zen.headers(u.def.apiKey).forEach((k, v) => ureq.headers.set(k, v));
+        ureq.headers.set('Content-Type', 'application/json');
+        ureq.add(utf8.encode(jsonEncode(sent)));
+        final r = await ureq.close().timeout(
+            clientWantsStream ? const Duration(hours: 2) : const Duration(minutes: 70));
+        if (r.statusCode == 200) {
+          uresp = r;
+        } else {
+          errStatus = r.statusCode;
+          errBody = await r.transform(utf8.decoder).join();
+          client.close(force: true);
+        }
+      } catch (e) {
+        errBody = e.toString();
+        client.close(force: true);
+      }
+
+      if (uresp == null) {
+        final retryable =
+            errStatus == null || errStatus == 429 || errStatus >= 500;
+        if (retryable && attempt < maxAttempts - 1) {
+          final w = (500 * pow(2, attempt)).toInt() + rnd.nextInt(300);
+          _log('$publicName ⟳ zen 第 ${attempt + 1} 次失败(${errStatus ?? 'conn'})，${w}ms 后重试');
+          await Future.delayed(Duration(milliseconds: w));
+          continue;
+        }
+        final parsed = (errBody != null && errBody.isNotEmpty) ? _safeJson(errBody) : null;
+        final msg = (parsed?['error']?['message'] ??
+                parsed?['message'] ??
+                errBody ??
+                'Zen 请求失败')
+            as String;
+        u.health = UpstreamHealth.down;
+        u.lastError = msg;
+        _account(publicName, u.id, 0, 0, true);
+        _log('$publicName ✗ zen HTTP ${errStatus ?? 'conn'}: $msg');
+        return failJson({
+          'message': msg,
+          'type': anthropic ? 'api_error' : 'upstream_error'
+        }, errStatus ?? 502);
+      }
+
+      u.health = UpstreamHealth.healthy;
+      u.lastError = null;
+      try {
+        if (clientWantsStream) {
+          await _pumpZenStream(uresp, req, route, publicName, injected,
+              anthropic: anthropic, client: client);
+        } else {
+          await _pumpZenAggregate(uresp, req, route, publicName, injected,
+              anthropic: anthropic, client: client);
+        }
+      } catch (e) {
+        _account(publicName, u.id, 0, 0, true);
+        _log('$publicName ✗ zen stream: $e');
+        client.close(force: true);
+      }
+      return;
+    }
+  }
+
+  Future<void> _pumpZenStream(HttpClientResponse uresp, HttpRequest req,
+      ModelRoute route, String publicName, Set<String> injected,
+      {required bool anthropic, required HttpClient client}) async {
+    req.response.headers
+      ..contentType = ContentType('text', 'event-stream')
+      ..set('Cache-Control', 'no-cache')
+      ..set('x-zeroapi-upstream', route.upstream.id);
+    req.response.statusCode = 200;
+    final decoy = <int, bool>{};
+    int prompt = 0, completion = 0;
+
+    if (anthropic) {
+      final aStream = AnthropicAdapter.streamTransformer(route.upstreamModel);
+      var buf = '';
+      await for (final raw in uresp) {
+        buf += utf8.decode(raw, allowMalformed: true);
+        int nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          final line = buf.substring(0, nl).trim();
+          buf = buf.substring(nl + 1);
+          if (!line.startsWith('data:')) continue;
+          final data = line.substring(5).trim();
+          if (data.isEmpty) continue;
+          if (data == '[DONE]') {
+            for (final ev in aStream.finish()) {
+              req.response.write(ev);
+            }
+            await req.response.flush();
+            continue;
+          }
+          Map<String, dynamic>? j;
+          try {
+            j = jsonDecode(data) as Map<String, dynamic>;
+          } catch (_) {
+            j = null;
+          }
+          if (j == null) continue;
+          final us = j['usage'] as Map?;
+          if (us != null) {
+            prompt = (us['prompt_tokens'] ?? prompt) as int;
+            completion = (us['completion_tokens'] ?? completion) as int;
+          }
+          Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
+          for (final ev in aStream.feed(jsonEncode(j))) {
+            req.response.write(ev);
+          }
+          await req.response.flush();
+        }
+      }
+    } else {
+      var buf = '';
+      await for (final raw in uresp) {
+        buf += utf8.decode(raw, allowMalformed: true);
+        int nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          final line = buf.substring(0, nl).trim();
+          buf = buf.substring(nl + 1);
+          if (!line.startsWith('data:')) continue;
+          final data = line.substring(5).trim();
+          if (data.isEmpty) continue;
+          if (data == '[DONE]') {
+            req.response.write('data: [DONE]\n\n');
+            await req.response.flush();
+            continue;
+          }
+          Map<String, dynamic>? j;
+          try {
+            j = jsonDecode(data) as Map<String, dynamic>;
+          } catch (_) {
+            j = null;
+          }
+          if (j == null) continue;
+          final us = j['usage'] as Map?;
+          if (us != null) {
+            prompt += (us['prompt_tokens'] ?? 0) as int;
+            completion += (us['completion_tokens'] ?? 0) as int;
+          }
+          final out = Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
+          if (out == null) continue;
+          req.response.write('data: ${jsonEncode(out)}\n\n');
+          await req.response.flush();
+        }
+      }
+    }
+    await req.response.close();
+    _account(publicName, route.upstream.id, prompt, completion, false);
+    _log('$publicName ✓ zen stream ${route.upstream.id}${anthropic ? ' [anthropic]' : ''}');
+    client.close(force: true);
+  }
+
+  Future<void> _pumpZenAggregate(HttpClientResponse uresp, HttpRequest req,
+      ModelRoute route, String publicName, Set<String> injected,
+      {required bool anthropic, required HttpClient client}) async {
+    final text = await uresp.transform(utf8.decoder).join();
+    client.close(force: true);
+    final datas = <Map<String, dynamic>>[];
+    for (final raw in text.split('\n')) {
+      final t = raw.trim();
+      if (!t.startsWith('data:')) continue;
+      final d = t.substring(5).trim();
+      if (d.isEmpty || d == '[DONE]') continue;
+      try {
+        datas.add(jsonDecode(d) as Map<String, dynamic>);
+      } catch (_) {}
+    }
+    final agg = Zen.aggregate(datas, route.upstreamModel, injected);
+    int prompt = 0, completion = 0;
+    final us = agg['usage'] as Map?;
+    if (us != null) {
+      prompt = (us['prompt_tokens'] ?? 0) as int;
+      completion = (us['completion_tokens'] ?? 0) as int;
+    }
+    req.response.headers
+      ..contentType = ContentType.json
+      ..set('x-zeroapi-upstream', route.upstream.id);
+    req.response.statusCode = 200;
+    req.response.write(jsonEncode(anthropic
+        ? AnthropicAdapter.toAnthropicResponse(agg)
+        : agg));
+    await req.response.close();
+    _account(publicName, route.upstream.id, prompt, completion, false);
+    _log('$publicName ✓ zen ${route.upstream.id}${anthropic ? ' [anthropic]' : ''}');
   }
 
   Map<String, dynamic> _safeJson(String s) {

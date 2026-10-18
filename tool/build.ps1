@@ -11,8 +11,7 @@
 param(
   [string[]]$Platforms = @(),
   [switch]$Installer,
-  [switch]$Clean,
-  [switch]$RefreshVendor  # 强制重新拉取 vendor（zengate+opencode-ai），否则已存在则复用
+  [switch]$Clean
 )
 $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")
@@ -88,16 +87,10 @@ foreach ($p in $Platforms) {
   if ($LASTEXITCODE -eq 0) {
     Write-Host "  产物: $t.Out" -ForegroundColor Green
     if ($Installer -and $p -like "windows*") {
-      # vendor（zengate + 匹配架构的 opencode-ai）随安装包分发，装好即用；
-      # 首次或 -RefreshVendor 时重新准备。版本红线（opencode-ai 必须 ≥1.19.3：
-      # 旧内置目录列不出新免费模型；v2 健康检查不兼容）——详见 vendor.ps1 头部。
-      if ($RefreshVendor -or -not (Test-Path "vendor\zengate\index.js")) {
-        powershell -File tool\vendor.ps1
-        if ($LASTEXITCODE -ne 0) { Write-Host "  vendor 准备失败" -ForegroundColor Red; $failed += "$p-vendor"; continue }
-      }
+      # Zen 免费档由网关原生直连（lib/gateway/zen.dart），无需随包 vendor。
+      # 清理旧构建残留的 Release\vendor（若有），安装包只含应用本体。
       $vendorDest = Join-Path $t.Out "vendor"
-      if (Test-Path $vendorDest) { Remove-Item -Recurse -Force $vendorDest }  # 避免重复构建套嵌 vendor\vendor
-      Copy-Item -Recurse -Force vendor $vendorDest
+      if (Test-Path $vendorDest) { Remove-Item -Recurse -Force $vendorDest }
       $arch = if ($p -eq "windows-x64") { "x64" } elseif ($p -eq "windows-arm64") { "arm64" } else { $winArch }
       $iscc = @(
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",

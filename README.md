@@ -5,7 +5,7 @@
 
 ```
 你的客户端 ──(OpenAI API + 统一 key)──▶ ZeroApi(:8123)
-                                        ├──▶ OpenCode Zen Free (内置：自动拉起/守护) → 免费模型
+                                        ├──▶ OpenCode Zen Free (内置：直连，免费模型自动发现)
                                         ├──▶ Qoder2API-Hub  (自定义：转发)
                                         ├──▶ niceboat       (自定义：转发)
                                         └──▶ 未来任意兼容供应商  (加一条配置即可)
@@ -18,17 +18,18 @@
 ## 开箱即用
 
 Windows：直接双击 `build/windows/<arch>/runner/Release/zeroapi.exe`
-（首次启动自动检测本机 `npm -g` 安装的 zengate 并读取其 API key，
-以"内置供应商"身份接入，界面显示为 OpenCode Zen Free——没装 zengate 则该项跳过，其他供应商照常）。
+（首次启动自带内置供应商 OpenCode Zen Free：网关原生直连 Zen 免费通道，
+无需安装任何其他组件、无需 API key，免费模型自动发现并可用）。
 
 配置与日志在 `%APPDATA%\zeroapi\`（Linux/macOS 为 `~/.config/zeroapi/`）。
 首次启动会自动把旧 `%APPDATA%\polygate\` 目录迁移过去。
 
-## 供应商的两种形态
+## 供应商形态
 
 | 类型 | UI 名称 | 含义 | 典型例子 |
 |------|---------|------|----------|
-| `managed` | 内置 | ZeroApi 负责 `启动命令 + 参数` 拉起子进程；进程退出自动退避重启；端口已有实例则视为外部进程、不重复拉起 | OpenCode Zen Free（`node .../zengate/index.js`） |
+| `zen`     | 内置 | 网关原生直连 OpenCode Zen 免费通道：按客户端指纹请求 `opencode.ai/inference/v1`，只暴露免费档模型（`*-free`/big-pickle，其余默认隐藏），无需任何本地进程 | OpenCode Zen Free |
+| `managed` | 内置 | ZeroApi 负责 `启动命令 + 参数` 拉起子进程；进程退出自动退避重启；端口已有实例则视为外部进程、不重复拉起 | 本地网关类供应商（如自建的 OpenAI 兼容服务） |
 | `remote`  | 自定义 | 只做转发与探活，供应商由它自己负责 | Qoder2API-Hub、niceboat、OpenRouter 等任何 OpenAI 兼容端点 |
 
 新增供应商：供应商页 → 「接入新供应商」，填 Base URL（带 `/v1`）与 Key；内置型再填命令与参数。
@@ -60,9 +61,8 @@ API Key 同上；网关暴露 `/v1/messages` 并在 OpenAI ⇄ Anthropic 双向�
 
 ## 已验证行为（本机）
 
-- 内置：ZeroApi 启动即拉起 zengate 子进程，预热就绪前不显示连接拒绝错误；
-  供应商日志落 `%APPDATA%\zeroapi\logs\upstream-<id>.log`；
-  子进程意外退出自动重启（1s 起指数退避，封顶 60s）。
+- 内置 Zen：网关启动即直连 Zen 免费通道拉模型目录（只保留免费档），预热就绪前不显示连接拒绝错误；
+  429/5xx 与连接错误自动指数退避重试；供应商日志落 `%APPDATA%\zeroapi\logs\`。
 - 非流式 + SSE 流式透传；usage 记账（内存汇总 + 按天 jsonl + 分时段图表）。
 - `/v1/responses` 端点透传（请求体原样转发供应商 `/responses`，
   usage 按 `input_tokens`/`output_tokens` 记账）。
@@ -103,9 +103,10 @@ iscc /DMyArch=arm64 /DMyVersion=1.1.0 packaging/zeroapi.iss
 
 ## 致谢
 
-- [zengate](https://github.com/developingchet/zengate) — 本项目内置供应商
-  OpenCode Zen Free 的上游实现；其中 OpenCode Zen 免费模型的接入方式与
-  部分设计参考了该项目。
+- [jcleng/opencode-free-provider](https://github.com/jcleng/opencode-free-provider) —
+  OpenCode Zen 免费通道的客户端指纹接入方式（本项目直连实现的主要参考）。
+- [LAGcomcom/zen-gate](https://github.com/LAGcomcom/zen-gate)、[routatic/proxy](https://github.com/routatic/proxy) —
+  同类 Zen 网关项目，接入细节交叉印证。
 - [models.dev](https://models.dev) — 开放模型目录，本项目模型能力信息
   （上下文窗口、模态、推理/工具调用等）的数据来源。
 - [LXGW WenKai / 霞鹜文楷](https://github.com/lxgw/LxgwWenKai-Lite) — 应用内置

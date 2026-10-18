@@ -128,7 +128,7 @@ class _UpstreamCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 6),
-            if (!d.isManaged)
+            if (!d.isManaged && d.type != 'zen')
               Text(d.baseUrl,
                   style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
             const SizedBox(height: 8),
@@ -231,7 +231,7 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
                       label: Text('内置'),
                       tooltip: '本应用负责拉起并守护本地进程'),
                 ],
-                selected: {type},
+                selected: {type == 'zen' ? 'managed' : type},
                 onSelectionChanged: (s) => setState(() => type = s.first),
               ),
               const SizedBox(height: 12),
@@ -1151,7 +1151,7 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             Text(
               'ZeroApi — 零汇聚合网关。把多个 OpenAI 兼容供应商聚合为一个统一入口；'
-              '内置型供应商由本应用负责拉起与守护。'
+              '内置 OpenCode Zen Free 由本应用原生直连，其他内置型由应用拉起守护。'
               '模型命名：供应商id/模型名；跨供应商不重名时可直接用裸名。',
               style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
             ),
