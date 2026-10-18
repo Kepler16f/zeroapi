@@ -118,6 +118,19 @@ void main() {
     expect(resp.statusCode, 404);
   });
 
+  test('usageRange 今日聚合含内存记账与小时趋势', () async {
+    await gw('POST', '/v1/chat/completions',
+        {'model': 'fake/gpt-test', 'messages': []});
+    await gw('POST', '/v1/chat/completions',
+        {'model': 'gpt-test', 'messages': []});
+    final s = await proxy.usageRange(days: 1);
+    expect(s.requests, greaterThanOrEqualTo(2));
+    expect(s.byModel['fake/gpt-test'], greaterThanOrEqualTo(1));
+    expect(s.trend.length, greaterThanOrEqualTo(1)); // 小时桶
+    // tokens 来自 fake 上游固定值（prompt 10 / completion 5 每次）
+    expect(s.promptTokens, greaterThanOrEqualTo(10));
+  });
+
   test('错误网关 key 返回 401', () async {
     final req = await client.openUrl(
         'POST', Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/responses'));

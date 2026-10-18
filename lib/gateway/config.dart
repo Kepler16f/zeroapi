@@ -2,10 +2,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-/// 供应商定义（config.json 里的静态描述）
+/// 供应商定义（config.json 里的静态描述）。
+/// 内置（managed）与自定义（remote）在此归一：对外统一是"一个有 base URL 的
+/// OpenAI 兼容端点"，差别只是内置的端点由本应用负责拉起守护（command/args），
+/// 展示名与地址由拉起目标决定；自定义的完全由用户填写。
 class UpstreamDef {
   String id;
-  String type; // remote | managed
+  String type; // remote(自定义) | managed(内置)
   String label;
   String baseUrl;
   String apiKey;
@@ -23,6 +26,14 @@ class UpstreamDef {
     this.args = const [],
     this.enabled = true,
   });
+
+  bool get isManaged => type == 'managed';
+
+  /// 统一展示名：有备注用备注，否则用 id
+  String get displayName => label.isNotEmpty ? label : id;
+
+  /// UI 类型标签：内置 / 自定义
+  String get typeLabel => isManaged ? '内置' : '自定义';
 
   factory UpstreamDef.fromJson(Map<String, dynamic> j) => UpstreamDef(
         id: j['id'] as String,

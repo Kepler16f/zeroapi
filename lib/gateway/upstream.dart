@@ -7,7 +7,7 @@ import 'modelsdev.dart';
 
 enum UpstreamHealth { unknown, checking, healthy, down }
 
-/// 供应商运行时：健康探测 + managed 类型子进程托管（拉起/守护/退避重启）
+/// 供应商运行时：健康探测 + 内置(managed)类型的子进程拉起/守护/退避重启
 class UpstreamRuntime {
   final UpstreamDef def;
   UpstreamHealth health = UpstreamHealth.unknown;
@@ -24,8 +24,15 @@ class UpstreamRuntime {
 
   UpstreamRuntime(this.def);
 
+  /// 状态变化回调（由 GatewayService 接 notifyListeners，UI 即时感知就绪）
+  void Function()? onStatusChanged;
+
   String get id => def.id;
   bool get isManaged => def.type == 'managed';
+  /// 内置供应商刚拉起、子进程尚未就绪的预热窗口：
+  /// 期间连接拒绝是预期噪声，不显示为错误
+  bool _warming = false;
+  bool get warming => _warming;
 
   Map<String, String> _headers([Map<String, String>? extra]) => {
         'Content-Type': 'application/json',
@@ -62,8 +69,14 @@ class UpstreamRuntime {
       _backoffMs = 1000;
       return true;
     } catch (e) {
-      health = UpstreamHealth.down;
-      lastError = e.toString();
+      if (_warming) {
+        // 预热窗口内（子进程尚未就绪）：保持"启动中"，不记拒绝错误
+        health = UpstreamHealth.checking;
+        lastError = null;
+      } else {
+        health = UpstreamHealth.down;
+        lastError = e.toString();
+      }
       return false;
     }
   }
@@ -101,15 +114,22 @@ class UpstreamRuntime {
   void _spawn() {
     final cmd = def.command;
     if (cmd == null || cmd.isEmpty) {
-      lastError = 'managed 供应商未配置 command（本机未检测到可执行入口）';
+      lastError = '内置供应商未配置 command（本机未检测到可执行入口）';
       return;
     }
+    // 已决定拉起：立即进入"启动中"。子进程就绪前的连接拒绝是预期噪声，
+    // 不能以红色错误呈现（否则应用每次启动都会先闪一帧"积极拒绝"）
+    health = UpstreamHealth.checking;
+    lastError = null;
+    _warming = true;
     try {
       final logFile = _logSink();
       logFile?.writeln('[${DateTime.now().toIso8601String()}] spawn: $cmd ${def.args.join(" ")}');
       Process.start(cmd, def.args).then((p) {
         child = p;
         lastSpawnAt = DateTime.now();
+        onStatusChanged?.call();
+        unawaited(_warmup());
         final sink = _logSink();
         p.stdout.listen((d) => sink?.add(d),
             onDone: () => sink?.flush());
@@ -120,6 +140,7 @@ class UpstreamRuntime {
           sink?.flush();
           child = null;
           health = UpstreamHealth.unknown;
+          onStatusChanged?.call();
           if (_stopping) return;
           // 退避重启
           Future.delayed(Duration(milliseconds: _backoffMs), () async {
@@ -132,6 +153,29 @@ class UpstreamRuntime {
     } catch (e) {
       lastError = '拉起失败: $e';
     }
+  }
+
+  /// 子进程就绪前每 500ms 探一次，最长 15s；就绪即通知 UI 刷新
+  Future<void> _warmup() async {
+    for (var i = 0; i < 30 && !_stopping; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (_stopping || child == null) {
+        _warming = false;
+        return;
+      }
+      if (await probe()) {
+        _warming = false;
+        onStatusChanged?.call();
+        return;
+      }
+    }
+    // 15s 内没就绪：结束预热窗口，此后探测失败如实报 down（真实故障）
+    _warming = false;
+    if (health == UpstreamHealth.checking) {
+      health = UpstreamHealth.down;
+      lastError = '启动超时：子进程 15 秒内未就绪（查看供应商日志）';
+    }
+    onStatusChanged?.call();
   }
 
   IOSink? _logFileSink;

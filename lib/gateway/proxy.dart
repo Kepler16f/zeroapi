@@ -37,16 +37,35 @@ class ModelRegistry {
   List<ModelRoute> get all => _routes.values.toList();
 }
 
+/// 一组用量聚合：总量 + 按模型 + 趋势桶（trend 的键由写入方决定：
+/// 当天视图为小时 "00"-"23"，跨天汇总为日期 "MM-dd"）
 class UsageStats {
   int requests = 0, errors = 0, promptTokens = 0, completionTokens = 0;
   final Map<String, int> byModel = {};
+  final Map<String, int> trend = {};
 
-  void add(String model, int prompt, int completion, bool isError) {
+  void add(String model, int prompt, int completion, bool isError, {String? trendKey}) {
     requests++;
     promptTokens += prompt;
     completionTokens += completion;
     if (isError) errors++;
     byModel.update(model, (v) => v + 1, ifAbsent: () => 1);
+    if (trendKey != null) {
+      trend.update(trendKey, (v) => v + 1, ifAbsent: () => 1);
+    }
+  }
+
+  void merge(UsageStats o, {String? trendKey}) {
+    requests += o.requests;
+    errors += o.errors;
+    promptTokens += o.promptTokens;
+    completionTokens += o.completionTokens;
+    o.byModel.forEach((k, v) => byModel.update(k, (x) => x + v, ifAbsent: () => v));
+    if (trendKey != null) {
+      trend.update(trendKey, (x) => x + o.requests, ifAbsent: () => o.requests);
+    } else {
+      o.trend.forEach((k, v) => trend.update(k, (x) => x + v, ifAbsent: () => v));
+    }
   }
 
   Map<String, dynamic> toJson() => {
@@ -64,11 +83,88 @@ class ProxyServer {
   final String apiKey;
   final ModelRegistry registry;
   final bool anthropicEnabled;
-  final UsageStats usageToday = UsageStats();
+  UsageStats usageToday = UsageStats();
   HttpServer? _server;
   IOSink? _usageSink;
   final _logLines = <String>[]; // 环形日志，UI 展示
   static const _maxLog = 200;
+  String _usageDay = DateTime.now().toIso8601String().substring(0, 10);
+
+  /// 统一记账：内存当日汇总（含小时趋势）+ jsonl 落盘（跨天自动换文件）
+  void _account(String model, String upstream, int p, int c, bool err) {
+    final now = DateTime.now();
+    final day = now.toIso8601String().substring(0, 10);
+    if (day != _usageDay) {
+      _usageDay = day;
+      usageToday = UsageStats();
+      try {
+        _usageSink?.flush();
+        _usageSink?.close();
+      } catch (_) {}
+      _usageSink = null;
+    }
+    usageToday.add(model, p, c, err, trendKey: now.hour.toString().padLeft(2, '0'));
+    try {
+      _usageSink ??= _openUsageFile();
+      _usageSink?.writeln(jsonEncode({
+        'ts': now.toIso8601String(),
+        'model': model,
+        'upstream': upstream,
+        'prompt': p,
+        'completion': c,
+        'error': err,
+      }));
+    } catch (_) {}
+  }
+
+  /// 从磁盘 jsonl 聚合指定天数范围的用量（含按天趋势）。
+  /// days=1 今日（小时趋势）；days=7/30 按天趋势；days=null 全部。
+  Future<UsageStats> usageRange({int? days}) async {
+    final out = UsageStats();
+    try {
+      final base = Platform.isWindows
+          ? Platform.environment['APPDATA']!
+          : '${Platform.environment['HOME']}/.config';
+      final dir = Directory('$base/zeroapi/logs');
+      if (!dir.existsSync()) return out;
+      final cutoff = days == null
+          ? null
+          : DateTime.now().subtract(Duration(days: days - 1));
+      final files = dir
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.contains('usage-'))
+          .toList()
+        ..sort();
+      for (final f in files) {
+        final m = RegExp(r'usage-(\d{4}-\d{2}-\d{2})\.jsonl').firstMatch(f.path);
+        if (m == null) continue;
+        final fileDay = DateTime.tryParse(m.group(1)!);
+        if (fileDay == null) continue;
+        // 当天文件用内存态（含未落盘的 flush 延迟）；历史文件读磁盘。
+        // 跨天视图把当天聚合成一个日期桶，今日视图保留小时桶。
+        if (m.group(1) == _usageDay) {
+          out.merge(usageToday, trendKey: days == 1 ? null : _usageDay.substring(5));
+          continue;
+        }
+        if (cutoff != null && fileDay.isBefore(cutoff)) continue;
+        final lines = await f.readAsLines();
+        for (final l in lines) {
+          try {
+            final j = jsonDecode(l) as Map<String, dynamic>;
+            out.add(
+                (j['model'] ?? '?') as String,
+                (j['prompt'] ?? 0) as int,
+                (j['completion'] ?? 0) as int,
+                (j['error'] ?? false) as bool,
+                trendKey: m.group(1)!.substring(5)); // MM-dd
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return out;
+  }
+
   void _log(String s) {
     _logLines.add('[${DateTime.now().toIso8601String().substring(11, 19)}] $s');
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
@@ -291,8 +387,7 @@ class ProxyServer {
       if (uresp.statusCode != 200) {
         final err = await uresp.transform(utf8.decoder).join();
         _log('$publicName ← 供应商 ${u.id} HTTP ${uresp.statusCode}');
-        usageToday.add(publicName, 0, 0, true);
-        _usageLine(publicName, u.id, 0, 0, true);
+        _account(publicName, u.id, 0, 0, true);
         final parsed = err.isNotEmpty ? _safeJson(err) : null;
         final errMsg = (parsed?['error']?['message'] ??
             parsed?['message'] ??
@@ -341,8 +436,7 @@ class ProxyServer {
           }
         }
         await req.response.close();
-        usageToday.add(publicName, prompt, completion, false);
-        _usageLine(publicName, u.id, prompt, completion, false);
+        _account(publicName, u.id, prompt, completion, false);
         _log('$publicName ✓ stream ${u.id}$tag');
       } else if (isStream) {
         req.response.headers
@@ -387,8 +481,7 @@ class ProxyServer {
           await req.response.flush();
         }
         await req.response.close();
-        usageToday.add(publicName, prompt, completion, false);
-        _usageLine(publicName, u.id, prompt, completion, false);
+        _account(publicName, u.id, prompt, completion, false);
         _log('$publicName ✓ stream ${u.id}$tag');
       } else {
         final data = await uresp.transform(utf8.decoder).join();
@@ -404,8 +497,7 @@ class ProxyServer {
             completion = (us?['completion_tokens'] ?? 0) as int;
           }
         } catch (_) {}
-        usageToday.add(publicName, prompt, completion, false);
-        _usageLine(publicName, u.id, prompt, completion, false);
+        _account(publicName, u.id, prompt, completion, false);
         _log('$publicName ✓ ${u.id}$tag');
         req.response.headers
           ..contentType = ContentType.json
@@ -421,10 +513,11 @@ class ProxyServer {
       }
       client.close(force: true);
     } catch (e) {
-      u.health = UpstreamHealth.down;
-      u.lastError = e.toString();
-      usageToday.add(publicName, 0, 0, true);
-      _usageLine(publicName, u.id, 0, 0, true);
+      if (!u.warming) {
+        u.health = UpstreamHealth.down;
+        u.lastError = e.toString();
+      }
+      _account(publicName, u.id, 0, 0, true);
       _log('$publicName ✗ ${u.id}: $e');
       try {
         failJson({'message': '供应商 ${u.id} 请求失败: $e', 'type': anthropic ? 'api_error' : 'upstream_error'}, 502);
@@ -441,19 +534,6 @@ class ProxyServer {
     }
   }
 
-  void _usageLine(String model, String upstream, int p, int c, bool err) {
-    try {
-      _usageSink ??= _openUsageFile();
-      _usageSink?.writeln(jsonEncode({
-        'ts': DateTime.now().toIso8601String(),
-        'model': model,
-        'upstream': upstream,
-        'prompt': p,
-        'completion': c,
-        'error': err,
-      }));
-    } catch (_) {}
-  }
 
   static IOSink? _openUsageFile() {
     try {

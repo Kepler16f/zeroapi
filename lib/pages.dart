@@ -80,12 +80,18 @@ class _UpstreamCard extends StatelessWidget {
                 const SizedBox(width: 8),
                 Flexible(
                   child: Text(
-                    d.label.isNotEmpty ? d.label : d.id,
+                    d.displayName,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                         fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
+                if (rt.health == UpstreamHealth.checking) ...[
+                  const SizedBox(width: 8),
+                  Text('启动中…',
+                      style: TextStyle(
+                          fontSize: 11.5, color: cs.onSurfaceVariant)),
+                ],
                 if (d.label.isNotEmpty) ...[
                   const SizedBox(width: 8),
                   Text('id: ${d.id}',
@@ -96,7 +102,7 @@ class _UpstreamCard extends StatelessWidget {
                 ],
                 const SizedBox(width: 8),
                 Chip(
-                  label: Text(d.type == 'managed' ? '托管' : '远端',
+                  label: Text(d.typeLabel,
                       style: const TextStyle(fontSize: 11)),
                   visualDensity: VisualDensity.compact,
                 ),
@@ -121,8 +127,9 @@ class _UpstreamCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 6),
-            Text(d.baseUrl,
-                style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+            if (!d.isManaged)
+              Text(d.baseUrl,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
             const SizedBox(height: 8),
             Row(children: [
               Icon(Icons.view_in_ar, size: 14, color: cs.onSurfaceVariant),
@@ -215,12 +222,12 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
                   ButtonSegment(
                       value: 'remote',
                       icon: Icon(Icons.cloud_outlined),
-                      label: Text('远端'),
+                      label: Text('自定义'),
                       tooltip: '纯转发，供应商自己已在运行'),
                   ButtonSegment(
                       value: 'managed',
                       icon: Icon(Icons.settings_suggest),
-                      label: Text('托管'),
+                      label: Text('内置'),
                       tooltip: '本应用负责拉起并守护本地进程'),
                 ],
                 selected: {type},
@@ -372,7 +379,10 @@ class _ModelsPageState extends State<ModelsPage> {
 
   Widget _tile(ModelRoute r, {bool showAlias = true}) {
     final info = r.upstream.modelInfo[r.upstreamModel];
-    final alias = r.bare ? '${r.upstream.id}/${r.upstreamModel}' : (widget.service.registry.resolve(r.upstreamModel) != null ? r.upstreamModel : null);
+    final known = r.bare ? '${r.upstream.id}/${r.upstreamModel}' : (widget.service.registry.resolve(r.upstreamModel) != null ? r.upstreamModel : null);
+    final alias = showAlias ? known : null;
+    final pretty = info?.displayName;
+    final hasPretty = pretty != null && pretty != r.upstreamModel && pretty != r.publicName;
     return ListTile(
       dense: true,
       leading: Icon(
@@ -384,19 +394,34 @@ class _ModelsPageState extends State<ModelsPage> {
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            info?.displayName != null && info!.displayName != r.upstreamModel
-                ? '${r.publicName}  · ${info.displayName}'
-                : r.publicName,
-            style: const TextStyle(
-                fontFamily: 'monospace', fontSize: 13.5)),
+          Text(hasPretty ? pretty : r.publicName,
+              style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: hasPretty ? FontWeight.w600 : FontWeight.normal,
+                  fontFamily: hasPretty ? null : 'monospace')),
+          if (hasPretty)
+            Text.rich(
+              TextSpan(
+                style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    color: Colors.grey),
+                children: [
+                  TextSpan(text: r.publicName),
+                  if (alias != null && alias != r.publicName)
+                    TextSpan(text: '（别名 $alias）'),
+                ],
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            )
+          else if (alias != null && alias != r.publicName)
+            Text('别名 $alias',
+                style: const TextStyle(fontSize: 11, color: Colors.grey)),
           const SizedBox(height: 3),
           _capChips(r),
         ],
       ),
-      subtitle: (showAlias && alias != null)
-          ? Text('别名可直用：$alias', style: const TextStyle(fontSize: 11))
-          : null,
       trailing: IconButton(
         icon: const Icon(Icons.copy, size: 16),
         tooltip: '复制模型名',
@@ -493,23 +518,77 @@ class _ModelsPageState extends State<ModelsPage> {
 
 // ---------------- 用量页 ----------------
 
-class UsagePage extends StatelessWidget {
+class UsagePage extends StatefulWidget {
   final GatewayService service;
   const UsagePage({super.key, required this.service});
 
   @override
+  State<UsagePage> createState() => _UsagePageState();
+}
+
+class _UsagePageState extends State<UsagePage> {
+  /// 今日/本周/本月/所有的天数范围；null = 所有
+  int? _days;
+  UsageStats _stats = UsageStats();
+  int _loadedCount = -1;
+
+  static const _views = <String, int?>{
+    '今日': 1,
+    '本周': 7,
+    '本月': 30,
+    '所有': null,
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final server = widget.service.server;
+    if (server == null) return;
+    final s = await server.usageRange(days: _days);
+    if (!mounted) return;
+    setState(() {
+      _stats = s;
+      _loadedCount = server.usageToday.requests;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final service = widget.service;
     return AnimatedBuilder(
       animation: service,
       builder: (context, _) {
         final server = service.server;
         if (server == null) return const Center(child: Text('网关未启动'));
-        final u = server.usageToday;
+        // 记账数变化时刷新历史聚合
+        if (server.usageToday.requests != _loadedCount) _load();
+        final u = _stats;
         final cs = Theme.of(context).colorScheme;
         final logs = server.logs.reversed.take(100).toList();
+        final trend = u.trend.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            SegmentedButton<String>(
+              segments: [
+                for (final e in _views.entries)
+                  ButtonSegment(value: e.key, label: Text(e.key)),
+              ],
+              selected: {
+                _views.entries
+                    .firstWhere((e) => e.value == _days)
+                    .key
+              },
+              onSelectionChanged: (sel) {
+                setState(() => _days = _views[sel.first]);
+                _load();
+              },
+            ),
+            const SizedBox(height: 16),
             Wrap(
               spacing: 12,
               runSpacing: 12,
@@ -520,21 +599,25 @@ class UsagePage extends StatelessWidget {
                 _StatCard('输出 tokens', '${u.completionTokens}', cs.tertiaryContainer),
               ],
             ),
-            const SizedBox(height: 16),
-            if (u.byModel.isNotEmpty) ...[
-              const Text('按模型', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 20),
+            if (u.requests > 0) ...[
+              Text(_days == 1 ? '请求趋势（按小时）' : '请求趋势（按天）',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 10),
+              _TrendChart(data: trend, color: cs.primary),
+              const SizedBox(height: 20),
+              const Text('按模型请求数',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
               const SizedBox(height: 8),
-              ...u.byModel.entries
-                  .map((e) => ListTile(
-                        dense: true,
-                        title: Text(e.key,
-                            style: const TextStyle(
-                                fontFamily: 'monospace', fontSize: 13)),
-                        trailing: Text('${e.value} 次'),
-                      ))
-                  ,
+              _BarList(data: u.byModel, color: cs.tertiary),
               const SizedBox(height: 16),
-            ],
+            ] else
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 24),
+                child: Center(
+                    child: Text('该时段暂无请求',
+                        style: TextStyle(color: cs.onSurfaceVariant))),
+              ),
             const Text('网关日志（本次运行）',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
@@ -556,6 +639,124 @@ class UsagePage extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+/// 纵向柱状图（趋势）：键在下方（小时/日期），柱高按最大值归一
+class _TrendChart extends StatelessWidget {
+  final List<MapEntry<String, int>> data;
+  final Color color;
+  const _TrendChart({required this.data, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    if (data.isEmpty) return const SizedBox.shrink();
+    final max = data.map((e) => e.value).reduce((a, b) => a > b ? a : b);
+    return SizedBox(
+      height: 150,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          for (final e in data)
+            Expanded(
+              flex: data.length > 40 ? 1 : (data.length > 16 ? 1 : 2),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Text('${e.value}',
+                        style: const TextStyle(fontSize: 9, height: 1.2)),
+                    const SizedBox(height: 2),
+                    FractionallySizedBox(
+                      alignment: Alignment.bottomCenter,
+                      heightFactor: (e.value / max).clamp(0.02, 1.0),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: color,
+                          borderRadius:
+                              const BorderRadius.vertical(top: Radius.circular(3)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(e.key,
+                        overflow: TextOverflow.clip,
+                        maxLines: 1,
+                        style: TextStyle(
+                            fontSize: data.length > 14 ? 8 : 9.5,
+                            color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 横向条形列表（按模型请求数）
+class _BarList extends StatelessWidget {
+  final Map<String, int> data;
+  final Color color;
+  const _BarList({required this.data, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    final entries = data.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final max = entries.isEmpty ? 1 : entries.first.value;
+    return Column(
+      children: [
+        for (final e in entries)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 190,
+                  child: Text(e.key,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontFamily: 'monospace', fontSize: 12)),
+                ),
+                Expanded(
+                  child: LayoutBuilder(builder: (context, c) {
+                    return Stack(
+                      children: [
+                        Container(
+                          height: 18,
+                          decoration: BoxDecoration(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .surfaceContainerHighest,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                        Container(
+                          height: 18,
+                          width: (c.maxWidth * e.value / max).clamp(2.0, c.maxWidth),
+                          decoration: BoxDecoration(
+                            color: color,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                      ],
+                    );
+                  }),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                    width: 44,
+                    child: Text('${e.value} 次',
+                        textAlign: TextAlign.end,
+                        style: const TextStyle(fontSize: 12))),
+              ],
+            ),
+          ),
+      ],
     );
   }
 }
@@ -765,7 +966,7 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             Text(
               'ZeroApi — 零汇聚合网关。把多个 OpenAI 兼容供应商聚合为一个统一入口；'
-              '托管型供应商由本应用负责拉起与守护。'
+              '内置型供应商由本应用负责拉起与守护。'
               '模型命名：供应商id/模型名；跨供应商不重名时可直接用裸名。',
               style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
             ),

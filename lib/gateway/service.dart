@@ -30,7 +30,7 @@ class GatewayService extends ChangeNotifier {
     unawaited(ModelsDev.instance.start());
     _runtimes.clear();
     for (final def in config.upstreams) {
-      final rt = UpstreamRuntime(def);
+      final rt = UpstreamRuntime(def)..onStatusChanged = notifyListeners;
       _runtimes.add(rt);
       rt.startPeriodicProbe();
     }
@@ -71,7 +71,7 @@ class GatewayService extends ChangeNotifier {
 
   void addUpstream(UpstreamDef def) {
     config.upstreams.add(def);
-    final rt = UpstreamRuntime(def);
+    final rt = UpstreamRuntime(def)..onStatusChanged = notifyListeners;
     _runtimes.add(rt);
     rt.startPeriodicProbe();
     config.save();
