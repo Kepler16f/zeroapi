@@ -1,6 +1,6 @@
 ; ZeroApi (零汇) — Windows 安装包脚本 (Inno Setup 6)
 ; 用法（在项目根目录，已先 flutter build windows）：
-;   iscc /DMyArch=arm64 /DMyVersion=1.2.0 packaging\zeroapi.iss
+;   iscc /DMyArch=arm64 /DMyVersion=0.1.2 packaging\zeroapi.iss
 ;   （iscc 位于 %LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe）
 ; 产物：installer\zeroapi-setup-<arch>-<version>.exe
 
@@ -9,7 +9,7 @@
 #ifdef MyVersion
   #define MyAppVersion MyVersion
 #else
-  #define MyAppVersion "1.2.0"
+  #define MyAppVersion "0.1.2"
 #endif
 #ifndef MyArch
   #define MyArch "arm64"
