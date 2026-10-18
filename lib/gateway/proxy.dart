@@ -42,6 +42,10 @@ class ModelRegistry {
 class UsageStats {
   int requests = 0, errors = 0, promptTokens = 0, completionTokens = 0;
   final Map<String, int> byModel = {};
+  /// 按模型的词元总量（输入+输出）：用量图按此排序/占比，次数仅并列展示
+  final Map<String, int> byModelTokens = {};
+  /// 按天词元总量（MM-dd → tokens）：周/月/总视图折线的纵轴
+  final Map<String, int> byDayTokens = {};
   final Map<String, int> trend = {};
 
   void add(String model, int prompt, int completion, bool isError, {String? trendKey}) {
@@ -50,8 +54,11 @@ class UsageStats {
     completionTokens += completion;
     if (isError) errors++;
     byModel.update(model, (v) => v + 1, ifAbsent: () => 1);
+    final tokens = prompt + completion;
+    byModelTokens.update(model, (v) => v + tokens, ifAbsent: () => tokens);
     if (trendKey != null) {
       trend.update(trendKey, (v) => v + 1, ifAbsent: () => 1);
+      byDayTokens.update(trendKey, (v) => v + tokens, ifAbsent: () => tokens);
     }
   }
 
@@ -61,10 +68,14 @@ class UsageStats {
     promptTokens += o.promptTokens;
     completionTokens += o.completionTokens;
     o.byModel.forEach((k, v) => byModel.update(k, (x) => x + v, ifAbsent: () => v));
+    o.byModelTokens.forEach((k, v) => byModelTokens.update(k, (x) => x + v, ifAbsent: () => v));
     if (trendKey != null) {
       trend.update(trendKey, (x) => x + o.requests, ifAbsent: () => o.requests);
+      byDayTokens.update(trendKey, (x) => x + o.promptTokens + o.completionTokens,
+          ifAbsent: () => o.promptTokens + o.completionTokens);
     } else {
       o.trend.forEach((k, v) => trend.update(k, (x) => x + v, ifAbsent: () => v));
+      o.byDayTokens.forEach((k, v) => byDayTokens.update(k, (x) => x + v, ifAbsent: () => v));
     }
   }
 
@@ -74,6 +85,7 @@ class UsageStats {
         'promptTokens': promptTokens,
         'completionTokens': completionTokens,
         'byModel': byModel,
+        'byModelTokens': byModelTokens,
       };
 }
 
@@ -89,6 +101,12 @@ class ProxyServer {
   final _logLines = <String>[]; // 环形日志，UI 展示
   static const _maxLog = 200;
   String _usageDay = DateTime.now().toIso8601String().substring(0, 10);
+
+  /// 未知模型时的自救：由 GatewayService 注入"重探全部上游 + 重建路由"。
+  /// 上游模型目录是动态的（如 opencode 随 models.dev 上新/重启后变化），
+  /// 本地路由表可能滞后；重探一次仍找不到才 404，与上游目录严格同步。
+  Future<void> Function()? onUnknownModel;
+  DateTime _lastUnknownRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 统一记账：内存当日汇总（含小时趋势）+ jsonl 落盘（跨天自动换文件）
   void _account(String model, String upstream, int p, int c, bool err) {
@@ -293,13 +311,29 @@ class ProxyServer {
   Future<ModelRoute?> _resolveRoute(
       Map<String, dynamic> body, HttpRequest req, {bool anthropicErrors = false}) async {
     final publicName = (body['model'] ?? '') as String;
-    final route = registry.resolve(publicName);
+    var route = registry.resolve(publicName);
     void fail(String msg, String openaiType, String anthropicType, int status) => anthropicErrors
         ? _json(req, {'type': 'error', 'error': {'message': msg, 'type': anthropicType}}, status)
         : _json(req, {'error': {'message': msg, 'type': openaiType}}, status);
     if (route == null) {
-      fail('未知模型 $publicName，见 GET /v1/models', 'unknown_model', 'not_found_error', 404);
-      return null;
+      final refresh = onUnknownModel;
+      // 5 秒去抖：并发 404 只触发一次全量重探
+      if (refresh != null &&
+          DateTime.now().difference(_lastUnknownRefresh) >= const Duration(seconds: 5)) {
+        _lastUnknownRefresh = DateTime.now();
+        _log('未知模型 $publicName：重探上游目录…');
+        try {
+          await refresh().timeout(const Duration(seconds: 30), onTimeout: () {});
+        } catch (_) {}
+        route = registry.resolve(publicName);
+        if (route != null) {
+          _log('未知模型 $publicName：重探后已收录（${route.upstream.id}）');
+        }
+      }
+      if (route == null) {
+        fail('未知模型 $publicName，见 GET /v1/models', 'unknown_model', 'not_found_error', 404);
+        return null;
+      }
     }
     final u = route.upstream;
     if (u.health != UpstreamHealth.healthy) {
@@ -380,8 +414,10 @@ class ProxyServer {
         ureq.headers.set('Authorization', 'Bearer ${u.def.apiKey}');
       }
       ureq.add(utf8.encode(jsonEncode(body)));
+      // 首字节超时对齐上游 REQUEST_TIMEOUT_MS（内置 zen 为 1h）并留余量：
+      // 免费模型思考几分钟属正常，不能比上游先掐断
       final uresp = await ureq.close().timeout(
-            isStream ? const Duration(hours: 2) : const Duration(minutes: 10),
+            isStream ? const Duration(hours: 2) : const Duration(minutes: 70),
           );
 
       if (uresp.statusCode != 200) {

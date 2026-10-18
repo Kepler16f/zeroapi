@@ -30,12 +30,15 @@ class GatewayService extends ChangeNotifier {
     unawaited(ModelsDev.instance.start());
     _runtimes.clear();
     for (final def in config.upstreams) {
-      final rt = UpstreamRuntime(def)..onStatusChanged = notifyListeners;
+      // 供应商预热就绪时立即重建路由表（不等 60s 周期刷新），
+      // 否则冷启动后模型要干等下一轮刷新才出现
+      final rt = UpstreamRuntime(def)..onStatusChanged = refreshRoutesNow;
       _runtimes.add(rt);
       rt.startPeriodicProbe();
     }
     server = ProxyServer(config.host, config.port, config.apiKey, registry,
-        anthropicEnabled: config.anthropicEnabled);
+        anthropicEnabled: config.anthropicEnabled)
+      ..onUnknownModel = _refreshRoutes;
     try {
       await server!.start();
       running = true;
@@ -97,6 +100,7 @@ class GatewayService extends ChangeNotifier {
       ..apiKey = newDef.apiKey
       ..command = newDef.command
       ..args = newDef.args
+      ..env = newDef.env
       ..enabled = newDef.enabled;
     final i = config.upstreams.indexWhere((x) => x.id == old.id);
     if (i >= 0) config.upstreams[i] = newDef;
@@ -159,6 +163,14 @@ class GatewayService extends ChangeNotifier {
     config.anthropicEnabled = enabled;
     config.save();
     await restartServer();
+  }
+
+  /// 关窗行为仅写入 config.json；windows/runner 的 C++ 层在每次 WM_CLOSE
+  /// 时重新读取，切换即时生效，无需重启网关或应用
+  void setCloseToTray(bool enabled) {
+    config.closeToTray = enabled;
+    config.save();
+    notifyListeners();
   }
 
   @override

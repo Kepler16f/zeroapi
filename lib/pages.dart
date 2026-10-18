@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -529,6 +530,8 @@ class UsagePage extends StatefulWidget {
 class _UsagePageState extends State<UsagePage> {
   /// 今日/本周/本月/所有的天数范围；null = 所有
   int? _days;
+  /// 图表形态：柱状/饼图/折线（折线仅跨天视图可用）
+  String _chart = 'bar';
   UsageStats _stats = UsageStats();
   int _loadedCount = -1;
 
@@ -569,26 +572,16 @@ class _UsagePageState extends State<UsagePage> {
         final u = _stats;
         final cs = Theme.of(context).colorScheme;
         final logs = server.logs.reversed.take(100).toList();
-        final trend = u.trend.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
+        final crossDay = _days != 1;
+        final chartTypes = <String, String>{
+          'bar': '柱状',
+          'pie': '饼图',
+          if (crossDay) 'line': '折线',
+        };
+        if (_chart == 'line' && !crossDay) _chart = 'bar';
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            SegmentedButton<String>(
-              segments: [
-                for (final e in _views.entries)
-                  ButtonSegment(value: e.key, label: Text(e.key)),
-              ],
-              selected: {
-                _views.entries
-                    .firstWhere((e) => e.value == _days)
-                    .key
-              },
-              onSelectionChanged: (sel) {
-                setState(() => _days = _views[sel.first]);
-                _load();
-              },
-            ),
-            const SizedBox(height: 16),
             Wrap(
               spacing: 12,
               runSpacing: 12,
@@ -599,17 +592,56 @@ class _UsagePageState extends State<UsagePage> {
                 _StatCard('输出 tokens', '${u.completionTokens}', cs.tertiaryContainer),
               ],
             ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                SegmentedButton<String>(
+                  segments: [
+                    for (final e in _views.entries)
+                      ButtonSegment(value: e.key, label: Text(e.key)),
+                  ],
+                  selected: {
+                    _views.entries.firstWhere((e) => e.value == _days).key
+                  },
+                  onSelectionChanged: (sel) {
+                    setState(() {
+                      _days = _views[sel.first];
+                      // 折线图仅跨天视图可用
+                      if (_days == 1 && _chart == 'line') _chart = 'bar';
+                    });
+                    _load();
+                  },
+                ), Spacer(),
+                SegmentedButton<String>(
+                  showSelectedIcon: false,
+                  segments: [
+                    for (final e in chartTypes.entries)
+                      ButtonSegment(value: e.key, label: Text(e.value)),
+                  ],
+                  selected: {_chart},
+                  onSelectionChanged: (sel) =>
+                      setState(() => _chart = sel.first),
+                ),
+              ],
+            ),
             const SizedBox(height: 20),
             if (u.requests > 0) ...[
-              Text(_days == 1 ? '请求趋势（按小时）' : '请求趋势（按天）',
-                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text(
+                _chart == 'line'
+                    ? '词元用量趋势（按天）'
+                    : '按模型词元用量（输入+输出）',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 10),
-              _TrendChart(data: trend, color: cs.primary),
-              const SizedBox(height: 20),
-              const Text('按模型请求数',
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 8),
-              _BarList(data: u.byModel, color: cs.tertiary),
+              if (_chart == 'bar')
+                _TokenBarChart(stats: u)
+              else if (_chart == 'pie')
+                _PieChart(stats: u)
+              else
+                _LineChart(
+                  data: (u.byDayTokens.entries.toList()
+                    ..sort((a, b) => a.key.compareTo(b.key))),
+                ),
               const SizedBox(height: 16),
             ] else
               Padding(
@@ -643,50 +675,76 @@ class _UsagePageState extends State<UsagePage> {
   }
 }
 
-/// 纵向柱状图（趋势）：键在下方（小时/日期），柱高按最大值归一
-class _TrendChart extends StatelessWidget {
-  final List<MapEntry<String, int>> data;
-  final Color color;
-  const _TrendChart({required this.data, required this.color});
+String _fmtTokens(int n) {
+  if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(n >= 10000000 ? 0 : 1)}M';
+  if (n >= 1000) return '${(n / 1000).toStringAsFixed(n >= 10000 ? 0 : 1)}K';
+  return '$n';
+}
+
+List<Color> _tokenPalette(BuildContext context) {
+  final cs = Theme.of(context).colorScheme;
+  return [
+    cs.primary,
+    cs.tertiary,
+    cs.secondary,
+    cs.error,
+    cs.primary.withValues(alpha: 0.6),
+    cs.tertiary.withValues(alpha: 0.6),
+    cs.secondary.withValues(alpha: 0.6),
+    cs.error.withValues(alpha: 0.6),
+  ];
+}
+
+/// 柱状图：按模型词元用量排序/柱高，次数与 token 数并列显示
+class _TokenBarChart extends StatelessWidget {
+  final UsageStats stats;
+  const _TokenBarChart({required this.stats});
 
   @override
   Widget build(BuildContext context) {
-    if (data.isEmpty) return const SizedBox.shrink();
-    final max = data.map((e) => e.value).reduce((a, b) => a > b ? a : b);
+    final entries = stats.byModelTokens.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    if (entries.isEmpty) return const SizedBox.shrink();
+    final max = entries.first.value;
+    final palette = _tokenPalette(context);
     return SizedBox(
-      height: 150,
+      height: 230,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          for (final e in data)
+          for (var i = 0; i < entries.length; i++)
             Expanded(
-              flex: data.length > 40 ? 1 : (data.length > 16 ? 1 : 2),
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
-                    Text('${e.value}',
-                        style: const TextStyle(fontSize: 9, height: 1.2)),
-                    const SizedBox(height: 2),
+                    Text(_fmtTokens(entries[i].value),
+                        style: const TextStyle(fontSize: 10, height: 1.2)),
+                    Text('${stats.byModel[entries[i].key] ?? 0} 次',
+                        style: const TextStyle(
+                            fontSize: 9.5, color: Colors.grey, height: 1.2)),
+                    const SizedBox(height: 3),
                     FractionallySizedBox(
                       alignment: Alignment.bottomCenter,
-                      heightFactor: (e.value / max).clamp(0.02, 1.0),
+                      heightFactor: max == 0
+                          ? 0.02
+                          : (entries[i].value / max).clamp(0.03, 0.72),
                       child: Container(
                         decoration: BoxDecoration(
-                          color: color,
+                          color: palette[i % palette.length],
                           borderRadius:
-                              const BorderRadius.vertical(top: Radius.circular(3)),
+                              const BorderRadius.vertical(top: Radius.circular(4)),
                         ),
                       ),
                     ),
-                    const SizedBox(height: 4),
-                    Text(e.key,
-                        overflow: TextOverflow.clip,
-                        maxLines: 1,
-                        style: TextStyle(
-                            fontSize: data.length > 14 ? 8 : 9.5,
-                            color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                    const SizedBox(height: 6),
+                    Text(entries[i].key,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 9.5, fontFamily: 'monospace')),
                   ],
                 ),
               ),
@@ -697,68 +755,176 @@ class _TrendChart extends StatelessWidget {
   }
 }
 
-/// 横向条形列表（按模型请求数）
-class _BarList extends StatelessWidget {
-  final Map<String, int> data;
-  final Color color;
-  const _BarList({required this.data, required this.color});
+/// 饼图：模型词元占比 + 图例（次数并列显示）
+class _PieChart extends StatelessWidget {
+  final UsageStats stats;
+  const _PieChart({required this.stats});
 
   @override
   Widget build(BuildContext context) {
-    final entries = data.entries.toList()
+    final entries = stats.byModelTokens.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
-    final max = entries.isEmpty ? 1 : entries.first.value;
-    return Column(
+    final total = entries.fold<int>(0, (s, e) => s + e.value);
+    if (total == 0) return const SizedBox.shrink();
+    final palette = _tokenPalette(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        for (final e in entries)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 3),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 190,
-                  child: Text(e.key,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          fontFamily: 'monospace', fontSize: 12)),
-                ),
-                Expanded(
-                  child: LayoutBuilder(builder: (context, c) {
-                    return Stack(
-                      children: [
-                        Container(
-                          height: 18,
-                          decoration: BoxDecoration(
-                            color: Theme.of(context)
-                                .colorScheme
-                                .surfaceContainerHighest,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                        ),
-                        Container(
-                          height: 18,
-                          width: (c.maxWidth * e.value / max).clamp(2.0, c.maxWidth),
-                          decoration: BoxDecoration(
-                            color: color,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                        ),
-                      ],
-                    );
-                  }),
-                ),
-                const SizedBox(width: 8),
-                SizedBox(
-                    width: 44,
-                    child: Text('${e.value} 次',
-                        textAlign: TextAlign.end,
-                        style: const TextStyle(fontSize: 12))),
+        SizedBox(
+          width: 160,
+          height: 160,
+          child: CustomPaint(
+            painter: _PiePainter(
+              slices: [
+                for (var i = 0; i < entries.length; i++)
+                  _PieSlice(entries[i].value / total * pi * 2,
+                      palette[i % palette.length])
               ],
             ),
           ),
+        ),
+        const SizedBox(width: 20),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (var i = 0; i < entries.length && i < 8; i++)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(children: [
+                    Container(
+                        width: 10,
+                        height: 10,
+                        decoration: BoxDecoration(
+                            color: palette[i % palette.length],
+                            borderRadius: BorderRadius.circular(2))),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(entries[i].key,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontFamily: 'monospace', fontSize: 11.5)),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                        '${_fmtTokens(entries[i].value)} tok · ${stats.byModel[entries[i].key] ?? 0} 次 · ${(entries[i].value / total * 100).toStringAsFixed(1)}%',
+                        style: TextStyle(
+                            fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                  ]),
+                ),
+            ],
+          ),
+        ),
       ],
     );
   }
+}
+
+class _PieSlice {
+  final double sweep;
+  final Color color;
+  const _PieSlice(this.sweep, this.color);
+}
+
+class _PiePainter extends CustomPainter {
+  final List<_PieSlice> slices;
+  const _PiePainter({required this.slices});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    var start = -pi / 2;
+    final paint = Paint()..style = PaintingStyle.fill;
+    for (final s in slices) {
+      paint.color = s.color;
+      canvas.drawArc(rect, start, s.sweep, true, paint);
+      start += s.sweep;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _PiePainter old) => old.slices != slices;
+}
+
+/// 折线图：按天词元用量趋势
+class _LineChart extends StatelessWidget {
+  final List<MapEntry<String, int>> data;
+  const _LineChart({required this.data});
+
+  @override
+  Widget build(BuildContext context) {
+    if (data.isEmpty) return const SizedBox.shrink();
+    final max = data.map((e) => e.value).fold<int>(0, (a, b) => a > b ? a : b);
+    return SizedBox(
+      height: 180,
+      child: CustomPaint(
+        size: Size.infinite,
+        painter: _LinePainter(
+          points: data.map((e) => e.value.toDouble()).toList(),
+          labels: data.map((e) => e.key).toList(),
+          maxValue: (max == 0 ? 1 : max).toDouble(),
+          color: Theme.of(context).colorScheme.primary,
+        ),
+      ),
+    );
+  }
+}
+
+class _LinePainter extends CustomPainter {
+  final List<double> points;
+  final List<String> labels;
+  final double maxValue;
+  final Color color;
+  const _LinePainter(
+      {required this.points,
+      required this.labels,
+      required this.maxValue,
+      required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const bottomPad = 22.0, topPad = 14.0;
+    final w = size.width, h = size.height - bottomPad;
+    final step = points.length > 1 ? (w - 24) / (points.length - 1) : 0.0;
+    double x(int i) => 12 + (points.length > 1 ? i * step : (w - 24) / 2);
+    double y(double v) => topPad + (h - topPad) * (1 - v / maxValue);
+
+    // 面积填充
+    final path = Path()..moveTo(x(0), y(points[0]));
+    for (var i = 1; i < points.length; i++) {
+      path.lineTo(x(i), y(points[i]));
+    }
+    path.lineTo(x(points.length - 1), h);
+    path.lineTo(x(0), h);
+    path.close();
+    canvas.drawPath(path, Paint()..color = color.withValues(alpha: 0.12));
+
+    // 折线
+    final line = Path()..moveTo(x(0), y(points[0]));
+    for (var i = 1; i < points.length; i++) {
+      line.lineTo(x(i), y(points[i]));
+    }
+    canvas.drawPath(
+        line, Paint()..color = color..strokeWidth = 2..style = PaintingStyle.stroke..strokeCap = StrokeCap.round);
+
+    // 数据点 + 标签（点多时只画间隔点）
+    final labelEvery = (points.length / 8).ceil();
+    final tp = TextPainter(textDirection: TextDirection.ltr);
+    for (var i = 0; i < points.length; i++) {
+      canvas.drawCircle(Offset(x(i), y(points[i])), 3, Paint()..color = color);
+      if (i % labelEvery == 0 || i == points.length - 1) {
+        tp.text = TextSpan(
+            text: labels[i],
+            style: const TextStyle(fontSize: 9, color: Colors.grey));
+        tp.layout();
+        tp.paint(canvas, Offset(x(i) - tp.width / 2, size.height - bottomPad + 4));
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _LinePainter old) =>
+      old.points != points || old.maxValue != maxValue;
 }
 
 class _StatCard extends StatelessWidget {
@@ -933,6 +1099,25 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
               selected: {s.config.themeMode},
               onSelectionChanged: (sel) => s.setThemeMode(sel.first),
+            ),
+            const SizedBox(height: 24),
+            const Text('窗口行为', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(
+                    value: true,
+                    icon: Icon(Icons.minimize),
+                    label: Text('收起到托盘'),
+                    tooltip: '点关闭隐藏到系统托盘，网关继续运行'),
+                ButtonSegment(
+                    value: false,
+                    icon: Icon(Icons.close),
+                    label: Text('退出应用'),
+                    tooltip: '点关闭直接退出'),
+              ],
+              selected: {s.config.closeToTray},
+              onSelectionChanged: (sel) => s.setCloseToTray(sel.first),
             ),
             const SizedBox(height: 24),
             const Text('协议适配', style: TextStyle(fontWeight: FontWeight.bold)),

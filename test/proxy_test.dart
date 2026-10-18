@@ -118,6 +118,31 @@ void main() {
     expect(resp.statusCode, 404);
   });
 
+  test('未知模型触发重探后命中', () async {
+    // 模拟路由表滞后：清空后按 stale 解析不到，但上游实际有该模型
+    registry.rebuild([]);
+    proxy.onUnknownModel = () async {
+      await runtime.probe();
+      registry.rebuild([runtime]);
+    };
+    final resp = await gw('POST', '/v1/chat/completions',
+        {'model': 'gpt-test', 'messages': []});
+    expect(resp.statusCode, 200);
+    final body = jsonDecode(await utf8.decodeStream(resp));
+    expect(body['choices'][0]['message']['content'], 'hello gpt-test');
+  });
+
+  test('重探后仍不存在的模型返回 404', () async {
+    registry.rebuild([]);
+    proxy.onUnknownModel = () async {
+      await runtime.probe();
+      registry.rebuild([runtime]);
+    };
+    final resp = await gw('POST', '/v1/chat/completions',
+        {'model': 'truly-unknown', 'messages': []});
+    expect(resp.statusCode, 404);
+  });
+
   test('usageRange 今日聚合含内存记账与小时趋势', () async {
     await gw('POST', '/v1/chat/completions',
         {'model': 'fake/gpt-test', 'messages': []});
@@ -129,6 +154,9 @@ void main() {
     expect(s.trend.length, greaterThanOrEqualTo(1)); // 小时桶
     // tokens 来自 fake 上游固定值（prompt 10 / completion 5 每次）
     expect(s.promptTokens, greaterThanOrEqualTo(10));
+    // 按 token 聚合：桶值 = prompt+completion，供柱/饼图排序占比
+    expect(s.byModelTokens['fake/gpt-test'], greaterThanOrEqualTo(15));
+    expect(s.byModelTokens['gpt-test'], greaterThanOrEqualTo(15));
   });
 
   test('错误网关 key 返回 401', () async {
