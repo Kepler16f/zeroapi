@@ -36,6 +36,19 @@ void main() {
       }
       if (path.endsWith('/chat/completions')) {
         final body = jsonDecode(await utf8.decodeStream(req));
+        if (body['stream'] == true) {
+          // 含 CJK 与 em-dash 的流式输出：latin1 编码会在写响应体时抛
+          // 'Contains invalid characters'，用于回归 SSE utf-8 修复
+          req.response.headers.contentType =
+              ContentType('text', 'event-stream', charset: 'utf-8');
+          req.response.add(utf8.encode(
+              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"你好 — 底层"}}]}\n\n'));
+          req.response.add(utf8.encode(
+              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\n'));
+          req.response.add(utf8.encode('data: [DONE]\n\n'));
+          await req.response.close();
+          return;
+        }
         req.response
           ..headers.contentType = ContentType.json
           ..write(jsonEncode({
@@ -163,6 +176,29 @@ void main() {
     // 按 token 聚合：桶值 = prompt+completion，供柱/饼图排序占比
     expect(s.byModelTokens['fake/gpt-test'], greaterThanOrEqualTo(15));
     expect(s.byModelTokens['gpt-test'], greaterThanOrEqualTo(15));
+  });
+
+  test('SSE 含 CJK 不崩：/v1/messages 流式（Anthropic 转换路径）完整读回', () async {
+    final req = await client.openUrl('POST',
+        Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/messages'));
+    req.headers.set('Authorization', 'Bearer sk-gw');
+    req.headers.contentType = ContentType.json;
+    req.add(utf8.encode(jsonEncode({
+      'model': 'fake/gpt-test',
+      'messages': [
+        {'role': 'user', 'content': 'hi'}
+      ],
+      'stream': true,
+      'max_tokens': 64,
+    })));
+    final resp = await req.close();
+    expect(resp.statusCode, 200);
+    expect(resp.headers.contentType?.charset?.toLowerCase(), 'utf-8');
+    final text = await utf8.decodeStream(resp);
+    expect(text, contains('content_block_delta'));
+    expect(text, contains('你好'));
+    expect(text, contains('—')); // em-dash：latin1 写路径会在这里炸
+    expect(text, contains('message_stop'));
   });
 
   test('错误网关 key 返回 401', () async {

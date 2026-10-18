@@ -495,8 +495,10 @@ class ProxyServer {
 
       if (isStream && anthropic) {
         // Anthropic 模式：OpenAI chunk 逐条翻译成 Claude SSE 事件
+        // charset 必须显式 utf-8：SSE 事件含模型原文（CJK/em-dash），
+        // 缺省 latin1 编码会让 write() 抛 'Contains invalid characters'
         req.response.headers
-          ..contentType = ContentType('text', 'event-stream')
+          ..contentType = ContentType('text', 'event-stream', charset: 'utf-8')
           ..set('Cache-Control', 'no-cache')
           ..set('x-zeroapi-upstream', u.id);
         req.response.statusCode = 200;
@@ -527,7 +529,7 @@ class ProxyServer {
               } catch (_) {}
             }
             for (final ev in evs) {
-              req.response.write(ev);
+              req.response.add(utf8.encode(ev));
             }
             await req.response.flush();
           }
@@ -537,7 +539,7 @@ class ProxyServer {
         _log('$publicName ✓ stream ${u.id}$tag');
       } else if (isStream) {
         req.response.headers
-          ..contentType = ContentType('text', 'event-stream')
+          ..contentType = ContentType('text', 'event-stream', charset: 'utf-8')
           ..set('Cache-Control', 'no-cache')
           ..set('x-zeroapi-upstream', u.id);
         req.response.statusCode = 200;
@@ -811,10 +813,14 @@ class ProxyServer {
     var committed = false;
     var done = false;
 
+    // 响应体必须按 utf-8 写出：免费模型输出常含 CJK/em-dash 等 latin1 覆盖不
+    // 了的字符，若 contentType 不带 charset，Dart 会回落 latin1 编码，write()
+    // 直接抛 'Contains invalid characters' 截断已提交的流。显式带 utf-8，并用
+    // add(utf8.encode(...)) 按字节写，彻底绕开响应默认编码假设。
     void commit() {
       if (committed) return;
       req.response.headers
-        ..contentType = ContentType('text', 'event-stream')
+        ..contentType = ContentType('text', 'event-stream', charset: 'utf-8')
         ..set('Cache-Control', 'no-cache')
         ..set('x-zeroapi-upstream', route.upstream.id);
       req.response.statusCode = 200;
@@ -833,11 +839,11 @@ class ProxyServer {
         if (aStream != null) {
           commit();
           for (final ev in aStream.finish()) {
-            req.response.write(ev);
+            req.response.add(utf8.encode(ev));
           }
         } else {
           commit();
-          req.response.write('data: [DONE]\n\n');
+          req.response.add(utf8.encode('data: [DONE]\n\n'));
         }
         await req.response.flush();
         return;
@@ -861,13 +867,13 @@ class ProxyServer {
         if (evs.isNotEmpty) {
           commit();
           for (final ev in evs) {
-            req.response.write(ev);
+            req.response.add(utf8.encode(ev));
           }
           await req.response.flush();
         }
       } else if (out != null) {
         commit();
-        req.response.write('data: ${jsonEncode(out)}\n\n');
+        req.response.add(utf8.encode('data: ${jsonEncode(out)}\n\n'));
         await req.response.flush();
       }
     }
