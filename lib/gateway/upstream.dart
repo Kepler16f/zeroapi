@@ -125,7 +125,9 @@ class UpstreamRuntime {
     try {
       final logFile = _logSink();
       logFile?.writeln('[${DateTime.now().toIso8601String()}] spawn: $cmd ${def.args.join(" ")}');
-      Process.start(cmd, def.args).then((p) {
+      Process.start(cmd, def.args,
+              environment: def.env.isEmpty ? null : def.env)
+          .then((p) {
         child = p;
         lastSpawnAt = DateTime.now();
         onStatusChanged?.call();

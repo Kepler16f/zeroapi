@@ -50,3 +50,4 @@ installer/
 
 # 本地原始字体备份（子集版进仓库，原始 14MB 不进）
 tool/LXGWWenKaiLite-Regular-v1.522.ttf
+/vendor/
