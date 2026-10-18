@@ -85,11 +85,14 @@ class UpstreamRuntime {
     }
   }
 
-  /// zen：直连 OpenCode Zen inference API，列 free 档模型（无本地进程）
+  /// zen：直连 OpenCode Zen inference API，列 free 档模型（无本地进程）。
+  /// baseUrl 即 zen 通道入口：默认真直连；用户填自建反代（如 Cloudflare
+  /// Worker）时从反代出口 IP 出网，目录与补全都走同一条路。
   Future<bool> _probeZen() async {
     try {
+      final base = def.baseUrl.replaceAll(RegExp(r'/+$'), '');
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
-      final req = await client.getUrl(Uri.parse('${Zen.base}/models'));
+      final req = await client.getUrl(Uri.parse('$base/models'));
       Zen.headers(def.apiKey).forEach((k, v) => req.headers.set(k, v));
       final resp = await req.close().timeout(const Duration(seconds: 15));
       final body = await resp.transform(utf8.decoder).join();

@@ -767,7 +767,8 @@ class ProxyServer {
     Duration? retryAfter;
     try {
       final ureq = await _zenClientFor(u.def)
-          .openUrl('POST', Uri.parse('${Zen.base}/chat/completions'));
+          .openUrl('POST', Uri.parse(
+              '${u.def.baseUrl.replaceAll(RegExp(r'/+$'), '')}/chat/completions'));
       Zen.headers(u.def.apiKey).forEach((k, v) => ureq.headers.set(k, v));
       ureq.headers.set('Content-Type', 'application/json');
       ureq.add(utf8.encode(jsonEncode(sent)));
