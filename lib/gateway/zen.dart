@@ -1,5 +1,42 @@
 import 'dart:math';
 
+/// 单模型熔断器：某免费模型被 429/5xx 命中后，在冷却窗口内直接快速失败/转投，
+/// 避免高并发下每个请求都去撞坏端点（重试风暴会放大限流）。
+class ModelBreaker {
+  final Map<String, DateTime> _blockedUntil = {};
+  final Map<String, int> _failures = {};
+
+  /// 该模型当前是否处于冷却（熔断打开）
+  bool isOpen(String model) =>
+      (_blockedUntil[model]?.isAfter(DateTime.now())) ?? false;
+
+  /// 记一次失败：连败达到阈值即打开熔断，冷却随连败次数增长（封顶 60s）
+  void onFailure(String model, {Duration? retryAfter}) {
+    final n = (_failures[model] ?? 0) + 1;
+    _failures[model] = n;
+    final cooldown = retryAfter ??
+        Duration(
+            milliseconds: n < 3 ? 1000 : (min(60, 5 * n) * 1000));
+    final until = DateTime.now().add(cooldown);
+    final cur = _blockedUntil[model];
+    if (cur == null || until.isAfter(cur)) _blockedUntil[model] = until;
+  }
+
+  void onSuccess(String model) {
+    _failures.remove(model);
+    _blockedUntil.remove(model);
+  }
+
+  /// 熔断打开时，从候选里挑一个当前健康的免费模型（按调用方给的顺序）；
+  /// 全熔则返回 null。
+  String? pickHealthy(List<String> candidates) {
+    for (final c in candidates) {
+      if (!isOpen(c)) return c;
+    }
+    return null;
+  }
+}
+
 /// OpenCode Zen 免费层「直连」支持：不 spawn opencode 二进制，按同类高星项目
 /// （jcleng/opencode-free-provider 实测）复刻免费层要求的客户端指纹，直接调
 /// https://opencode.ai/inference/v1 。只暴露免费档模型（big-pickle / *-free），

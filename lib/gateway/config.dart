@@ -35,9 +35,8 @@ class UpstreamDef {
   /// 统一展示名：有备注用备注，否则用 id
   String get displayName => label.isNotEmpty ? label : id;
 
-  /// UI 类型标签：Zen 直连 / 内置 / 自定义
-  String get typeLabel =>
-      type == 'zen' ? 'Zen 直连' : (isManaged ? '内置' : '自定义');
+  /// UI 类型标签：zen 直连与 managed 都显示为「内置」
+  String get typeLabel => isManaged || type == 'zen' ? '内置' : '自定义';
 
   factory UpstreamDef.fromJson(Map<String, dynamic> j) => UpstreamDef(
         id: j['id'] as String,

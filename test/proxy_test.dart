@@ -13,9 +13,11 @@ void main() {
   late ModelRegistry registry;
   late UpstreamRuntime runtime;
   late String baseUrl;
+  late Directory usageDir;
   final client = HttpClient();
 
   setUp(() async {
+    usageDir = await Directory.systemTemp.createTemp('zeroapi-test-');
     fake = await HttpServer.bind('127.0.0.1', 0);
     baseUrl = 'http://127.0.0.1:${fake.port}/v1';
     fake.listen((req) async {
@@ -67,13 +69,17 @@ void main() {
     runtime = UpstreamRuntime(def);
     await runtime.probe();
     registry = ModelRegistry()..rebuild([runtime]);
-    proxy = ProxyServer('127.0.0.1', 0, 'sk-gw', registry);
+    proxy = ProxyServer('127.0.0.1', 0, 'sk-gw', registry,
+        usageDir: usageDir.path);
     await proxy.start();
   });
 
   tearDown(() async {
     await proxy.stop();
     await fake.close(force: true);
+    try {
+      usageDir.deleteSync(recursive: true);
+    } catch (_) {}
   });
 
   Future<HttpClientResponse> gw(String method, String path,
@@ -167,5 +173,27 @@ void main() {
     req.add(utf8.encode(jsonEncode({'model': 'fake/gpt-test'})));
     final resp = await req.close();
     expect(resp.statusCode, 401);
+  });
+
+  test('重启回填：当日 jsonl 在 start() 时载入内存用量', () async {
+    final day = DateTime.now().toIso8601String().substring(0, 10);
+    final dir = Directory(usageDir.path)..createSync(recursive: true);
+    File('${dir.path}/usage-$day.jsonl').writeAsStringSync(
+      '${jsonEncode({'ts': '${day}T08:00:00.000', 'model': 'rb-m1', 'upstream': 'zen', 'prompt': 11, 'completion': 7, 'error': false})}\n'
+      '${jsonEncode({'ts': '${day}T08:30:00.000', 'model': 'rb-m2', 'upstream': 'zen', 'prompt': 3, 'completion': 2, 'error': true})}\n'
+      '${jsonEncode({'ts': '${day}T23:59:59.000', 'model': 'rb-m3', 'upstream': 'zen', 'prompt': 1, 'completion': 1, 'error': false})}\n',
+      mode: FileMode.append,
+    );
+    // 模拟重启：全新 ProxyServer 启动即带回今天的记账
+    final p2 = ProxyServer('127.0.0.1', 0, 'sk-gw', ModelRegistry(),
+        usageDir: usageDir.path);
+    await p2.start();
+    expect(p2.usageToday.requests, greaterThanOrEqualTo(3));
+    expect(p2.usageToday.errors, greaterThanOrEqualTo(1));
+    expect(p2.usageToday.promptTokens, greaterThanOrEqualTo(15));
+    expect(p2.usageToday.byModelTokens['rb-m1'], greaterThanOrEqualTo(18));
+    expect(p2.usageToday.trend['08'], greaterThanOrEqualTo(2));
+    expect(p2.usageToday.trend['23'], greaterThanOrEqualTo(1));
+    await p2.stop();
   });
 }

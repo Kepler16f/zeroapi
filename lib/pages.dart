@@ -650,9 +650,29 @@ class _UsagePageState extends State<UsagePage> {
                     child: Text('该时段暂无请求',
                         style: TextStyle(color: cs.onSurfaceVariant))),
               ),
-            const Text('网关日志（本次运行）',
-                style: TextStyle(fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                children: [
+                  const Text('网关日志（本次运行）',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: () {
+                      Clipboard.setData(
+                          ClipboardData(text: logs.reversed.join('\n')));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                              content: Text('日志已复制到剪贴板'),
+                              duration: Duration(seconds: 2),
+                              behavior: SnackBarBehavior.floating));
+                    },
+                    icon: const Icon(Icons.copy_all, size: 16),
+                    label: const Text('复制'),
+                  ),
+                ],
+              ),
+            ),
             Container(
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(

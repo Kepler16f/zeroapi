@@ -8,6 +8,14 @@ import 'modelsdev.dart';
 import 'upstream.dart';
 import 'zen.dart';
 
+/// 上游流在"尚未向客户端提交响应"前断裂——调用方可透明重试，客户端无感知
+class _ZenEarlyReset implements Exception {
+  final String why;
+  _ZenEarlyReset(this.why);
+  @override
+  String toString() => 'early-reset: $why';
+}
+
 class ModelRoute {
   final String publicName;
   final UpstreamRuntime upstream;
@@ -100,6 +108,14 @@ class ProxyServer {
   UsageStats usageToday = UsageStats();
   HttpServer? _server;
   IOSink? _usageSink;
+
+  /// 共享上游 HttpClient：连接池复用（TLS keep-alive），高并发下避免
+  /// 每请求重建客户端造成的握手风暴与 socket 耗尽；只在 stop() 时关闭。
+  HttpClient? _up;
+  HttpClient get upClient => _up ??= HttpClient()
+    ..connectionTimeout = const Duration(seconds: 15)
+    ..idleTimeout = const Duration(seconds: 60)
+    ..maxConnectionsPerHost = 64;
   final _logLines = <String>[]; // 环形日志，UI 展示
   static const _maxLog = 200;
   String _usageDay = DateTime.now().toIso8601String().substring(0, 10);
@@ -142,10 +158,7 @@ class ProxyServer {
   Future<UsageStats> usageRange({int? days}) async {
     final out = UsageStats();
     try {
-      final base = Platform.isWindows
-          ? Platform.environment['APPDATA']!
-          : '${Platform.environment['HOME']}/.config';
-      final dir = Directory('$base/zeroapi/logs');
+      final dir = Directory(_usageDirPath);
       if (!dir.existsSync()) return out;
       final cutoff = days == null
           ? null
@@ -191,7 +204,16 @@ class ProxyServer {
   }
 
   ProxyServer(this.host, this.port, this.apiKey, this.registry,
-      {this.anthropicEnabled = true});
+      {this.anthropicEnabled = true, this._usageDir});
+
+  /// 用量 jsonl 目录覆盖（测试注入隔离目录；生产走 %APPDATA%/zeroapi/logs）
+  final String? _usageDir;
+
+  String get _usageDirPath =>
+      _usageDir ??
+      (Platform.isWindows
+          ? '${Platform.environment['APPDATA']}/zeroapi/logs'
+          : '${Platform.environment['HOME']}/.config/zeroapi/logs');
 
   List<String> get logs => List.unmodifiable(_logLines);
 
@@ -199,10 +221,34 @@ class ProxyServer {
   int get boundPort => _server?.port ?? port;
 
   Future<void> start() async {
+    _restoreTodayUsage();
     final server = await HttpServer.bind(host, port);
     _server = server;
     server.listen(_handle, onError: (e) => _log('server error: $e'));
     _log('zeroapi 监听 http://$host:$port/v1');
+  }
+
+  /// 重启后从当日 jsonl 回填内存用量，使今日统计跨重启连续
+  /// （今日文件只回填一次；之后新请求仍照常走 _account 增量写）
+  void _restoreTodayUsage() {
+    try {
+      final f = File('$_usageDirPath/usage-$_usageDay.jsonl');
+      if (!f.existsSync()) return;
+      for (final line in f.readAsLinesSync()) {
+        try {
+          final j = jsonDecode(line) as Map<String, dynamic>;
+          usageToday.add(
+              (j['model'] ?? '?') as String,
+              (j['prompt'] ?? 0) as int,
+              (j['completion'] ?? 0) as int,
+              (j['error'] ?? false) as bool,
+              trendKey: DateTime.parse(j['ts'] as String)
+                  .hour
+                  .toString()
+                  .padLeft(2, '0'));
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   Future<void> stop() async {
@@ -578,190 +624,298 @@ class ProxyServer {
   }
 
   /// Zen 直连转发：复刻免费层客户端指纹、强制 stream:true + 诱饵工具，
-  /// 回传时剔除模型对诱饵工具的调用。429/5xx/连接错误指数退避重试（仅首字节
-  /// 前，流式已提交后不可重试）。客户端 stream 决定是否把上游 SSE 聚合成非流式。
+  /// 回传时剔除模型对诱饵工具的调用。
+  ///
+  /// 高并发要点：
+  /// - 共享连接池（upClient，TLS keep-alive 复用），不再每请求 new HttpClient
+  /// - 先探流再向客户端提交 200：首字节前发现断流/错误可透明重试，
+  ///   客户端不会看到半截流
+  /// - 429/5xx 打开单模型熔断（冷却窗口），冷却期内同模型请求快速失败或
+  ///   转投其他健康的免费模型（fallback 链），尊重 Retry-After
+  /// - 指数退避 + 抖动重试，仅未提交时进行
   Future<void> _forwardZen(HttpRequest req, ModelRoute route, String publicName,
       Map<String, dynamic> body,
       {required bool clientWantsStream, bool anthropic = false}) async {
     final u = route.upstream;
+    void failJson(Map<String, dynamic> err, int status) => anthropic
+        ? _json(req, {'type': 'error', 'error': err}, status)
+        : _json(req, {'error': err}, status);
+
+    // 熔断打开：该端点冷却中 → 转投其他健康免费模型或快速失败，
+    // 不浪费并发额度去撞已知坏端点
+    final target = route.upstreamModel;
+    if (_breaker.isOpen(target)) {
+      final alt = _breaker.pickHealthy(
+          _zenModelPool.where((m) => m != target).toList());
+      if (alt == null) {
+        _account(publicName, u.id, 0, 0, true);
+        return failJson({
+          'message':
+              '模型 $target 正在退避冷却（上游限流），请选择其他免费模型或稍后再试',
+          'type': anthropic ? 'overloaded_error' : 'rate_limited',
+          'code': 'model_backoff',
+        }, 503);
+      }
+      _log('$publicName ⟳ $target 熔断中，转投 $alt');
+      body = Map<String, dynamic>.from(body)..['model'] = alt;
+      route = ModelRoute(publicName, u, alt, route.bare);
+    }
+    await _zenTurn(req, route, publicName, body,
+        clientWantsStream: clientWantsStream,
+        anthropic: anthropic,
+        attempt: 0);
+  }
+
+  final ModelBreaker _breaker = ModelBreaker();
+  Set<String> get _zenModelPool => {
+        for (final r in registry.all)
+          if (r.upstream.isZen) r.upstreamModel,
+      };
+
+  /// 单次 zen 请求尝试：发送→探流→提交→泵流；可重试错误在提交前发生。
+  Future<void> _zenTurn(HttpRequest req, ModelRoute route, String publicName,
+      Map<String, dynamic> origBody,
+      {required bool clientWantsStream,
+      required bool anthropic,
+      required int attempt}) async {
+    final u = route.upstream;
     final injected = <String>{};
-    final sent = Map<String, dynamic>.from(body)
+    final sent = Map<String, dynamic>.from(origBody)
+      ..['model'] = route.upstreamModel
       ..['stream'] = true
       ..['stream_options'] = {'include_usage': true}
-      ..['tools'] = Zen.ensureFreeTools(body['tools'], injected);
+      ..['tools'] = Zen.ensureFreeTools(origBody['tools'], injected);
 
     void failJson(Map<String, dynamic> err, int status) => anthropic
         ? _json(req, {'type': 'error', 'error': err}, status)
         : _json(req, {'error': err}, status);
 
-    const maxAttempts = 3;
+    const maxAttempts = 5;
     final rnd = Random();
-    for (var attempt = 0; attempt < maxAttempts; attempt++) {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
-      HttpClientResponse? uresp;
-      int? errStatus;
-      String? errBody;
-      try {
-        final ureq = await client
-            .openUrl('POST', Uri.parse('${Zen.base}/chat/completions'));
-        Zen.headers(u.def.apiKey).forEach((k, v) => ureq.headers.set(k, v));
-        ureq.headers.set('Content-Type', 'application/json');
-        ureq.add(utf8.encode(jsonEncode(sent)));
-        final r = await ureq.close().timeout(
-            clientWantsStream ? const Duration(hours: 2) : const Duration(minutes: 70));
-        if (r.statusCode == 200) {
-          uresp = r;
-        } else {
-          errStatus = r.statusCode;
-          errBody = await r.transform(utf8.decoder).join();
-          client.close(force: true);
-        }
-      } catch (e) {
-        errBody = e.toString();
-        client.close(force: true);
+    HttpClientResponse? uresp;
+    int? errStatus;
+    String? errBody;
+    Duration? retryAfter;
+    try {
+      final ureq = await upClient
+          .openUrl('POST', Uri.parse('${Zen.base}/chat/completions'));
+      Zen.headers(u.def.apiKey).forEach((k, v) => ureq.headers.set(k, v));
+      ureq.headers.set('Content-Type', 'application/json');
+      ureq.add(utf8.encode(jsonEncode(sent)));
+      final r = await ureq.close().timeout(
+          clientWantsStream ? const Duration(hours: 2) : const Duration(minutes: 70));
+      if (r.statusCode == 200) {
+        uresp = r;
+      } else {
+        errStatus = r.statusCode;
+        final ra = r.headers.value('retry-after');
+        retryAfter = int.tryParse(ra ?? '') != null
+            ? Duration(seconds: int.parse(ra!))
+            : null;
+        errBody = await r.transform(utf8.decoder).join();
       }
+    } catch (e) {
+      errBody = e.toString();
+    }
 
-      if (uresp == null) {
-        final retryable =
-            errStatus == null || errStatus == 429 || errStatus >= 500;
-        if (retryable && attempt < maxAttempts - 1) {
-          final w = (500 * pow(2, attempt)).toInt() + rnd.nextInt(300);
-          _log('$publicName ⟳ zen 第 ${attempt + 1} 次失败(${errStatus ?? 'conn'})，${w}ms 后重试');
-          await Future.delayed(Duration(milliseconds: w));
-          continue;
+    Future<void> retryOrFail(String why) async {
+      _breaker.onFailure(route.upstreamModel, retryAfter: retryAfter);
+      if (attempt < maxAttempts - 1) {
+        // 退避：优先尊重 Retry-After，否则指数 + 抖动（避免并发请求同步重试）
+        final base = retryAfter?.inMilliseconds ??
+            (500 * pow(2, attempt)).toInt();
+        final w = (min(base, 15000)) + rnd.nextInt(400);
+        _log('$publicName ⟳ zen 第 ${attempt + 1} 次失败($why)，${w}ms 后重试');
+        await Future.delayed(Duration(milliseconds: w));
+        // 重试前若本模型仍熔断而池中有健康替代 → 转投
+        var nextRoute = route;
+        if (_breaker.isOpen(route.upstreamModel)) {
+          final alt = _breaker
+              .pickHealthy(_zenModelPool.where((m) => m != route.upstreamModel).toList());
+          if (alt != null) {
+            _log('$publicName ⟳ 转投健康模型 $alt');
+            nextRoute = ModelRoute(publicName, u, alt, route.bare);
+          }
         }
-        final parsed = (errBody != null && errBody.isNotEmpty) ? _safeJson(errBody) : null;
-        final msg = (parsed?['error']?['message'] ??
-                parsed?['message'] ??
-                errBody ??
-                'Zen 请求失败')
-            as String;
-        u.health = UpstreamHealth.down;
-        u.lastError = msg;
-        _account(publicName, u.id, 0, 0, true);
-        _log('$publicName ✗ zen HTTP ${errStatus ?? 'conn'}: $msg');
-        return failJson({
-          'message': msg,
-          'type': anthropic ? 'api_error' : 'upstream_error'
-        }, errStatus ?? 502);
+        return _zenTurn(req, nextRoute, publicName, origBody,
+            clientWantsStream: clientWantsStream,
+            anthropic: anthropic,
+            attempt: attempt + 1);
       }
+      final parsed = (errBody != null && errBody.isNotEmpty) ? _safeJson(errBody) : null;
+      final msg = (parsed?['error']?['message'] ??
+              parsed?['message'] ??
+              errBody ??
+              'Zen 请求失败')
+          as String;
+      u.lastError = msg;
+      _account(publicName, u.id, 0, 0, true);
+      _log('$publicName ✗ zen ${errStatus ?? 'conn'}: $msg');
+      return failJson({
+        'message': msg,
+        'type': anthropic
+            ? 'api_error'
+            : (errStatus == 429 ? 'rate_limit_exceeded' : 'upstream_error')
+      }, errStatus ?? 502);
+    }
 
-      u.health = UpstreamHealth.healthy;
-      u.lastError = null;
-      try {
-        if (clientWantsStream) {
-          await _pumpZenStream(uresp, req, route, publicName, injected,
-              anthropic: anthropic, client: client);
-        } else {
-          await _pumpZenAggregate(uresp, req, route, publicName, injected,
-              anthropic: anthropic, client: client);
-        }
-      } catch (e) {
-        _account(publicName, u.id, 0, 0, true);
-        _log('$publicName ✗ zen stream: $e');
-        client.close(force: true);
+    if (uresp == null) {
+      final retryable = errStatus == null || errStatus == 429 || errStatus >= 500;
+      if (retryable) return retryOrFail('HTTP ${errStatus ?? 'conn'}');
+      final parsed = (errBody ?? '').isNotEmpty ? _safeJson(errBody!) : null;
+      // 走到这里 errStatus 必非空（4xx 非 429）
+      final msg = (parsed?['error']?['message'] ??
+              '供应商 ${u.id} HTTP $errStatus')
+          as String;
+      _account(publicName, u.id, 0, 0, true);
+      return failJson(
+          {'message': msg, 'type': anthropic ? 'api_error' : 'upstream_error'},
+          errStatus);
+    }
+
+    _breaker.onSuccess(route.upstreamModel);
+    u.health = UpstreamHealth.healthy;
+    u.lastError = null;
+    // 解码流交给 pump：pump 只在产出首个有效输出后才提交响应头，
+    // 提交前的断流以 _ZenEarlyReset 抛出 → 此处透明重试
+    final lines = uresp.transform(utf8.decoder);
+    try {
+      if (clientWantsStream) {
+        await _pumpZenStream(lines, req, route, publicName, injected,
+            anthropic: anthropic);
+      } else {
+        await _pumpZenAggregate(lines, req, route, publicName, injected,
+            anthropic: anthropic);
       }
-      return;
+    } on _ZenEarlyReset catch (e) {
+      if (attempt < maxAttempts - 1) return retryOrFail('early(${e.why})');
+      _account(publicName, u.id, 0, 0, true);
+      _log('$publicName ✗ zen 提交前流断（已尽重试）: ${e.why}');
+      return failJson({
+        'message': '上游免费端点不稳定（连接被重置），请稍后重试',
+        'type': anthropic ? 'api_error' : 'upstream_error'
+      }, 502);
+    } catch (e) {
+      _account(publicName, u.id, 0, 0, true);
+      _log('$publicName ✗ zen stream: $e');
     }
   }
 
-  Future<void> _pumpZenStream(HttpClientResponse uresp, HttpRequest req,
+  /// 流式泵：延迟提交——产出首个有效输出前如果上游断流，抛 _ZenEarlyReset
+  /// （调用方还能透明重试，客户端什么都没收到）；提交后的断流只能带错误收尾。
+  Future<void> _pumpZenStream(Stream<String> lines, HttpRequest req,
       ModelRoute route, String publicName, Set<String> injected,
-      {required bool anthropic, required HttpClient client}) async {
-    req.response.headers
-      ..contentType = ContentType('text', 'event-stream')
-      ..set('Cache-Control', 'no-cache')
-      ..set('x-zeroapi-upstream', route.upstream.id);
-    req.response.statusCode = 200;
+      {required bool anthropic}) async {
     final decoy = <int, bool>{};
     int prompt = 0, completion = 0;
+    var committed = false;
+    var done = false;
 
-    if (anthropic) {
-      final aStream = AnthropicAdapter.streamTransformer(route.upstreamModel);
-      var buf = '';
-      await for (final raw in uresp) {
-        buf += utf8.decode(raw, allowMalformed: true);
-        int nl;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          final line = buf.substring(0, nl).trim();
-          buf = buf.substring(nl + 1);
-          if (!line.startsWith('data:')) continue;
-          final data = line.substring(5).trim();
-          if (data.isEmpty) continue;
-          if (data == '[DONE]') {
-            for (final ev in aStream.finish()) {
-              req.response.write(ev);
-            }
-            await req.response.flush();
-            continue;
+    void commit() {
+      if (committed) return;
+      req.response.headers
+        ..contentType = ContentType('text', 'event-stream')
+        ..set('Cache-Control', 'no-cache')
+        ..set('x-zeroapi-upstream', route.upstream.id);
+      req.response.statusCode = 200;
+      committed = true;
+    }
+
+    final aStream = anthropic
+        ? AnthropicAdapter.streamTransformer(route.upstreamModel)
+        : null;
+
+    // 逐行解析 SSE；事件可能跨多个解码块，按 \n 切行缓冲
+    String pending = '';
+    Future<void> handleData(String data) async {
+      if (data == '[DONE]') {
+        done = true;
+        if (aStream != null) {
+          commit();
+          for (final ev in aStream.finish()) {
+            req.response.write(ev);
           }
-          Map<String, dynamic>? j;
-          try {
-            j = jsonDecode(data) as Map<String, dynamic>;
-          } catch (_) {
-            j = null;
-          }
-          if (j == null) continue;
-          final us = j['usage'] as Map?;
-          if (us != null) {
-            prompt = (us['prompt_tokens'] ?? prompt) as int;
-            completion = (us['completion_tokens'] ?? completion) as int;
-          }
-          Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
-          for (final ev in aStream.feed(jsonEncode(j))) {
+        } else {
+          commit();
+          req.response.write('data: [DONE]\n\n');
+        }
+        await req.response.flush();
+        return;
+      }
+      Map<String, dynamic>? j;
+      try {
+        j = jsonDecode(data) as Map<String, dynamic>;
+      } catch (_) {
+        j = null;
+      }
+      if (j == null) return;
+      final us = j['usage'] as Map?;
+      if (us != null) {
+        prompt = (us['prompt_tokens'] ?? prompt) as int;
+        completion = (us['completion_tokens'] ?? completion) as int;
+      }
+      final out = Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
+      if (aStream != null) {
+        if (out == null) return; // 纯诱饵增量，不喂给适配器
+        final evs = aStream.feed(jsonEncode(out));
+        if (evs.isNotEmpty) {
+          commit();
+          for (final ev in evs) {
             req.response.write(ev);
           }
           await req.response.flush();
         }
+      } else if (out != null) {
+        commit();
+        req.response.write('data: ${jsonEncode(out)}\n\n');
+        await req.response.flush();
       }
-    } else {
-      var buf = '';
-      await for (final raw in uresp) {
-        buf += utf8.decode(raw, allowMalformed: true);
+    }
+
+    try {
+      await for (final s in lines) {
+        pending += s;
         int nl;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          final line = buf.substring(0, nl).trim();
-          buf = buf.substring(nl + 1);
+        while ((nl = pending.indexOf('\n')) >= 0) {
+          final line = pending.substring(0, nl).trim();
+          pending = pending.substring(nl + 1);
           if (!line.startsWith('data:')) continue;
           final data = line.substring(5).trim();
           if (data.isEmpty) continue;
-          if (data == '[DONE]') {
-            req.response.write('data: [DONE]\n\n');
-            await req.response.flush();
-            continue;
-          }
-          Map<String, dynamic>? j;
-          try {
-            j = jsonDecode(data) as Map<String, dynamic>;
-          } catch (_) {
-            j = null;
-          }
-          if (j == null) continue;
-          final us = j['usage'] as Map?;
-          if (us != null) {
-            prompt += (us['prompt_tokens'] ?? 0) as int;
-            completion += (us['completion_tokens'] ?? 0) as int;
-          }
-          final out = Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
-          if (out == null) continue;
-          req.response.write('data: ${jsonEncode(out)}\n\n');
-          await req.response.flush();
+          await handleData(data);
+          if (done) break;
         }
+        if (done) break;
       }
+    } catch (e) {
+      if (!committed) {
+        throw _ZenEarlyReset('$e');
+      }
+      rethrow; // 已提交：错误直接上抛，由 _zenTurn 的 catch 记录
+    }
+    if (!committed) {
+      // 流正常结束但一个事件都没有（免费端点秒断的另一种表现）
+      if (!done) throw _ZenEarlyReset('empty-stream');
     }
     await req.response.close();
     _account(publicName, route.upstream.id, prompt, completion, false);
     _log('$publicName ✓ zen stream ${route.upstream.id}${anthropic ? ' [anthropic]' : ''}');
-    client.close(force: true);
   }
 
-  Future<void> _pumpZenAggregate(HttpClientResponse uresp, HttpRequest req,
+  /// 非流式泵：先全量读 SSE 聚合，读失败且尚未写响应 → 抛 _ZenEarlyReset 可重试
+  Future<void> _pumpZenAggregate(Stream<String> lines, HttpRequest req,
       ModelRoute route, String publicName, Set<String> injected,
-      {required bool anthropic, required HttpClient client}) async {
-    final text = await uresp.transform(utf8.decoder).join();
-    client.close(force: true);
+      {required bool anthropic}) async {
+    final text = StringBuffer();
+    try {
+      await for (final s in lines) {
+        text.write(s);
+      }
+    } catch (e) {
+      throw _ZenEarlyReset('aggregate: $e');
+    }
     final datas = <Map<String, dynamic>>[];
-    for (final raw in text.split('\n')) {
+    for (final raw in text.toString().split('\n')) {
       final t = raw.trim();
       if (!t.startsWith('data:')) continue;
       final d = t.substring(5).trim();
@@ -798,12 +952,9 @@ class ProxyServer {
   }
 
 
-  static IOSink? _openUsageFile() {
+  IOSink? _openUsageFile() {
     try {
-      final base = Platform.isWindows
-          ? Platform.environment['APPDATA']!
-          : '${Platform.environment['HOME']}/.config';
-      final dir = Directory('$base/zeroapi/logs');
+      final dir = Directory(_usageDirPath);
       if (!dir.existsSync()) dir.createSync(recursive: true);
       final day = DateTime.now().toIso8601String().substring(0, 10);
       return File('${dir.path}/usage-$day.jsonl')
