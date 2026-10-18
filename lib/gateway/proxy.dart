@@ -471,8 +471,10 @@ class ProxyServer {
         ? _json(req, {'type': 'error', 'error': err}, status)
         : _json(req, {'error': err}, status);
 
+    final proxy = _remoteFindProxy(u.def);
     final HttpClient client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 15);
+      ..connectionTimeout = const Duration(seconds: 15)
+      ..findProxy = (_) => proxy ?? 'DIRECT';
     try {
       final ureq = await client.openUrl('POST',
           Uri.parse('${u.def.baseUrl.replaceAll(RegExp(r'/+$'), '')}/$endpoint'));
@@ -695,9 +697,21 @@ class ProxyServer {
 
   HttpClient _zenClientFor(UpstreamDef def) {
     final pool = def.proxyPool;
-    if (pool.isEmpty) return upClient; // 直连，复用共享连接池
+    if (pool.isEmpty) {
+      // 直连（开关关闭或清空地址）：释放代理客户端，复用共享连接池
+      _zenUp?.close(force: true);
+      _zenUp = null;
+      _zenProxySig = '';
+      return upClient;
+    }
     final fp = pool[_zenProxyIdx % pool.length];
     if (_zenUp != null && _zenProxySig == fp) return _zenUp!;
+    // 出口实际变化（换代理/换池/轮换）：被封的静默窗口是针对旧 IP 的，
+    // 立即解除——用户在代理端换了节点就能马上重试，不必干等
+    if (_zenProxySig.isNotEmpty && _zenProxySig != fp) {
+      _zenIpBanUntil = null;
+      _zenBanStreak = 0;
+    }
     _zenUp?.close(force: true);
     final c = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15)
@@ -708,6 +722,15 @@ class ProxyServer {
     _zenProxySig = fp;
     return c;
   }
+
+  /// 通用（remote）转发路径的出口代理：每请求新建 client，轮流用池里的代理
+  String? _remoteFindProxy(UpstreamDef def) {
+    final pool = def.proxyPool;
+    if (pool.isEmpty) return null;
+    return pool[_remoteProxyTick++ % pool.length];
+  }
+
+  int _remoteProxyTick = 0;
 
   /// 命中 IP 风控时切到池里下一个出口代理；池大小 ≤1 无法轮换返回 false。
   bool _rotateZenProxy(UpstreamDef def) {

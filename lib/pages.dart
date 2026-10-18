@@ -203,8 +203,6 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
       TextEditingController(text: widget.def?.command ?? '');
   late final TextEditingController args = TextEditingController(
       text: widget.def?.args.join(' ') ?? '');
-  late final TextEditingController proxy =
-      TextEditingController(text: widget.def?.proxy ?? '');
   late String type = widget.def?.type ?? 'remote';
   bool _obscureKey = true;
 
@@ -274,15 +272,6 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
                     decoration: const InputDecoration(
                         labelText: '参数（空格分隔）')),
               ],
-              if (type == 'zen')
-                TextField(
-                    controller: proxy,
-                    decoration: const InputDecoration(
-                        labelText: '出口代理（可空，绕过上游按 IP 的滥用风控）',
-                        helperText:
-                            'socks5://127.0.0.1:7891 或 http://127.0.0.1:7890；'
-                            '逗号分隔多个则命中风控时自动轮换出口 IP',
-                        helperMaxLines: 2)),
             ],
           ),
         ),
@@ -307,7 +296,9 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
                       .where((s) => s.isNotEmpty)
                       .toList()
                   : const [],
-              proxy: type == 'zen' ? proxy.text.trim() : '',
+              // 编辑供应商不重置出口代理（在设置页统一配置）
+              proxy: widget.def?.proxy ?? '',
+              proxyEnabled: widget.def?.proxyEnabled ?? false,
             );
             if (widget.def == null) {
               widget.service.addUpstream(def);
@@ -1011,6 +1002,30 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _obscure = true;
   String _protocol = 'openai';
 
+  // 出口代理：目标供应商 + 地址输入框（跟随选择联动）
+  String? _proxyTargetId;
+  final TextEditingController _proxyAddr = TextEditingController();
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncProxyTarget();
+  }
+
+  void _syncProxyTarget() {
+    final ups = widget.service.config.upstreams;
+    if (ups.isEmpty) return;
+    final id = (_proxyTargetId != null &&
+            ups.any((u) => u.id == _proxyTargetId))
+        ? _proxyTargetId!
+        : (ups.any((u) => u.proxyEnabled)
+            ? ups.firstWhere((u) => u.proxyEnabled).id
+            : ups.first.id);
+    if (id != _proxyTargetId) _proxyTargetId = id;
+    final def = ups.firstWhere((u) => u.id == id);
+    if (_proxyAddr.text != def.proxy) _proxyAddr.text = def.proxy;
+  }
+
   @override
   Widget build(BuildContext context) {
     final s = widget.service;
@@ -1126,6 +1141,88 @@ class _SettingsPageState extends State<SettingsPage> {
                 onPressed: () => s.rotateApiKey(),
               ),
             ]),
+            const SizedBox(height: 24),
+            const Text('出口代理',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(
+              '上游对免费通道按出口 IP 做滥用风控。本机 IP 被标记时，'
+              '可让选定供应商经本地代理（如 Clash 的 mixed 端口）或代理池换 IP 出网。',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            if (s.config.upstreams.isEmpty)
+              const Text('（暂无供应商）')
+            else
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Text('对供应商生效：'),
+                      const SizedBox(width: 8),
+                      DropdownButton<String>(
+                        value: _proxyTargetId ?? s.config.upstreams.first.id,
+                        items: [
+                          for (final u in s.config.upstreams)
+                            DropdownMenuItem(
+                                value: u.id,
+                                child: Text(u.displayName)),
+                        ],
+                        onChanged: (v) {
+                          if (v == null) return;
+                          final def = s.config.upstreams
+                              .firstWhere((u) => u.id == v);
+                          setState(() {
+                            _proxyTargetId = v;
+                            _proxyAddr.text = def.proxy;
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: const Text('启用出口代理', style: TextStyle(fontSize: 14)),
+                    subtitle: Text(
+                      '关闭则保留地址但直连；命中 IP 风控且填有多个代理时自动轮换下一个出口',
+                      style: TextStyle(
+                          fontSize: 12, color: cs.onSurfaceVariant),
+                    ),
+                    value: () {
+                      final id = _proxyTargetId;
+                      if (id == null) return false;
+                      final hit =
+                          s.config.upstreams.where((u) => u.id == id);
+                      return hit.isNotEmpty && hit.first.proxyEnabled;
+                    }(),
+                    onChanged: (v) {
+                      final id = _proxyTargetId;
+                      if (id == null) return;
+                      s.setUpstreamProxy(id,
+                          enabled: v, proxy: _proxyAddr.text.trim());
+                    },
+                  ),
+                  TextField(
+                    controller: _proxyAddr,
+                    onChanged: (v) {
+                      final id = _proxyTargetId;
+                      if (id == null) return;
+                      final hit = s.config.upstreams.where((u) => u.id == id);
+                      if (hit.isEmpty) return;
+                      s.setUpstreamProxy(id,
+                          enabled: hit.first.proxyEnabled, proxy: v.trim());
+                    },
+                    decoration: const InputDecoration(
+                      labelText: '代理地址',
+                      hintText: 'http://127.0.0.1:7890',
+                      helperText: '支持 http / socks5；逗号分隔多个=轮换池（换节点=换 IP）',
+                      helperMaxLines: 2,
+                    ),
+                  ),
+                ],
+              ),
             const SizedBox(height: 24),
             const Text('外观', style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),

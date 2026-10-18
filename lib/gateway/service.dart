@@ -173,6 +173,28 @@ class GatewayService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 出口代理：写目标供应商的 proxy/proxyEnabled。代理客户端由 ProxyServer
+  /// 每次请求实时解析 proxyPool，切换即时生效（下一次请求就走新出口）
+  void setUpstreamProxy(String upstreamId,
+      {required bool enabled, String? proxy}) {
+    final i = config.upstreams.indexWhere((x) => x.id == upstreamId);
+    if (i < 0) return;
+    config.upstreams[i]
+      ..proxyEnabled = enabled
+      ..proxy = proxy ?? config.upstreams[i].proxy;
+    config.save();
+    // 运行中的 runtime 共用同一 def 对象引用会随 config 重载失效——同步到
+    // _runtimes 里的实际实例，保证网关侧立即读到新值
+    for (final rt in _runtimes) {
+      if (rt.def.id == upstreamId) {
+        rt.def
+          ..proxyEnabled = enabled
+          ..proxy = config.upstreams[i].proxy;
+      }
+    }
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     ModelsDev.instance.stop();

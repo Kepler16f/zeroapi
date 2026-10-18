@@ -4,10 +4,11 @@ import 'package:zeroapi/gateway/config.dart';
 
 void main() {
   group('出口代理池解析', () {
-    test('空→直连；http/socks5 归一为 findProxy 格式；逗号分隔成池', () {
-      UpstreamDef mk(String p) =>
-          UpstreamDef(id: 'z', baseUrl: 'https://x/v1', proxy: p);
+    test('开关关/空→直连；http/socks5 归一为 findProxy 格式；逗号分隔成池', () {
+      UpstreamDef mk(String p, {bool on = true}) => UpstreamDef(
+          id: 'z', baseUrl: 'https://x/v1', proxy: p, proxyEnabled: on);
       expect(mk('').proxyPool, isEmpty);
+      expect(mk('http://127.0.0.1:7890', on: false).proxyPool, isEmpty);
       expect(mk('socks5://127.0.0.1:7891').proxyPool, ['SOCKS5 127.0.0.1:7891']);
       expect(mk('http://127.0.0.1:7890').proxyPool, ['PROXY 127.0.0.1:7890']);
       expect(mk('127.0.0.1:7890, socks5://1.2.3.4:1080').proxyPool,

@@ -21,6 +21,8 @@ class UpstreamDef {
   /// 支持 http/socks5，逗号分隔填多个做轮换池，如：
   ///   socks5://127.0.0.1:7891 或 http://127.0.0.1:7890,http://127.0.0.1:7892
   String proxy;
+  /// 出口代理开关：关闭时保留地址但走直连（proxyPool 返回空）
+  bool proxyEnabled;
 
   UpstreamDef({
     required this.id,
@@ -33,6 +35,7 @@ class UpstreamDef {
     this.enabled = true,
     this.env = const {},
     this.proxy = '',
+    this.proxyEnabled = false,
   });
 
   bool get isManaged => type == 'managed';
@@ -54,6 +57,7 @@ class UpstreamDef {
         enabled: (j['enabled'] ?? true) as bool,
         env: ((j['env'] ?? {}) as Map).cast<String, String>(),
         proxy: (j['proxy'] ?? '') as String,
+        proxyEnabled: (j['proxyEnabled'] ?? false) as bool,
       );
 
   Map<String, dynamic> toJson() => {
@@ -66,19 +70,23 @@ class UpstreamDef {
         if (args.isNotEmpty) 'args': args,
         if (env.isNotEmpty) 'env': env,
         if (proxy.isNotEmpty) 'proxy': proxy,
+        if (proxyEnabled) 'proxyEnabled': true,
         'enabled': enabled,
       };
 
   /// 解析出口代理池：逗号/换行分隔，每项归一为 Dart findProxy 需要的
-  /// `PROXY host:port`（http）或 `SOCKS5 host:port`。空则返回空列表（直连）。
-  List<String> get proxyPool => proxy
-      .split(RegExp(r'[,\n]'))
-      .map((s) => s.trim())
-      .where((s) => s.isNotEmpty)
-      .map(_toFindProxy)
-      .where((s) => s != null)
-      .cast<String>()
-      .toList();
+  /// `PROXY host:port`（http）或 `SOCKS5 host:port`。开关关闭或未填 → 直连。
+  List<String> get proxyPool {
+    if (!proxyEnabled || proxy.trim().isEmpty) return const [];
+    return proxy
+        .split(RegExp(r'[,\n]'))
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .map(_toFindProxy)
+        .where((s) => s != null)
+        .cast<String>()
+        .toList();
+  }
 
   static String? _toFindProxy(String raw) {
     var s = raw;
