@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'anthropic.dart';
+import 'config.dart';
 import 'modelsdev.dart';
 import 'upstream.dart';
 import 'zen.dart';
@@ -254,6 +255,11 @@ class ProxyServer {
   Future<void> stop() async {
     await _server?.close(force: true);
     _server = null;
+    _up?.close(force: true);
+    _up = null;
+    _zenUp?.close(force: true);
+    _zenUp = null;
+    _zenProxySig = '';
   }
 
   Future<void> _handle(HttpRequest req) async {
@@ -681,6 +687,37 @@ class ProxyServer {
   DateTime? _zenIpBanUntil;
   int _zenBanStreak = 0;
 
+  /// zen 出口代理客户端：配置了 proxy 池才独立建（findProxy 指向当前代理），
+  /// 否则复用共享 upClient 直连。轮换代理时按新 findProxy 重建。
+  HttpClient? _zenUp;
+  int _zenProxyIdx = 0;
+  String _zenProxySig = '';
+
+  HttpClient _zenClientFor(UpstreamDef def) {
+    final pool = def.proxyPool;
+    if (pool.isEmpty) return upClient; // 直连，复用共享连接池
+    final fp = pool[_zenProxyIdx % pool.length];
+    if (_zenUp != null && _zenProxySig == fp) return _zenUp!;
+    _zenUp?.close(force: true);
+    final c = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15)
+      ..idleTimeout = const Duration(seconds: 60)
+      ..maxConnectionsPerHost = 64
+      ..findProxy = (_) => fp;
+    _zenUp = c;
+    _zenProxySig = fp;
+    return c;
+  }
+
+  /// 命中 IP 风控时切到池里下一个出口代理；池大小 ≤1 无法轮换返回 false。
+  bool _rotateZenProxy(UpstreamDef def) {
+    final pool = def.proxyPool;
+    if (pool.length <= 1) return false;
+    _zenProxyIdx = (_zenProxyIdx + 1) % pool.length;
+    _log('⟳ zen 出口代理轮换 → 第 ${_zenProxyIdx + 1}/${pool.length} 个');
+    return true;
+  }
+
   /// 单次 zen 请求尝试：发送→探流→提交→泵流；可重试错误在提交前发生。
   Future<void> _zenTurn(HttpRequest req, ModelRoute route, String publicName,
       Map<String, dynamic> origBody,
@@ -706,7 +743,7 @@ class ProxyServer {
     String? errBody;
     Duration? retryAfter;
     try {
-      final ureq = await upClient
+      final ureq = await _zenClientFor(u.def)
           .openUrl('POST', Uri.parse('${Zen.base}/chat/completions'));
       Zen.headers(u.def.apiKey).forEach((k, v) => ureq.headers.set(k, v));
       ureq.headers.set('Content-Type', 'application/json');
@@ -775,6 +812,16 @@ class ProxyServer {
         _breaker.onFailure(route.upstreamModel,
             retryAfter: const Duration(seconds: 90));
         if (abuse) {
+          // 有代理池：先换出口 IP 立即重试（新 IP 可能直接可用），不进长静默；
+          // 无池或已轮尽本轮才进递增静默窗口
+          if (_rotateZenProxy(u.def) && attempt < maxAttempts - 1) {
+            _account(publicName, u.id, 0, 0, true);
+            _log('$publicName ⟳ 命中 IP 风控，换出口代理重试（第 ${attempt + 1} 次）');
+            return _zenTurn(req, route, publicName, origBody,
+                clientWantsStream: clientWantsStream,
+                anthropic: anthropic,
+                attempt: attempt + 1);
+          }
           _zenBanStreak = min(_zenBanStreak + 1, 5);
           final mins = min(60, 5 << (_zenBanStreak - 1)); // 5,10,20,40,60
           _zenIpBanUntil = DateTime.now().add(Duration(minutes: mins));

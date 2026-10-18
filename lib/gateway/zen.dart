@@ -57,31 +57,13 @@ class Zen {
     return sb.toString();
   }
 
-  /// 一次调用的指纹头。关键拟人点：会话 ID 跨请求复用（真实 opencode 一整段
-  /// 对话只有一个 ses_，只有 request 逐次新建）——每请求换新 session 是机器
-  /// 流量特征，会触发上游「Detect Abuse Traffic」403。滚动窗口：10 分钟或
-  /// 100 次请求换一次会话，贴近真人开新对话的节奏。
-  static String? _sid;
-  static DateTime? _sidAt;
-  static int _sidUse = 0;
-
-  static String _sessionId(Random rnd, int now) {
-    final stale = _sid == null ||
-        DateTime.now().difference(_sidAt!) > const Duration(minutes: 10) ||
-        _sidUse >= 100;
-    if (stale) {
-      _sid = 'ses_${_id(now, true, rnd.nextInt(64), rnd)}';
-      _sidAt = DateTime.now();
-      _sidUse = 0;
-    }
-    _sidUse++;
-    return _sid!;
-  }
-
+  /// 一次调用的指纹头。session 每次新建（per-request）——参考项目 jcleng
+  /// 的实测结论：per-request 是 safest 模式，sticky 复用单个 ses_ 反而会让
+  /// 一个会话短时内堆积大量请求、坐实机器人特征。request id 本就逐次唯一。
   static Map<String, String> headers(String apiKey) {
     final rnd = Random.secure();
     final now = DateTime.now().millisecondsSinceEpoch;
-    final sid = _sessionId(rnd, now);
+    final sid = 'ses_${_id(now, true, rnd.nextInt(64), rnd)}';
     final rid = 'msg_${_id(now, false, rnd.nextInt(64), rnd)}';
     return {
       'user-agent': _ua,

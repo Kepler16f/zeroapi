@@ -17,6 +17,10 @@ class UpstreamDef {
   bool enabled;
   /// managed 拉起子进程时注入的环境变量（如 REQUEST_TIMEOUT_MS、OPENCODE_PATH）
   Map<String, String> env;
+  /// zen 上游的出口代理（换出口 IP 用，绕过上游按 IP 的滥用风控）。
+  /// 支持 http/socks5，逗号分隔填多个做轮换池，如：
+  ///   socks5://127.0.0.1:7891 或 http://127.0.0.1:7890,http://127.0.0.1:7892
+  String proxy;
 
   UpstreamDef({
     required this.id,
@@ -28,6 +32,7 @@ class UpstreamDef {
     this.args = const [],
     this.enabled = true,
     this.env = const {},
+    this.proxy = '',
   });
 
   bool get isManaged => type == 'managed';
@@ -48,6 +53,7 @@ class UpstreamDef {
         args: ((j['args'] ?? []) as List).cast<String>(),
         enabled: (j['enabled'] ?? true) as bool,
         env: ((j['env'] ?? {}) as Map).cast<String, String>(),
+        proxy: (j['proxy'] ?? '') as String,
       );
 
   Map<String, dynamic> toJson() => {
@@ -59,8 +65,35 @@ class UpstreamDef {
         if (command != null) 'command': command,
         if (args.isNotEmpty) 'args': args,
         if (env.isNotEmpty) 'env': env,
+        if (proxy.isNotEmpty) 'proxy': proxy,
         'enabled': enabled,
       };
+
+  /// 解析出口代理池：逗号/换行分隔，每项归一为 Dart findProxy 需要的
+  /// `PROXY host:port`（http）或 `SOCKS5 host:port`。空则返回空列表（直连）。
+  List<String> get proxyPool => proxy
+      .split(RegExp(r'[,\n]'))
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .map(_toFindProxy)
+      .where((s) => s != null)
+      .cast<String>()
+      .toList();
+
+  static String? _toFindProxy(String raw) {
+    var s = raw;
+    final socks = s.startsWith('socks5://') || s.startsWith('socks://');
+    if (socks) {
+      s = s.replaceFirst(RegExp(r'^socks5?://'), '');
+    } else {
+      s = s.replaceFirst(RegExp(r'^https?://'), '');
+    }
+    final hostPort = s.split('/').first.trim();
+    if (hostPort.isEmpty) return null;
+    final withPort =
+        hostPort.contains(':') ? hostPort : '$hostPort:${socks ? '1080' : '8080'}';
+    return '${socks ? 'SOCKS5' : 'PROXY'} $withPort';
+  }
 }
 
 class GatewayConfig {

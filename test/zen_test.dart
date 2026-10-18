@@ -1,7 +1,20 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zeroapi/gateway/zen.dart';
+import 'package:zeroapi/gateway/config.dart';
 
 void main() {
+  group('出口代理池解析', () {
+    test('空→直连；http/socks5 归一为 findProxy 格式；逗号分隔成池', () {
+      UpstreamDef mk(String p) =>
+          UpstreamDef(id: 'z', baseUrl: 'https://x/v1', proxy: p);
+      expect(mk('').proxyPool, isEmpty);
+      expect(mk('socks5://127.0.0.1:7891').proxyPool, ['SOCKS5 127.0.0.1:7891']);
+      expect(mk('http://127.0.0.1:7890').proxyPool, ['PROXY 127.0.0.1:7890']);
+      expect(mk('127.0.0.1:7890, socks5://1.2.3.4:1080').proxyPool,
+          ['PROXY 127.0.0.1:7890', 'SOCKS5 1.2.3.4:1080']);
+    });
+  });
+
   group('Zen 免费档判定', () {
     test('big-pickle 与 *-free 保留，付费模型过滤', () {
       expect(Zen.isFreeModel('big-pickle'), true);
@@ -35,13 +48,12 @@ void main() {
     test('自定义 key 覆盖 public', () {
       expect(Zen.headers('sk-xx')['authorization'], 'Bearer sk-xx');
     });
-    test('会话复用：窗口内同 session、request 逐次唯一（防滥用风控）', () {
+    test('per-request 会话：session 与 request 均逐次唯一（jcleng safest）', () {
       final h1 = Zen.headers('');
       final h2 = Zen.headers('');
-      // 同一时间窗内 session 必须复用（真人一段对话一个 ses_）
-      expect(h2['x-opencode-session'], h1['x-opencode-session']);
-      // 请求 id 必须逐次不同
-      expect(h2['x-opencode-request'] == h1['x-opencode-request'], false);
+      // per-request 模式：每次调用都是全新 ses_（避免单会话堆积请求）
+      expect(h1['x-opencode-session'] != h2['x-opencode-session'], true);
+      expect(h1['x-opencode-request'] != h2['x-opencode-request'], true);
     });
   });
 

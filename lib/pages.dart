@@ -203,6 +203,8 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
       TextEditingController(text: widget.def?.command ?? '');
   late final TextEditingController args = TextEditingController(
       text: widget.def?.args.join(' ') ?? '');
+  late final TextEditingController proxy =
+      TextEditingController(text: widget.def?.proxy ?? '');
   late String type = widget.def?.type ?? 'remote';
   bool _obscureKey = true;
 
@@ -272,6 +274,15 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
                     decoration: const InputDecoration(
                         labelText: '参数（空格分隔）')),
               ],
+              if (type == 'zen')
+                TextField(
+                    controller: proxy,
+                    decoration: const InputDecoration(
+                        labelText: '出口代理（可空，绕过上游按 IP 的滥用风控）',
+                        helperText:
+                            'socks5://127.0.0.1:7891 或 http://127.0.0.1:7890；'
+                            '逗号分隔多个则命中风控时自动轮换出口 IP',
+                        helperMaxLines: 2)),
             ],
           ),
         ),
@@ -296,6 +307,7 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
                       .where((s) => s.isNotEmpty)
                       .toList()
                   : const [],
+              proxy: type == 'zen' ? proxy.text.trim() : '',
             );
             if (widget.def == null) {
               widget.service.addUpstream(def);
