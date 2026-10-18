@@ -201,6 +201,17 @@ void main() {
     expect(text, contains('message_stop'));
   });
 
+  test('SSE 含 CJK 不崩：/v1/chat/completions 流式（透传字节路径）', () async {
+    final resp = await gw('POST', '/v1/chat/completions',
+        {'model': 'fake/gpt-test', 'messages': [], 'stream': true});
+    expect(resp.statusCode, 200);
+    expect(resp.headers.contentType?.charset?.toLowerCase(), 'utf-8');
+    final text = await utf8.decodeStream(resp);
+    expect(text, contains('你好'));
+    expect(text, contains('—')); // em-dash 随上游原始字节透传，不经字符串编码
+    expect(text, contains('data: [DONE]'));
+  });
+
   test('错误网关 key 返回 401', () async {
     final req = await client.openUrl(
         'POST', Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/responses'));
