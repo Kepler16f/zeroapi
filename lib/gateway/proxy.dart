@@ -677,7 +677,9 @@ class ProxyServer {
   /// 上游 IP 级滥用封锁（403 abusive traffic）后的全局静默窗口：
   /// 期间暂停一切 zen 请求。单模型熔断不够——换任何模型都会再撞一次风控，
   /// 继续撞只会延长封锁；彻底沉默才给 IP 解封留机会。
+  /// 窗口指数递增（5→10→20→40→60m）：持续封锁时降低探测频率。
   DateTime? _zenIpBanUntil;
+  int _zenBanStreak = 0;
 
   /// 单次 zen 请求尝试：发送→探流→提交→泵流；可重试错误在提交前发生。
   Future<void> _zenTurn(HttpRequest req, ModelRoute route, String publicName,
@@ -760,28 +762,43 @@ class ProxyServer {
     if (uresp == null) {
       final retryable = errStatus == null || errStatus == 429 || errStatus >= 500;
       if (retryable) return retryOrFail('HTTP ${errStatus ?? 'conn'}');
-      // 403=上游滥用风控：单模型立即冷却 90s；若错误是 IP 级「abusive
-      // traffic」封锁（区别于指纹格式错误），再设全局静默窗口 5 分钟，
-      // 让本进程彻底沉默，避免换模型继续撞风控延长封锁
-      if (errStatus == 403) {
-        _breaker.onFailure(route.upstreamModel,
-            retryAfter: const Duration(seconds: 90));
-        if ((errBody ?? '').contains('abusive traffic')) {
-          _zenIpBanUntil = DateTime.now().add(const Duration(minutes: 5));
-        }
-      }
       final parsed = (errBody ?? '').isNotEmpty ? _safeJson(errBody!) : null;
-      // 走到这里 errStatus 必非空（4xx 非 429）
-      final msg = (parsed?['error']?['message'] ??
+      final rawMsg = (parsed?['error']?['message'] ??
               '供应商 ${u.id} HTTP $errStatus')
           as String;
+      // 403 绝不能原样透传：上游滥用风控/门控与认证无关，客户端会把 403
+      // 统一显示成 authentication failed 并可能禁用 provider。改为 429
+      // （限流语义，客户端退避重试）。IP 级封锁再进 5 分钟全局静默。
+      if (errStatus == 403) {
+        final abuse = rawMsg.toLowerCase().contains('abus') ||
+            (errBody ?? '').toLowerCase().contains('abusive traffic');
+        _breaker.onFailure(route.upstreamModel,
+            retryAfter: const Duration(seconds: 90));
+        if (abuse) {
+          _zenBanStreak = min(_zenBanStreak + 1, 5);
+          final mins = min(60, 5 << (_zenBanStreak - 1)); // 5,10,20,40,60
+          _zenIpBanUntil = DateTime.now().add(Duration(minutes: mins));
+          _log('$publicName ⛔ IP 滥用封锁（第 $_zenBanStreak 次），静默 $mins 分钟');
+        }
+        _account(publicName, u.id, 0, 0, true);
+        _log('$publicName ✗ zen 403 ${abuse ? 'IP 滥用封锁' : '门控拒绝'}: $rawMsg');
+        return failJson({
+          'message': abuse
+              ? 'OpenCode 检测到本机出口 IP 的滥用流量并限制免费通道（与账号无关）：$rawMsg'
+              : 'OpenCode 免费通道拒绝了该请求：$rawMsg',
+          'type': anthropic ? 'rate_limit_error' : 'rate_limited',
+          'code': abuse ? 'ip_abuse_backoff' : 'upstream_forbidden',
+        }, 429);
+      }
       _account(publicName, u.id, 0, 0, true);
       return failJson(
-          {'message': msg, 'type': anthropic ? 'api_error' : 'upstream_error'},
+          {'message': rawMsg, 'type': anthropic ? 'api_error' : 'upstream_error'},
           errStatus);
     }
 
     _breaker.onSuccess(route.upstreamModel);
+    _zenBanStreak = 0;
+    _zenIpBanUntil = null;
     u.health = UpstreamHealth.healthy;
     u.lastError = null;
     // 解码流交给 pump：pump 只在产出首个有效输出后才提交响应头，
