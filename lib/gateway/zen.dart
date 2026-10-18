@@ -1,6 +1,6 @@
 import 'dart:math';
 
-/// 单模型熔断器：某免费模型被 429/5xx 命中后，在冷却窗口内直接快速失败/转投，
+/// 单模型熔断器：某免费模型被 429/5xx 命中后，在冷却窗口内直接快速失败，
 /// 避免高并发下每个请求都去撞坏端点（重试风暴会放大限流）。
 class ModelBreaker {
   final Map<String, DateTime> _blockedUntil = {};
@@ -25,15 +25,6 @@ class ModelBreaker {
   void onSuccess(String model) {
     _failures.remove(model);
     _blockedUntil.remove(model);
-  }
-
-  /// 熔断打开时，从候选里挑一个当前健康的免费模型（按调用方给的顺序）；
-  /// 全熔则返回 null。
-  String? pickHealthy(List<String> candidates) {
-    for (final c in candidates) {
-      if (!isOpen(c)) return c;
-    }
-    return null;
   }
 }
 

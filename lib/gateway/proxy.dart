@@ -632,8 +632,8 @@ class ProxyServer {
   /// - 共享连接池（upClient，TLS keep-alive 复用），不再每请求 new HttpClient
   /// - 先探流再向客户端提交 200：首字节前发现断流/错误可透明重试，
   ///   客户端不会看到半截流
-  /// - 429/5xx 打开单模型熔断（冷却窗口），冷却期内同模型请求快速失败或
-  ///   转投其他健康的免费模型（fallback 链），尊重 Retry-After
+  /// - 429/5xx 打开单模型熔断（冷却窗口），冷却期内同模型请求快速失败并
+  ///   如实报错（不转投其他模型），尊重 Retry-After
   /// - 指数退避 + 抖动重试，仅未提交时进行
   Future<void> _forwardZen(HttpRequest req, ModelRoute route, String publicName,
       Map<String, dynamic> body,
@@ -643,24 +643,16 @@ class ProxyServer {
         ? _json(req, {'type': 'error', 'error': err}, status)
         : _json(req, {'error': err}, status);
 
-    // 熔断打开：该端点冷却中 → 转投其他健康免费模型或快速失败，
-    // 不浪费并发额度去撞已知坏端点
+    // 熔断打开：该端点冷却中 → 快速失败并如实报错。绝不静默转投其他模型：
+    // 用户指定的模型必须原样执行，换模型出答案等于伪造结果
     final target = route.upstreamModel;
     if (_breaker.isOpen(target)) {
-      final alt = _breaker.pickHealthy(
-          _zenModelPool.where((m) => m != target).toList());
-      if (alt == null) {
-        _account(publicName, u.id, 0, 0, true);
-        return failJson({
-          'message':
-              '模型 $target 正在退避冷却（上游限流），请选择其他免费模型或稍后再试',
-          'type': anthropic ? 'overloaded_error' : 'rate_limited',
-          'code': 'model_backoff',
-        }, 503);
-      }
-      _log('$publicName ⟳ $target 熔断中，转投 $alt');
-      body = Map<String, dynamic>.from(body)..['model'] = alt;
-      route = ModelRoute(publicName, u, alt, route.bare);
+      _account(publicName, u.id, 0, 0, true);
+      return failJson({
+        'message': '模型 $target 正在退避冷却（上游限流），请稍后重试或改用其他免费模型',
+        'type': anthropic ? 'rate_limit_error' : 'rate_limited',
+        'code': 'model_backoff',
+      }, 429);
     }
     await _zenTurn(req, route, publicName, body,
         clientWantsStream: clientWantsStream,
@@ -669,10 +661,6 @@ class ProxyServer {
   }
 
   final ModelBreaker _breaker = ModelBreaker();
-  Set<String> get _zenModelPool => {
-        for (final r in registry.all)
-          if (r.upstream.isZen) r.upstreamModel,
-      };
 
   /// 单次 zen 请求尝试：发送→探流→提交→泵流；可重试错误在提交前发生。
   Future<void> _zenTurn(HttpRequest req, ModelRoute route, String publicName,
@@ -729,17 +717,8 @@ class ProxyServer {
         final w = (min(base, 15000)) + rnd.nextInt(400);
         _log('$publicName ⟳ zen 第 ${attempt + 1} 次失败($why)，${w}ms 后重试');
         await Future.delayed(Duration(milliseconds: w));
-        // 重试前若本模型仍熔断而池中有健康替代 → 转投
-        var nextRoute = route;
-        if (_breaker.isOpen(route.upstreamModel)) {
-          final alt = _breaker
-              .pickHealthy(_zenModelPool.where((m) => m != route.upstreamModel).toList());
-          if (alt != null) {
-            _log('$publicName ⟳ 转投健康模型 $alt');
-            nextRoute = ModelRoute(publicName, u, alt, route.bare);
-          }
-        }
-        return _zenTurn(req, nextRoute, publicName, origBody,
+        // 只重试用户指定的原模型，绝不转投其他模型（换模型=伪造结果）
+        return _zenTurn(req, route, publicName, origBody,
             clientWantsStream: clientWantsStream,
             anthropic: anthropic,
             attempt: attempt + 1);
