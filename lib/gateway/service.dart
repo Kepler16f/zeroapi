@@ -195,6 +195,26 @@ class GatewayService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 把 zen 供应商的 baseUrl 指到自建 Worker（一键部署完成时调用）；
+  /// 同时确保出口代理开关开着——workers.dev 在部分网络环境需借代理可达
+  void applyWorkerBaseUrl(String workerRoot) {
+    final i = config.upstreams.indexWhere((x) => x.type == 'zen');
+    if (i < 0) return;
+    final u = config.upstreams[i];
+    u.baseUrl = workerRoot.endsWith('/')
+        ? '${workerRoot}inference/v1'
+        : '$workerRoot/inference/v1';
+    if (u.proxyEnabled == false && u.proxy.trim().isEmpty) u.proxyEnabled = true;
+    config.save();
+    for (final rt in _runtimes) {
+      if (rt.def.type == 'zen') {
+        rt.def.baseUrl = u.baseUrl;
+        unawaited(rt.probe());
+      }
+    }
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     ModelsDev.instance.stop();

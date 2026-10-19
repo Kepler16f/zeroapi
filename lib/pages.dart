@@ -4,10 +4,12 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../gateway/cf_api.dart';
 import '../gateway/config.dart';
 import '../gateway/proxy.dart';
 import '../gateway/service.dart';
 import '../gateway/upstream.dart';
+import '../gateway/workerdeploy.dart';
 import '../version.dart';
 
 // ---------------- 供应商页 ----------------
@@ -1006,6 +1008,124 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _proxyTargetId;
   final TextEditingController _proxyAddr = TextEditingController();
 
+  // Cloudflare Worker 一键部署对话框状态（token 仅存在于内存，不落盘）
+  final TextEditingController _cfToken = TextEditingController();
+  List<CfAccount>? _cfAccounts;
+  String _cfBusy = '';
+
+  Future<void> _showWorkerDeployDialog() async {
+    _cfAccounts = null;
+    _cfBusy = '';
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx2, setSt) {
+          final s = widget.service;
+          Future<void> verify() async {
+            setSt(() => _cfBusy = '正在校验 token…');
+            try {
+              final accs = await CfWorkerDeployer.verify(_cfToken.text.trim());
+              setSt(() {
+                _cfAccounts = accs;
+                _cfBusy = accs.isEmpty ? '该账号下没有可用工作区' : '';
+              });
+            } catch (e) {
+              setSt(() => _cfBusy = '$e');
+            }
+          }
+
+          Future<void> deploy(CfAccount acc) async {
+            setSt(() => _cfBusy = '正在部署 Worker 到「${acc.name}」…');
+            try {
+              final url = await CfWorkerDeployer.deploy(
+                  token: _cfToken.text.trim(), accountId: acc.id);
+              s.applyWorkerBaseUrl(url);
+              setSt(() => _cfBusy = '');
+              if (ctx2.mounted) Navigator.pop(ctx2);
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text('Worker 已部署并接入：$url\n'
+                        '注意 workers.dev 域名需代理可达（开启你的本地代理即可）'),
+                    duration: const Duration(seconds: 8)));
+              }
+            } catch (e) {
+              setSt(() => _cfBusy = '$e');
+            }
+          }
+
+          return AlertDialog(
+            title: const Text('一键部署 Cloudflare Worker（Zen 出口）'),
+            content: SizedBox(
+              width: 460,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '把 zen 流量改走你自己的 Cloudflare Worker，上游看到的是 '
+                      'Cloudflare 的海量边缘 IP，不再是你本机 IP——绕过按 IP 的'
+                      '滥用风控。\n使用你自己的免费 Cloudflare 账号（不绑卡、'
+                      '每天 10 万次请求内免费）；token 仅本次使用，不会保存。',
+                      style: TextStyle(fontSize: 12.5),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '创建 token：dash.cloudflare.com → My Profile → API Tokens → '
+                      'Create Token，模板「Edit cloudflare workers scripts」',
+                      style: TextStyle(
+                          fontSize: 11.5,
+                          color: Theme.of(ctx2).colorScheme.onSurfaceVariant),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _cfToken,
+                      obscureText: true,
+                      decoration: const InputDecoration(labelText: 'API Token'),
+                    ),
+                    const SizedBox(height: 10),
+                    if (_cfAccounts == null)
+                      FilledButton(
+                          onPressed: _cfBusy.isEmpty ? verify : null,
+                          child: const Text('校验 token')),
+                    if (_cfBusy.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(_cfBusy,
+                            style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.orange.shade800)),
+                      ),
+                    if (_cfAccounts != null && _cfAccounts!.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      const Text('选择账号并部署：', style: TextStyle(fontSize: 13)),
+                      const SizedBox(height: 4),
+                      for (final a in _cfAccounts!)
+                        ListTile(
+                          dense: true,
+                          title: Text(a.name.isEmpty ? a.id : a.name),
+                          trailing: FilledButton(
+                              onPressed: _cfBusy.isEmpty
+                                  ? () => deploy(a)
+                                  : null,
+                              child: const Text('部署')),
+                        ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('关闭')),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -1220,6 +1340,12 @@ class _SettingsPageState extends State<SettingsPage> {
                       helperText: '支持 http / socks5；逗号分隔多个=轮换池（换节点=换 IP）',
                       helperMaxLines: 2,
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: _showWorkerDeployDialog,
+                    icon: const Icon(Icons.cloud_upload_outlined, size: 18),
+                    label: const Text('一键部署 Cloudflare Worker（Zen 出口换 IP）'),
                   ),
                 ],
               ),

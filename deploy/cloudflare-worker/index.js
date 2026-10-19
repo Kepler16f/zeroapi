@@ -55,7 +55,8 @@ export default {
     }
 
     // 健康检查
-    if (request.method === 'GET' && (request.pathname === '/' || request.pathname === '/health')) {
+    const inUrl = new URL(request.url);
+    if (request.method === 'GET' && (inUrl.pathname === '/' || inUrl.pathname === '/health')) {
       return new Response(JSON.stringify({ ok: true, proxy: 'zeroapi-opencode-zen', target: TARGET_HOST }), {
         headers: { ...cors(), 'content-type': 'application/json' },
       });
@@ -76,30 +77,36 @@ export default {
     }
 
     // 覆盖为轮换的 opencode CLI UA；补齐上游免费门必需的会话头（若客户端没带）
-    h.set('user-agent', pick(UAS));
+    const clientUA = request.headers.get('user-agent') || '';
+    h.set('user-agent', clientUA.startsWith('opencode/') ? clientUA : pick(UAS));
+    // SSE 透传要求上游不压缩：压缩体经 Cloudflare 自动解压后，
+    // content-encoding 头若仍被拷贝给客户端会解码失败
+    h.set('accept-encoding', 'identity');
     h.set('origin', `https://${TARGET_HOST}`);
     h.set('referer', `https://${TARGET_HOST}/`);
     if (!h.has('x-opencode-client')) h.set('x-opencode-client', 'cli');
     if (!h.has('x-opencode-project')) h.set('x-opencode-project', 'global');
     if (!h.has('x-opencode-session')) {
-      const sid = 'ses_' + randHex(12) + randB62(14);
+      const sid = sesId();
       h.set('x-opencode-session', sid);
       h.set('x-opencode-session-id', sid);
     } else if (!h.has('x-opencode-session-id')) {
       // 上游要求二者相等，缺失时镜像过来
       h.set('x-opencode-session-id', h.get('x-opencode-session'));
     }
-    if (!h.has('x-opencode-request')) h.set('x-opencode-request', 'msg_' + randHex(12) + randB62(14));
+    if (!h.has('x-opencode-request')) h.set('x-opencode-request', msgId());
 
     const upstream = await fetch(new Request(target.toString(), {
       method: request.method,
       headers: h,
       body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
       redirect: 'follow',
-      cf: { cache: 'bypass' },
     }));
 
     const rh = new Headers(upstream.headers);
+    // body 已是解压后的明文：删除长度/编码声明，避免客户端按旧值解码
+    rh.delete('content-encoding');
+    rh.delete('content-length');
     for (const [k, v] of Object.entries(cors())) rh.set(k, v);
     rh.delete('cf-ray');
     rh.delete('cf-cache-status');
@@ -118,11 +125,16 @@ function cors() {
   };
 }
 
-function randHex(n) {
-  let s = '';
-  for (let i = 0; i < n; i++) s += '0123456789abcdef'[(Math.random() * 16) | 0];
-  return s;
+// 与 opencode CLI 同款的降序/升序 id（上游只校验低 12 位 counter ≤ 63）
+function encodedId(descending) {
+  const cur = BigInt(Date.now()) * 4096n + BigInt((Math.random() * 64) | 0);
+  const mask = (1n << 48n) - 1n;
+  const v = descending ? ~cur & mask : cur & mask;
+  return v.toString(16).padStart(12, '0').slice(-12) + randB62(14);
 }
+function sesId() { return 'ses_' + encodedId(true); }
+function msgId() { return 'msg_' + encodedId(false); }
+
 function randB62(n) {
   const a = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
   let s = '';
