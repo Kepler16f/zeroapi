@@ -260,4 +260,188 @@ void main() {
       expect(Zen.healBody('some other error', {'messages': []}), isNull);
     });
   });
+
+  group('工具名截断与回映', () {
+    final longName = 'mcp__plugin__${'x' * 57}'; // 70 字符
+    final shortTool = {
+      'type': 'function',
+      'function': {'name': 'bash', 'parameters': {}}
+    };
+    Map<String, dynamic> mkBody() => {
+          'model': 'big-pickle',
+          'tools': [
+            {
+              'type': 'function',
+              'function': {'name': longName, 'parameters': {}}
+            },
+            shortTool,
+          ],
+        };
+
+    test('超长名截断为 前缀#hash6（恰 64），短名原样保留不入 map', () {
+      expect(longName.length, 70);
+      final body = mkBody();
+      final origList = body['tools'];
+      final map = Zen.shortenToolNames(body);
+      final tools = body['tools'] as List;
+      expect(tools.length, 2);
+
+      final sn = (tools[0]['function'] as Map)['name'] as String;
+      expect(sn.length, 64);
+      expect(sn, matches(RegExp(r'#[0-9a-f]{6}$')));
+      expect(sn.startsWith('mcp__plugin__'), true);
+      expect(map[sn], longName);
+
+      // copy-on-write：有改动才换 list，未改的工具项复用原对象
+      expect(body['tools'], isNot(same(origList)));
+      expect(tools[1], same(shortTool));
+      expect((tools[1]['function'] as Map)['name'], 'bash');
+      expect(map.values, isNot(contains('bash')));
+
+      // 无超长名 → 返回空 map 且不动原 list
+      final flatList = <Object>[shortTool];
+      final flat = <String, dynamic>{'tools': flatList};
+      expect(Zen.shortenToolNames(flat), isEmpty);
+      expect(flat['tools'], same(flatList));
+    });
+
+    test('确定性：两个独立 body 的截断名完全一致', () {
+      final a = Zen.shortenToolNames(mkBody());
+      final b = Zen.shortenToolNames(mkBody());
+      expect(a.keys.length, 1);
+      expect(a, b);
+      expect((b.keys.single).length, 64);
+    });
+
+    test('历史 tool_calls 与 tool_choice 同步改写为同一截断名', () {
+      final body = mkBody();
+      body['messages'] = [
+        {
+          'role': 'assistant',
+          'tool_calls': [
+            {'id': 'c1', 'function': {'name': longName, 'arguments': '{}'}}
+          ]
+        },
+      ];
+      body['tool_choice'] = {'type': 'function', 'function': {'name': longName}};
+
+      final map = Zen.shortenToolNames(body);
+      final sn = map.keys.single;
+
+      final tc = ((body['messages'] as List).first['tool_calls'] as List).first;
+      expect(tc['id'], 'c1');
+      final tcFn = tc['function'] as Map;
+      expect(tcFn['name'], sn);
+      expect(tcFn['arguments'], '{}');
+
+      final tcf = body['tool_choice'] as Map;
+      expect(tcf['type'], 'function');
+      expect((tcf['function'] as Map)['name'], sn);
+    });
+
+    test('restore 把流式 delta 与非流式 message 的 tool_calls 换回原名', () {
+      final map = Zen.shortenToolNames(mkBody());
+      final sn = map.keys.single;
+
+      final chunk = {
+        'choices': [
+          {
+            'index': 0,
+            'delta': {
+              'tool_calls': [
+                {
+                  'index': 0,
+                  'id': 'c1',
+                  'function': {'name': sn, 'arguments': '{'}
+                }
+              ]
+            }
+          }
+        ]
+      };
+      Zen.restoreToolNames(chunk, map);
+      final dFn = (((chunk['choices'] as List).first['delta'] as Map)['tool_calls']
+          as List)
+          .first['function'] as Map;
+      expect(dFn['name'], longName);
+      expect(dFn['arguments'], '{');
+
+      final msgChunk = {
+        'choices': [
+          {
+            'index': 0,
+            'message': {
+              'role': 'assistant',
+              'tool_calls': [
+                {
+                  'index': 0,
+                  'id': 'c2',
+                  'function': {'name': sn, 'arguments': '{}'}
+                }
+              ]
+            }
+          }
+        ]
+      };
+      Zen.restoreToolNames(msgChunk, map);
+      final mFn = (((msgChunk['choices'] as List).first['message'] as Map)['tool_calls']
+          as List)
+          .first['function'] as Map;
+      expect(mFn['name'], longName);
+    });
+
+    test('空 map 不动内容，坏 chunk 不抛异常，未知名字保持原名', () {
+      final map = Zen.shortenToolNames(mkBody());
+      final sn = map.keys.single;
+
+      final frozen = {
+        'choices': [
+          {
+            'index': 0,
+            'delta': {
+              'tool_calls': [
+                {'index': 0, 'function': {'name': sn}}
+              ]
+            }
+          }
+        ]
+      };
+      Zen.restoreToolNames(frozen, {});
+      final fFn = (((frozen['choices'] as List).first['delta'] as Map)['tool_calls']
+          as List)
+          .first['function'] as Map;
+      expect(fFn['name'], sn);
+
+      expect(
+          () => Zen.restoreToolNames({'foo': 1}, {'a': 'b'}), returnsNormally);
+      expect(
+          () => Zen.restoreToolNames({'choices': 'nope'}, {'a': 'b'}),
+          returnsNormally);
+      expect(
+          () => Zen.restoreToolNames({'choices': [null, 5, 3.14]}, {'a': 'b'}),
+          returnsNormally);
+
+      final unknown = {
+        'choices': [
+          {
+            'index': 0,
+            'delta': {
+              'tool_calls': [
+                {
+                  'index': 0,
+                  'function': {'name': 'other_tool', 'arguments': '{}'}
+                }
+              ]
+            }
+          }
+        ]
+      };
+      Zen.restoreToolNames(unknown, map);
+      final uFn = (((unknown['choices'] as List).first['delta'] as Map)['tool_calls']
+          as List)
+          .first['function'] as Map;
+      expect(uFn['name'], 'other_tool');
+      expect(uFn['arguments'], '{}');
+    });
+  });
 }

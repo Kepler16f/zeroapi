@@ -91,7 +91,12 @@ class UpstreamRuntime {
   Future<bool> _probeZen() async {
     try {
       final base = def.baseUrl.replaceAll(RegExp(r'/+$'), '');
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+      // 探针与补全走同一条出口：配了出口代理/Worker 时也必须经代理，
+      // 否则代理重启窗口期目录探测直连 workers.dev 会被墙，误判"未知模型"
+      final pool = def.proxyPool;
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 10)
+        ..findProxy = (_) => pool.isEmpty ? 'DIRECT' : pool[0];
       final req = await client.getUrl(Uri.parse('$base/models'));
       Zen.headers(def.apiKey).forEach((k, v) => req.headers.set(k, v));
       final resp = await req.close().timeout(const Duration(seconds: 15));

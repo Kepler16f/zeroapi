@@ -130,7 +130,6 @@ class ProxyServer {
   final bool anthropicEnabled;
   UsageStats usageToday = UsageStats();
   HttpServer? _server;
-  IOSink? _usageSink;
 
   /// 共享上游 HttpClient：连接池复用（TLS keep-alive），高并发下避免
   /// 每请求重建客户端造成的握手风暴与 socket 耗尽；只在 stop() 时关闭。
@@ -178,25 +177,26 @@ class ProxyServer {
     if (day != _usageDay) {
       _usageDay = day;
       usageToday = UsageStats();
-      try {
-        _usageSink?.flush();
-        _usageSink?.close();
-      } catch (_) {}
-      _usageSink = null;
     }
     usageToday.add(model, p, c, err,
         trendKey: now.hour.toString().padLeft(2, '0'), cached: cached);
+    // 同步追加落盘：IOSink 的底层 open 是异步的，目录在 openWrite 后被删
+    // 时异常会从 done 逃逸成 unhandled async error（try/catch 拦不住）；
+    // 同步写把错误收敛在当场，也免掉 flush/close 生命周期管理。
     try {
-      _usageSink ??= _openUsageFile();
-      _usageSink?.writeln(jsonEncode({
-        'ts': now.toIso8601String(),
-        'model': model,
-        'upstream': upstream,
-        'prompt': p,
-        'completion': c,
-        'error': err,
-        if (cached > 0) 'cached': cached,
-      }));
+      final dir = Directory(_usageDirPath);
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      File('${dir.path}/usage-$day.jsonl').writeAsStringSync(
+          '${jsonEncode({
+            'ts': now.toIso8601String(),
+            'model': model,
+            'upstream': upstream,
+            'prompt': p,
+            'completion': c,
+            'error': err,
+            if (cached > 0) 'cached': cached,
+          })}\n',
+          mode: FileMode.append);
     } catch (_) {}
   }
 
@@ -875,6 +875,8 @@ class ProxyServer {
       ..['stream'] = true
       ..['stream_options'] = {'include_usage': true}
       ..['tools'] = Zen.ensureFreeTools(origBody['tools'], injected);
+    // 上游工具名 ≤64 字符（ZCode 的 MCP 工具会超）：截断发送，响应回映
+    final nameMap = Zen.shortenToolNames(sent);
 
     void failJson(Map<String, dynamic> err, int status) => anthropic
         ? _json(req, {'type': 'error', 'error': err}, status)
@@ -1032,10 +1034,10 @@ class ProxyServer {
     try {
       if (clientWantsStream) {
         await _pumpZenStream(lines, req, route, publicName, injected,
-            anthropic: anthropic);
+            anthropic: anthropic, nameMap: nameMap);
       } else {
         await _pumpZenAggregate(lines, req, route, publicName, injected,
-            anthropic: anthropic);
+            anthropic: anthropic, nameMap: nameMap);
       }
     } on _ZenEarlyReset catch (e) {
       if (attempt < maxAttempts - 1) return retryOrFail('early(${e.why})');
@@ -1055,7 +1057,8 @@ class ProxyServer {
   /// （调用方还能透明重试，客户端什么都没收到）；提交后的断流只能带错误收尾。
   Future<void> _pumpZenStream(Stream<String> lines, HttpRequest req,
       ModelRoute route, String publicName, Set<String> injected,
-      {required bool anthropic}) async {
+      {required bool anthropic,
+      Map<String, String> nameMap = const {}}) async {
     final decoy = <int, bool>{};
     int prompt = 0, completion = 0;
     var committed = false;
@@ -1110,6 +1113,7 @@ class ProxyServer {
         _ctx?.cached = _cachedOf(us);
       }
       final out = Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
+      if (out != null) Zen.restoreToolNames(out, nameMap);
       if (aStream != null) {
         if (out == null) return; // 纯诱饵增量，不喂给适配器
         final evs = aStream.feed(jsonEncode(out));
@@ -1162,7 +1166,8 @@ class ProxyServer {
   /// 非流式泵：先全量读 SSE 聚合，读失败且尚未写响应 → 抛 _ZenEarlyReset 可重试
   Future<void> _pumpZenAggregate(Stream<String> lines, HttpRequest req,
       ModelRoute route, String publicName, Set<String> injected,
-      {required bool anthropic}) async {
+      {required bool anthropic,
+      Map<String, String> nameMap = const {}}) async {
     final text = StringBuffer();
     try {
       await for (final s in lines) {
@@ -1178,7 +1183,9 @@ class ProxyServer {
       final d = t.substring(5).trim();
       if (d.isEmpty || d == '[DONE]') continue;
       try {
-        datas.add(jsonDecode(d) as Map<String, dynamic>);
+        final m = jsonDecode(d) as Map<String, dynamic>;
+        Zen.restoreToolNames(m, nameMap);
+        datas.add(m);
       } catch (_) {}
     }
     final agg = Zen.aggregate(datas, route.upstreamModel, injected);
@@ -1215,18 +1222,6 @@ class ProxyServer {
     }
   }
 
-
-  IOSink? _openUsageFile() {
-    try {
-      final dir = Directory(_usageDirPath);
-      if (!dir.existsSync()) dir.createSync(recursive: true);
-      final day = DateTime.now().toIso8601String().substring(0, 10);
-      return File('${dir.path}/usage-$day.jsonl')
-          .openWrite(mode: FileMode.append);
-    } catch (_) {
-      return null;
-    }
-  }
 
   void _json(HttpRequest req, Object body, [int status = 200]) {
     req.response.statusCode = status;

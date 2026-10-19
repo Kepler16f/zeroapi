@@ -189,6 +189,108 @@ class Zen {
     return '{}';
   }
 
+  static String _hash6(String s) {
+    var h = 0x811c9dc5;
+    for (final c in s.codeUnits) {
+      h ^= c;
+      h = (h * 0x01000193) & 0xFFFFFFFF;
+    }
+    return h.toRadixString(16).padLeft(8, '0').substring(0, 6);
+  }
+
+  /// 上游对工具名有长度上限（实测 64，ZCode 的 MCP 工具名会超），
+  /// 发送前把超长名确定性截断为 `前缀#hash6`（≤64），返回 截断名→原名 映射；
+  /// 响应侧用 restoreToolNames 换回，客户端全程无感知。多轮回传历史里的
+  /// assistant tool_calls / tool_choice 同步改写（哈希确定性保证跨请求一致）。
+  static Map<String, String> shortenToolNames(Map<String, dynamic> body,
+      {int maxLen = 64}) {
+    final map = <String, String>{};
+    String shortOf(String name) =>
+        '${name.substring(0, maxLen - 7)}#${_hash6(name)}';
+    final tools = body['tools'];
+    if (tools is List) {
+      var changed = false;
+      final rebuilt = <Object>[];
+      for (final t in tools) {
+        if (t is Map && t['function'] is Map) {
+          final fn = t['function'] as Map;
+          final name = fn['name']?.toString() ?? '';
+          if (name.length > maxLen) {
+            final sn = shortOf(name);
+            map[sn] = name;
+            rebuilt.add({...t, 'function': {...fn, 'name': sn}});
+            changed = true;
+            continue;
+          }
+        }
+        rebuilt.add(t);
+      }
+      if (changed) body['tools'] = rebuilt;
+    }
+    if (map.isEmpty) return map;
+    final reverse = {for (final e in map.entries) e.value: e.key};
+    final msgs = body['messages'];
+    if (msgs is List) {
+      var mChanged = false;
+      final rebuiltMsgs = <Object>[];
+      for (final m in msgs) {
+        var touched = false;
+        if (m is Map && m['tool_calls'] is List) {
+          final newTcs = (m['tool_calls'] as List).map((tc) {
+            if (tc is Map && tc['function'] is Map) {
+              final fn = tc['function'] as Map;
+              final sn = reverse[fn['name']?.toString()];
+              if (sn != null) {
+                touched = true;
+                return {...tc, 'function': {...fn, 'name': sn}};
+              }
+            }
+            return tc;
+          }).toList();
+          if (touched) {
+            mChanged = true;
+            rebuiltMsgs.add({...m, 'tool_calls': newTcs});
+            continue;
+          }
+        }
+        rebuiltMsgs.add(m);
+      }
+      if (mChanged) body['messages'] = rebuiltMsgs;
+    }
+    final tcf = body['tool_choice'];
+    if (tcf is Map && tcf['function'] is Map) {
+      final fn = tcf['function'] as Map;
+      final sn = reverse[fn['name']?.toString()];
+      if (sn != null) {
+        body['tool_choice'] = {...tcf, 'function': {...fn, 'name': sn}};
+      }
+    }
+    return map;
+  }
+
+  /// 响应回映：把 chunk（delta/message 的 tool_calls）里的截断工具名换回原名
+  static void restoreToolNames(Map<String, dynamic> chunk,
+      Map<String, String> map) {
+    if (map.isEmpty) return;
+    final choices = chunk['choices'];
+    if (choices is! List) return;
+    for (final c in choices) {
+      if (c is! Map) continue;
+      for (final key in ['delta', 'message']) {
+        final m = c[key];
+        if (m is Map && m['tool_calls'] is List) {
+          for (final tc in (m['tool_calls'] as List)) {
+            if (tc is Map && tc['function'] is Map) {
+              final fn = tc['function'] as Map;
+              final orig = map[fn['name']?.toString()];
+              if (orig != null) fn['name'] = orig;
+            }
+          }
+        }
+      }
+    }
+  }
+
   /// 递归剥离指定 key（顶层与 messages/tools 内任意深度），返回是否有删除
   static bool stripKeyDeep(Object? node, String key) {
     var removed = false;
