@@ -4,7 +4,7 @@
 或聊天客户端使用。一个应用同时管理所有网关类服务：开关、探活、拉起、聚合、记账。
 
 ```
-你的客户端 ──(OpenAI API + 统一 key)──▶ ZeroApi(:8123)
+你的客户端（本机 / 局域网设备）──(OpenAI API + 网关 key)──▶ ZeroApi(:8123)
                                         ├──▶ OpenCode Zen Free (内置：直连，免费模型自动发现)
                                         ├──▶ Qoder2API-Hub  (自定义：转发)
                                         ├──▶ niceboat       (自定义：转发)
@@ -28,7 +28,7 @@ Windows：直接双击 `build/windows/<arch>/runner/Release/zeroapi.exe`
 
 | 类型 | UI 名称 | 含义 | 典型例子 |
 |------|---------|------|----------|
-| `zen`     | 内置 | 网关原生直连 OpenCode Zen 免费通道：按客户端指纹请求 `opencode.ai/inference/v1`，只暴露免费档模型（`*-free`/big-pickle，其余默认隐藏），无需任何本地进程 | OpenCode Zen Free |
+| `zen`     | 内置 | 网关原生直连 OpenCode Zen 免费通道（纯 Dart 实现，不含 zengate/opencode 等外部二进制）：按客户端指纹请求 `opencode.ai/inference/v1`，只暴露免费档模型（`*-free`/big-pickle，其余默认隐藏），无需任何本地进程 | OpenCode Zen Free |
 | `managed` | 内置 | ZeroApi 负责 `启动命令 + 参数` 拉起子进程；进程退出自动退避重启；端口已有实例则视为外部进程、不重复拉起 | 本地网关类供应商（如自建的 OpenAI 兼容服务） |
 | `remote`  | 自定义 | 只做转发与探活，供应商由它自己负责 | Qoder2API-Hub、niceboat、OpenRouter 等任何 OpenAI 兼容端点 |
 
@@ -36,8 +36,9 @@ Windows：直接双击 `build/windows/<arch>/runner/Release/zeroapi.exe`
 
 ## 模型命名规则
 
-- 每个供应商的模型以 **`供应商id/模型名`** 暴露（如 `zen/big-pickle`）；
-- 当某个裸模型名在所有供应商中**唯一**时，也可直接用裸名（如 `big-pickle`）；重名时请带前缀，避免歧义。
+- 模型名**全局唯一**时直接以裸名暴露（如 `big-pickle`）：OpenCode Zen 的 big-pickle
+  在模型列表与路由中统一显示为裸名，不再出现 `zen/` 前缀的重复条目；
+- 跨供应商**重名**的模型仍以 **`供应商id/模型名`** 消歧，避免歧义。
 - `GET /v1/models` 返回全部路由及归属。
 - 模型的能力信息（上下文窗口、视觉/推理/工具调用等）来自上游返回与
   [models.dev](https://models.dev) 目录（每日自动刷新，离线时用本地缓存）。
@@ -46,24 +47,44 @@ Windows：直接双击 `build/windows/<arch>/runner/Release/zeroapi.exe`
 
 任何 OpenAI 兼容客户端只需两项（设置页可见、可复制，协议格式可在设置页切换）：
 
-- Base URL：`http://127.0.0.1:8123/v1`
-- API Key：设置页显示 / 复制 / 一键更换
+- Base URL：`http://127.0.0.1:8123/v1`（局域网内其他设备用本机局域网地址，见下文）
+- API Key：**多网关密钥**——设置页可创建多把 key（标签 + 值），支持新建/重命名/删除/复制，
+  每把 key 记录最近使用时间，便于按"不同设备/不同客户端一把 key"分发管理；
+  旧的单 key 配置会自动迁移为一把「默认」key。
 
 ```bash
 curl http://127.0.0.1:8123/v1/chat/completions \
   -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
-  -d '{"model":"zen/big-pickle","messages":[{"role":"user","content":"ping"}]}'
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"ping"}]}'
 ```
 
 Anthropic 客户端（Claude Code 等）：设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8123`，
 API Key 同上；网关暴露 `/v1/messages` 并在 OpenAI ⇄ Anthropic 双向翻译
 （含流式 SSE 事件），支持 `x-api-key` 鉴权。
 
+### 局域网访问
+
+设置页打开「允许局域网连接」开关后，网关监听 `0.0.0.0`，界面显示本机局域网地址；
+同一 Wi-Fi/内网的其他设备（手机、另一台电脑）即可直接用该地址访问。注意：
+
+- 首次监听会触发 Windows 防火墙授权弹窗，需点击「允许」；
+- 配合多密钥使用，可给每台设备单独发一把 key，分开管理与追查。
+
 ## 已验证行为（本机）
 
-- 内置 Zen：网关启动即直连 Zen 免费通道拉模型目录（只保留免费档），预热就绪前不显示连接拒绝错误；
+- 内置 Zen：网关启动即原生直连（纯 Dart，无 zengate/opencode 二进制）Zen 免费通道拉模型目录
+  （只保留免费档），预热就绪前不显示连接拒绝错误；
   429/5xx 与连接错误自动指数退避重试；供应商日志落 `%APPDATA%\zeroapi\logs\`。
-- 非流式 + SSE 流式透传；usage 记账（内存汇总 + 按天 jsonl + 分时段图表）。
+- 上游 403（IP 滥用风控）统一映射为 429 限流语义：单模型进入冷却、**不转投其他模型**；
+  判定出口 IP 被封时，应用内弹窗征询处理。
+- 设置页提供「出口代理」：支持 http/socks5，逗号分隔多个可作轮换池；
+  以及「一键部署 Cloudflare Worker」——用用户自己的免费 CF 账号部署，token 不落盘；
+  注意 workers.dev 域名在国内需代理才可达。
+- 非流式 + SSE 流式透传；每条请求日志记录：模型名、所用密钥标签、接口模式
+  （chat/anthropic/responses、流式/非流式）、词元用量（输入/输出）、耗时与上游出口；
+  上游返回缓存命中信息时一并显示缓存命中率。
+- 用量页：横向条形图（模型名/条形/行尾词元·次数）、饼图、折线图；词元以中文「万/亿」计；
+  用量跨重启持久（当日 jsonl 回填）。
 - `/v1/responses` 端点透传（请求体原样转发供应商 `/responses`，
   usage 按 `input_tokens`/`output_tokens` 记账）。
 - `/v1/messages`（Anthropic 格式）非流式与流式端到端可用。

@@ -41,7 +41,10 @@ class GatewayService extends ChangeNotifier {
       rt.startPeriodicProbe();
     }
     server = ProxyServer(config.host, config.port, config.apiKey, registry,
-        anthropicEnabled: config.anthropicEnabled)
+        anthropicEnabled: config.anthropicEnabled,
+        allowLan: config.allowLan,
+        keys: config.keys,
+        onKeyUsed: _touchKey)
       ..onUnknownModel = _refreshRoutes
       ..onIpBan = (id) => onIpBanDetected?.call(id);
     try {
@@ -142,20 +145,67 @@ class GatewayService extends ChangeNotifier {
 
   // ---- 设置 ----
 
-  Future<void> updateGateway({String? host, int? port, String? apiKey}) async {
+  Future<void> updateGateway({String? host, int? port}) async {
     config
       ..host = host ?? config.host
-      ..port = port ?? config.port
-      ..apiKey = apiKey ?? config.apiKey;
+      ..port = port ?? config.port;
     config.save();
     await restartServer();
   }
 
-  void rotateApiKey() {
-    config.apiKey =
-        'sk-pg-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+  /// 局域网接入开关：改监听地址必须重启网关才生效
+  Future<void> setAllowLan(bool enabled) async {
+    config.allowLan = enabled;
+    config.save();
+    await restartServer();
+  }
+
+  // ---- 网关密钥池（持有任意一把即可接入，不与设备绑定）----
+
+  void addGatewayKey(String label, {String? value}) {
+    final v = (value ?? '').trim();
+    config.keys.add(GatewayKey(
+        label.trim().isEmpty ? '密钥 ${config.keys.length + 1}' : label.trim(),
+        v.isEmpty ? genGatewayKey() : v));
+    config.save();
+    unawaited(restartServer()); // keys 以 List 引用注入，重建保险起见
+  }
+
+  void renameGatewayKey(int index, String label) {
+    if (index < 0 || index >= config.keys.length) return;
+    config.keys[index].label = label.trim().isEmpty ? config.keys[index].label : label.trim();
+    config.save();
+    notifyListeners();
+  }
+
+  void deleteGatewayKey(int index) {
+    if (index <= 0 || index >= config.keys.length) return; // 保留首把默认 key
+    config.keys.removeAt(index);
     config.save();
     unawaited(restartServer());
+  }
+
+  /// 轮换默认 key（旧「更换 API Key」语义）
+  void rotateApiKey() {
+    if (config.keys.isEmpty) {
+      config.keys.add(GatewayKey('默认', genGatewayKey()));
+    } else {
+      config.keys.first.value = genGatewayKey();
+    }
+    config.save();
+    unawaited(restartServer());
+  }
+
+  /// 密钥命中回调（网关线程）：限频 1 分钟内同一把不重复落盘
+  final Map<String, DateTime> _keyTouchMark = {};
+  void _touchKey(GatewayKey k) {
+    final now = DateTime.now();
+    final last = _keyTouchMark[k.value];
+    if (last != null && now.difference(last).inSeconds < 60) return;
+    _keyTouchMark[k.value] = now;
+    k.lastUsed = now;
+    config.save();
+    notifyListeners();
   }
 
   void setThemeMode(String mode) {

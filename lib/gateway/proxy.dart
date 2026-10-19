@@ -25,6 +25,20 @@ class ModelRoute {
   ModelRoute(this.publicName, this.upstream, this.upstreamModel, this.bare);
 }
 
+/// 单请求上下文：认证通过后经 Zone 注入，深层转发/泵流代码无需改签名即可
+/// 读取（密钥标签、接口模式、计时、缓存词元），供统一富日志与记账使用。
+class _ReqCtx {
+  final String keyLabel;
+  final Stopwatch sw = Stopwatch()..start();
+  String mode = ''; // chat | anthropic | responses
+  bool stream = false;
+  String model = '';
+  int cached = 0; // 上游 usage.prompt_tokens_details.cached_tokens
+  _ReqCtx(this.keyLabel);
+}
+
+final _ctxKey = Object();
+
 class ModelRegistry {
   final Map<String, ModelRoute> _routes = {};
 
@@ -52,6 +66,8 @@ class ModelRegistry {
 /// 当天视图为小时 "00"-"23"，跨天汇总为日期 "MM-dd"）
 class UsageStats {
   int requests = 0, errors = 0, promptTokens = 0, completionTokens = 0;
+  /// 上游 usage.prompt_tokens_details.cached_tokens 累计（缓存命中率分子）
+  int cachedTokens = 0;
   final Map<String, int> byModel = {};
   /// 按模型的词元总量（输入+输出）：用量图按此排序/占比，次数仅并列展示
   final Map<String, int> byModelTokens = {};
@@ -59,10 +75,12 @@ class UsageStats {
   final Map<String, int> byDayTokens = {};
   final Map<String, int> trend = {};
 
-  void add(String model, int prompt, int completion, bool isError, {String? trendKey}) {
+  void add(String model, int prompt, int completion, bool isError,
+      {String? trendKey, int cached = 0}) {
     requests++;
     promptTokens += prompt;
     completionTokens += completion;
+    cachedTokens += cached;
     if (isError) errors++;
     byModel.update(model, (v) => v + 1, ifAbsent: () => 1);
     final tokens = prompt + completion;
@@ -78,6 +96,7 @@ class UsageStats {
     errors += o.errors;
     promptTokens += o.promptTokens;
     completionTokens += o.completionTokens;
+    cachedTokens += o.cachedTokens;
     o.byModel.forEach((k, v) => byModel.update(k, (x) => x + v, ifAbsent: () => v));
     o.byModelTokens.forEach((k, v) => byModelTokens.update(k, (x) => x + v, ifAbsent: () => v));
     if (trendKey != null) {
@@ -103,7 +122,10 @@ class UsageStats {
 class ProxyServer {
   final String host;
   final int port;
-  final String apiKey;
+  /// 网关密钥池：命中任意一把即放行（不与设备绑定）
+  final List<GatewayKey> keys;
+  /// 允许局域网接入：true 时绑定 0.0.0.0（Windows 首次需防火墙放行）
+  final bool allowLan;
   final ModelRegistry registry;
   final bool anthropicEnabled;
   UsageStats usageToday = UsageStats();
@@ -133,7 +155,8 @@ class ProxyServer {
   DateTime _lastUnknownRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 统一记账：内存当日汇总（含小时趋势）+ jsonl 落盘（跨天自动换文件）
-  void _account(String model, String upstream, int p, int c, bool err) {
+  void _account(String model, String upstream, int p, int c, bool err,
+      {int cached = 0}) {
     final now = DateTime.now();
     final day = now.toIso8601String().substring(0, 10);
     if (day != _usageDay) {
@@ -145,7 +168,8 @@ class ProxyServer {
       } catch (_) {}
       _usageSink = null;
     }
-    usageToday.add(model, p, c, err, trendKey: now.hour.toString().padLeft(2, '0'));
+    usageToday.add(model, p, c, err,
+        trendKey: now.hour.toString().padLeft(2, '0'), cached: cached);
     try {
       _usageSink ??= _openUsageFile();
       _usageSink?.writeln(jsonEncode({
@@ -155,8 +179,31 @@ class ProxyServer {
         'prompt': p,
         'completion': c,
         'error': err,
+        if (cached > 0) 'cached': cached,
       }));
     } catch (_) {}
+  }
+
+  /// 从 usage map 提取缓存命中词元（OpenAI: prompt_tokens_details.cached_tokens；
+  /// Responses: input_tokens_details.cached_tokens）
+  static int _cachedOf(Map? us) {
+    if (us == null) return 0;
+    final d = (us['prompt_tokens_details'] ?? us['input_tokens_details']) as Map?;
+    return ((d?['cached_tokens'] ?? 0) as num).toInt();
+  }
+
+  /// 富日志行尾：密钥标签 · 模式 · 词元(含缓存) · 耗时
+  String _tail(_ReqCtx? ctx, int p, int c) {
+    if (ctx == null) return '';
+    final parts = <String>['key=${ctx.keyLabel}', ctx.mode + (ctx.stream ? '·流' : '')];
+    if (p > 0 || c > 0) {
+      final cache = ctx.cached > 0 && p > 0
+          ? '/缓${(ctx.cached / p * 100).toStringAsFixed(0)}%'
+          : '';
+      parts.add('$p+$c词元$cache');
+    }
+    parts.add('${(ctx.sw.elapsedMilliseconds / 1000).toStringAsFixed(1)}s');
+    return '  · ${parts.join(' · ')}';
   }
 
   /// 从磁盘 jsonl 聚合指定天数范围的用量（含按天趋势）。
@@ -212,14 +259,22 @@ class ProxyServer {
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
   }
 
-  ProxyServer(this.host, this.port, this.apiKey, this.registry,
-      {this.anthropicEnabled = true, this._usageDir});
+  ProxyServer(this.host, this.port, String apiKey, this.registry,
+      {this.anthropicEnabled = true,
+      this.allowLan = false,
+      List<GatewayKey>? keys,
+      this.usageDir,
+      this.onKeyUsed})
+      : keys = keys ?? [GatewayKey('默认', apiKey)];
 
   /// 用量 jsonl 目录覆盖（测试注入隔离目录；生产走 %APPDATA%/zeroapi/logs）
-  final String? _usageDir;
+  final String? usageDir;
+
+  /// 密钥命中回调（service 侧更新 lastUsed 并限频落盘）
+  final void Function(GatewayKey key)? onKeyUsed;
 
   String get _usageDirPath =>
-      _usageDir ??
+      usageDir ??
       (Platform.isWindows
           ? '${Platform.environment['APPDATA']}/zeroapi/logs'
           : '${Platform.environment['HOME']}/.config/zeroapi/logs');
@@ -231,10 +286,14 @@ class ProxyServer {
 
   Future<void> start() async {
     _restoreTodayUsage();
-    final server = await HttpServer.bind(host, port);
+    // 局域网模式绑定 0.0.0.0 让同网段设备可接入；否则仅本机回环
+    final server = await HttpServer.bind(
+        allowLan ? InternetAddress.anyIPv4 : host, port);
     _server = server;
     server.listen(_handle, onError: (e) => _log('server error: $e'));
-    _log('zeroapi 监听 http://$host:$port/v1');
+    _log(allowLan
+        ? 'zeroapi 监听 http://$host:$port/v1（局域网 0.0.0.0:$port，首次需允许防火墙）'
+        : 'zeroapi 监听 http://$host:$port/v1');
   }
 
   /// 重启后从当日 jsonl 回填内存用量，使今日统计跨重启连续
@@ -298,59 +357,21 @@ class ProxyServer {
 
       final auth = req.headers.value('authorization') ?? '';
       final xkey = req.headers.value('x-api-key') ?? '';
-      // Anthropic 系客户端（Claude Code/SDK）默认带 anthropic-version + x-api-key，
-      // 两种头任一匹配即可
-      if (auth != 'Bearer $apiKey' && xkey != apiKey) {
+      // 密钥池：Authorization: Bearer <key> 或 x-api-key: <key> 命中任意一把即
+      // 放行（Anthropic 系客户端默认带 anthropic-version + x-api-key）
+      final provided =
+          auth.startsWith('Bearer ') ? auth.substring(7).trim() : xkey.trim();
+      final matched = provided.isEmpty
+          ? const <GatewayKey>[]
+          : keys.where((k) => k.value == provided).toList();
+      if (matched.isEmpty) {
         return _json(req, {'error': {'message': '无效的网关 API key'}}, 401);
       }
-
-      if (path == '/v1/models' && req.method == 'GET') {
-        return _json(req, {
-          'object': 'list',
-          'data': registry.all
-              .map((r) {
-                final info = r.upstream.modelInfo[r.upstreamModel] ??
-                    ModelInfo.fromMaps({},
-                        ModelsDev.instance.lookup(r.upstream.def.id, r.upstreamModel));
-                return {
-                  'id': r.publicName,
-                  'object': 'model',
-                  'created': 0,
-                  'owned_by': r.upstream.id,
-                  'zeroapi': {
-                    'bare': r.bare,
-                    'upstream_model': r.upstreamModel,
-                    'healthy': r.upstream.health == UpstreamHealth.healthy,
-                    ...info.toJson(),
-                  },
-                };
-              })
-              .toList(),
-        });
-      }
-
-      if (path == '/v1/chat/completions' && req.method == 'POST') {
-        await _chat(req);
-        return;
-      }
-
-      if (path == '/v1/responses' && req.method == 'POST') {
-        await _responses(req);
-        return;
-      }
-
-      if (path == '/v1/messages' && req.method == 'POST') {
-        if (!anthropicEnabled) {
-          return _json(req, {
-            'type': 'error',
-            'error': {'type': 'not_found_error', 'message': 'Anthropic 适配已在设置中关闭'}
-          }, 404);
-        }
-        await _messages(req);
-        return;
-      }
-
-      _json(req, {'error': {'message': '不支持 ${req.method} $path'}}, 404);
+      // 请求上下文经 Zone 注入：深层转发/泵流无需改签名即可读密钥标签、
+      // 计时、模式，产出统一富日志
+      await runZoned(() => _dispatch(req, path),
+          zoneValues: {_ctxKey: _ReqCtx(matched.first.label)});
+      onKeyUsed?.call(matched.first);
     } catch (e) {
       _log('handler 异常: $e');
       try {
@@ -358,6 +379,64 @@ class ProxyServer {
       } catch (_) {}
     }
   }
+
+  /// 鉴权通过后的路由分发（运行在带 _ReqCtx 的 Zone 中）
+  Future<void> _dispatch(HttpRequest req, String path) async {
+    if (path == '/v1/models' && req.method == 'GET') {
+      // 去重：同一 (供应商,模型) 只暴露一条，裸名可用时优先裸名
+      // （big-pickle 而非 zen/big-pickle）；裸名被他家占用才用 前缀名 消歧
+      final byModel = <String, ModelRoute>{};
+      for (final r in registry.all) {
+        final key = '${r.upstream.id}|${r.upstreamModel}';
+        final cur = byModel[key];
+        if (cur == null || (r.bare && !cur.bare)) byModel[key] = r;
+      }
+      return _json(req, {
+        'object': 'list',
+        'data': byModel.values
+            .map((r) {
+              final info = r.upstream.modelInfo[r.upstreamModel] ??
+                  ModelInfo.fromMaps({},
+                      ModelsDev.instance.lookup(r.upstream.def.id, r.upstreamModel));
+              return {
+                'id': r.publicName,
+                'object': 'model',
+                'created': 0,
+                'owned_by': r.upstream.id,
+                'zeroapi': {
+                  'bare': r.bare,
+                  'upstream_model': r.upstreamModel,
+                  'healthy': r.upstream.health == UpstreamHealth.healthy,
+                  ...info.toJson() },
+              };
+            })
+            .toList(),
+      });
+    }
+
+    if (path == '/v1/chat/completions' && req.method == 'POST') {
+      _ctx?.mode = 'chat';
+      return _chat(req);
+    }
+    if (path == '/v1/responses' && req.method == 'POST') {
+      _ctx?.mode = 'responses';
+      return _responses(req);
+    }
+    if (path == '/v1/messages' && req.method == 'POST') {
+      if (!anthropicEnabled) {
+        return _json(req, {
+          'type': 'error',
+          'error': {'type': 'not_found_error', 'message': 'Anthropic 适配已在设置中关闭'}
+        }, 404);
+      }
+      _ctx?.mode = 'anthropic';
+      return _messages(req);
+    }
+    _json(req, {'error': {'message': '不支持 ${req.method} $path'}}, 404);
+  }
+
+  /// 当前请求上下文（Zone 注入；非请求路径如测试直调时为 null）
+  _ReqCtx? get _ctx => Zone.current[_ctxKey] as _ReqCtx?;
 
   /// 读取 JSON 请求体；非法 JSON 时写回 400 并返回 null
   Future<Map<String, dynamic>?> _readJson(HttpRequest req) async {
@@ -464,6 +543,16 @@ class ProxyServer {
     bool anthropic = false,
   }) async {
     final u = route.upstream;
+    // 请求上下文（测试直调 _forward 时可能为 null，全部判空使用）
+    final ctx = _ctx
+      ?..model = publicName
+      ..stream = isStream;
+    // 剥离非 OpenAI 标准的 Anthropic 风格字段：ZCode 等客户端会带 thinking
+    // 之类扩展参数，Zen 严格 JSON 解码报 unknown field → 400（glm 实测）。
+    // 只剥这几个明确非标准的；user/store/metadata/reasoning_effort 是
+    // OpenAI 规范字段，保留透传。推理开关语义由输出侧 reasoning_content 体现。
+    body.removeWhere((k, _) =>
+        const {'thinking', 'reasoning', 'thinking_budget'}.contains(k));
     body['model'] = route.upstreamModel;
     if (u.isZen) {
       await _forwardZen(req, route, publicName, body,
@@ -541,6 +630,7 @@ class ProxyServer {
                 if (us != null) {
                   prompt = (us['prompt_tokens'] ?? prompt) as int;
                   completion = (us['completion_tokens'] ?? completion) as int;
+                  ctx?.cached = _cachedOf(us);
                 }
               } catch (_) {}
             }
@@ -551,8 +641,9 @@ class ProxyServer {
           }
         }
         await req.response.close();
-        _account(publicName, u.id, prompt, completion, false);
-        _log('$publicName ✓ stream ${u.id}$tag');
+        _account(publicName, u.id, prompt, completion, false,
+            cached: ctx?.cached ?? 0);
+        _log('$publicName ✓ stream ${u.id}$tag${_tail(ctx, prompt, completion)}');
       } else if (isStream) {
         req.response.headers
           ..contentType = ContentType('text', 'event-stream', charset: 'utf-8')
@@ -586,6 +677,7 @@ class ProxyServer {
                     if (us != null) {
                       prompt += (us['prompt_tokens'] ?? 0) as int;
                       completion += (us['completion_tokens'] ?? 0) as int;
+                      ctx?.cached += _cachedOf(us);
                     }
                   }
                 } catch (_) {}
@@ -596,8 +688,9 @@ class ProxyServer {
           await req.response.flush();
         }
         await req.response.close();
-        _account(publicName, u.id, prompt, completion, false);
-        _log('$publicName ✓ stream ${u.id}$tag');
+        _account(publicName, u.id, prompt, completion, false,
+            cached: ctx?.cached ?? 0);
+        _log('$publicName ✓ stream ${u.id}$tag${_tail(ctx, prompt, completion)}');
       } else {
         final data = await uresp.transform(utf8.decoder).join();
         int prompt = 0, completion = 0;
@@ -611,9 +704,11 @@ class ProxyServer {
             prompt = (us?['prompt_tokens'] ?? 0) as int;
             completion = (us?['completion_tokens'] ?? 0) as int;
           }
+          ctx?.cached = _cachedOf(us);
         } catch (_) {}
-        _account(publicName, u.id, prompt, completion, false);
-        _log('$publicName ✓ ${u.id}$tag');
+        _account(publicName, u.id, prompt, completion, false,
+            cached: ctx?.cached ?? 0);
+        _log('$publicName ✓ ${u.id}$tag${_tail(ctx, prompt, completion)}');
         req.response.headers
           ..contentType = ContentType.json
           ..set('x-zeroapi-upstream', u.id);
@@ -982,6 +1077,7 @@ class ProxyServer {
       if (us != null) {
         prompt = (us['prompt_tokens'] ?? prompt) as int;
         completion = (us['completion_tokens'] ?? completion) as int;
+        _ctx?.cached = _cachedOf(us);
       }
       final out = Zen.filterDecoyChunk(j, injected, decoyIndex: decoy);
       if (aStream != null) {
@@ -1027,8 +1123,10 @@ class ProxyServer {
       if (!done) throw _ZenEarlyReset('empty-stream');
     }
     await req.response.close();
-    _account(publicName, route.upstream.id, prompt, completion, false);
-    _log('$publicName ✓ zen stream ${route.upstream.id}${anthropic ? ' [anthropic]' : ''}');
+    _account(publicName, route.upstream.id, prompt, completion, false,
+        cached: _ctx?.cached ?? 0);
+    _log('$publicName ✓ zen stream ${route.upstream.id}'
+        '${anthropic ? ' [anthropic]' : ''}${_tail(_ctx, prompt, completion)}');
   }
 
   /// 非流式泵：先全量读 SSE 聚合，读失败且尚未写响应 → 抛 _ZenEarlyReset 可重试
@@ -1059,6 +1157,7 @@ class ProxyServer {
     if (us != null) {
       prompt = (us['prompt_tokens'] ?? 0) as int;
       completion = (us['completion_tokens'] ?? 0) as int;
+      _ctx?.cached = _cachedOf(us);
     }
     req.response.headers
       ..contentType = ContentType.json
@@ -1068,8 +1167,10 @@ class ProxyServer {
         ? AnthropicAdapter.toAnthropicResponse(agg)
         : agg));
     await req.response.close();
-    _account(publicName, route.upstream.id, prompt, completion, false);
-    _log('$publicName ✓ zen ${route.upstream.id}${anthropic ? ' [anthropic]' : ''}');
+    _account(publicName, route.upstream.id, prompt, completion, false,
+        cached: _ctx?.cached ?? 0);
+    _log('$publicName ✓ zen ${route.upstream.id}'
+        '${anthropic ? ' [anthropic]' : ''}${_tail(_ctx, prompt, completion)}');
   }
 
   /// HH:MM 时刻显示（本地时区），用于提示静默窗口结束时间

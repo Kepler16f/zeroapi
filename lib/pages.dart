@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../gateway/cf_api.dart';
 import '../gateway/config.dart';
+import '../gateway/lan.dart';
 import '../gateway/proxy.dart';
 import '../gateway/service.dart';
 import '../gateway/upstream.dart';
@@ -684,13 +685,29 @@ class _UsagePageState extends State<UsagePage> {
                 color: cs.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: logs
-                    .map((l) => Text(l,
-                        style: const TextStyle(
-                            fontFamily: 'monospace', fontSize: 11.5)))
-                    .toList(),
+              // 固定高度窗口内滚动：logs 现有取法已倒序（logs[0] 最新），
+              // 故用 reversed:false——最新一条落在窗口最上方，进入即见最新，
+              // 鼠标/触控板在窗口内向下拖动查看历史，不再撑开整页
+              child: SizedBox(
+                height: 220,
+                child: logs.isEmpty
+                    ? Center(
+                        child: Text('（暂无日志）',
+                            style: TextStyle(
+                                color: cs.onSurfaceVariant, fontSize: 12)))
+                    : ListView.builder(
+                        itemCount: logs.length,
+                        itemBuilder: (context, i) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 1),
+                          child: Text(
+                            logs[i],
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                fontFamily: 'monospace', fontSize: 11),
+                          ),
+                        ),
+                      ),
               ),
             ),
           ],
@@ -1123,9 +1140,10 @@ class _SettingsPageState extends State<SettingsPage> {
       TextEditingController(text: widget.service.config.host);
   late final TextEditingController port =
       TextEditingController(text: '${widget.service.config.port}');
-  late final TextEditingController apiKey =
-      TextEditingController(text: widget.service.config.apiKey);
-  bool _obscure = true;
+  /// 密钥行显隐状态：index -> 是否明文显示（默认遮罩）
+  final Map<int, bool> _keyRevealed = {};
+  /// 局域网 IPv4 枚举的 Future：仅在开关打开时按需刷新
+  Future<List<String>>? _lanIpsFuture;
   String _protocol = 'openai';
 
   // 出口代理：目标供应商 + 地址输入框（跟随选择联动）
@@ -1154,6 +1172,117 @@ class _SettingsPageState extends State<SettingsPage> {
     if (id != _proxyTargetId) _proxyTargetId = id;
     final def = ups.firstWhere((u) => u.id == id);
     if (_proxyAddr.text != def.proxy) _proxyAddr.text = def.proxy;
+  }
+
+  // ---- 网关密钥池管理 ----
+
+  /// 轮换默认密钥（第一把）：会让所有用旧 key 的客户端立即失效，先弹确认
+  Future<void> _confirmRotate(GatewayService s) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('轮换默认密钥'),
+        content: const Text(
+            '将生成一把新的默认密钥替换现有值，旧密钥立即失效，'
+            '所有正在使用它的客户端需要更新配置。确定继续？'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('轮换')),
+        ],
+      ),
+    );
+    if (ok == true) s.rotateApiKey();
+  }
+
+  Future<void> _confirmDeleteKey(
+      GatewayService s, int index, String label) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除密钥'),
+        content: Text('确定删除密钥「$label」吗？'
+            '使用该密钥的客户端将立即无法接入网关。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              style: FilledButton.styleFrom(
+                  backgroundColor: Theme.of(ctx).colorScheme.error),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      s.deleteGatewayKey(index);
+      // 删除后其后的行会前移，重置相关行的显隐状态避免错位
+      _keyRevealed.removeWhere((i, _) => i >= index);
+    }
+  }
+
+  /// 添加密钥：标签必填（空则服务层自动生成序号），值可自定义、留空自动生成
+  Future<void> _showAddKeyDialog(GatewayService s) async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _AddKeyDialog(service: s),
+    );
+  }
+
+  /// 局域网接入地址列表：开关打开后展示本机各网卡的 http://ip:port/v1，可整段复制
+  Widget _buildLanAccess(GatewayService s) {
+    if (_lanIpsFuture == null) {
+      // 页面初次构建时开关可能已处于打开态（非本次交互翻上来的），补一次枚举
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _lanIpsFuture == null && s.config.allowLan) {
+          setState(() => _lanIpsFuture = localIPv4Addresses());
+        }
+      });
+      return const SizedBox.shrink();
+    }
+    final cs = Theme.of(context).colorScheme;
+    final port = s.config.port;
+    return FutureBuilder<List<String>>(
+      future: _lanIpsFuture,
+      builder: (context, snap) {
+        if (!snap.hasData) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text('正在检测本机局域网地址…',
+                style:
+                    TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          );
+        }
+        final hint = lanHintText(snap.data!, port);
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: SelectableText(hint,
+                    style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 12)),
+              ),
+              IconButton(
+                icon: const Icon(Icons.copy, size: 18),
+                tooltip: '复制接入地址',
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: hint));
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      content: Text('已复制接入地址'),
+                      duration: Duration(milliseconds: 600)));
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -1206,30 +1335,32 @@ class _SettingsPageState extends State<SettingsPage> {
                         ),
                       ),
                     const SizedBox(height: 6),
-                    Row(children: [
-                      Expanded(
-                        child: SelectableText(
-                          'API Key   ${_obscure ? '••••••••' : s.config.apiKey}',
-                          style: const TextStyle(fontFamily: 'monospace'),
-                        ),
+                    // 密钥池：每行一把 key，默认遮罩、可显隐/复制/删除
+                    Text(
+                      '持有任一密钥即可访问网关（本机与局域网设备通用，不绑定设备）',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                    ),
+                    const SizedBox(height: 4),
+                    ...s.config.keys.asMap().entries.map((e) => _GatewayKeyRow(
+                          index: e.key,
+                          gk: e.value,
+                          revealed: _keyRevealed[e.key] ?? false,
+                          onToggleReveal: () => setState(() =>
+                              _keyRevealed[e.key] =
+                                  !(_keyRevealed[e.key] ?? false)),
+                          onRotate: e.key == 0 ? () => _confirmRotate(s) : null,
+                          onDelete: e.key > 0
+                              ? () => _confirmDeleteKey(s, e.key, e.value.label)
+                              : null,
+                        )),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        icon: const Icon(Icons.add, size: 18),
+                        label: const Text('添加密钥'),
+                        onPressed: () => _showAddKeyDialog(s),
                       ),
-                      IconButton(
-                        icon: Icon(
-                            _obscure ? Icons.visibility_off : Icons.visibility),
-                        onPressed: () => setState(() => _obscure = !_obscure),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.copy),
-                        tooltip: '复制 key',
-                        onPressed: () {
-                          Clipboard.setData(
-                              ClipboardData(text: s.config.apiKey));
-                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                              content: Text('已复制'),
-                              duration: Duration(milliseconds: 600)));
-                        },
-                      ),
-                    ]),
+                    ),
                   ],
                 ),
               ),
@@ -1264,13 +1395,29 @@ class _SettingsPageState extends State<SettingsPage> {
                   }
                 },
               ),
-              const SizedBox(width: 12),
-              OutlinedButton.icon(
-                icon: const Icon(Icons.key),
-                label: const Text('更换 API Key'),
-                onPressed: () => s.rotateApiKey(),
-              ),
             ]),
+            const SizedBox(height: 16),
+            // ---- 局域网访问 ----
+            const Text('局域网访问',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('允许局域网连接', style: TextStyle(fontSize: 14)),
+              subtitle: Text(
+                '开启后监听 0.0.0.0，同网段设备凭任意密钥接入；'
+                'Windows 首次会弹防火墙授权，请点允许',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+              value: s.config.allowLan,
+              onChanged: (v) async {
+                await s.setAllowLan(v);
+                if (v && mounted) {
+                  // 开启时枚举本机 IPv4，供下方接入地址列表展示
+                  setState(() => _lanIpsFuture = localIPv4Addresses());
+                }
+              },
+            ),
+            if (s.config.allowLan) _buildLanAccess(s),
             const SizedBox(height: 24),
             const Text('出口代理',
                 style: TextStyle(fontWeight: FontWeight.bold)),
@@ -1437,5 +1584,183 @@ class _SettingsPageState extends State<SettingsPage> {
         ? (Platform.environment['APPDATA'] ?? '%APPDATA%')
         : '${Platform.environment['HOME'] ?? '~'}/.config';
     return '$base${Platform.pathSeparator}zeroapi${Platform.pathSeparator}config.json';
+  }
+}
+
+/// 密钥池单行：标签（第一把带「默认」标记与轮换按钮）、值（默认遮罩，
+/// 行内显隐/复制）、最近使用时间，行尾删除按钮（index>0 才有回调）。
+class _GatewayKeyRow extends StatelessWidget {
+  final int index;
+  final GatewayKey gk;
+  final bool revealed;
+  final VoidCallback onToggleReveal;
+  final VoidCallback? onRotate;
+  final VoidCallback? onDelete;
+
+  const _GatewayKeyRow({
+    required this.index,
+    required this.gk,
+    required this.revealed,
+    required this.onToggleReveal,
+    this.onRotate,
+    this.onDelete,
+  });
+
+  /// lastUsed 展示：MM-dd HH:mm，从未使用显示「未使用」
+  static String _fmtLastUsed(DateTime? t) {
+    if (t == null) return '未使用';
+    String p(int n) => n.toString().padLeft(2, '0');
+    return '${p(t.month)}-${p(t.day)} ${p(t.hour)}:${p(t.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(gk.label.isEmpty ? '密钥 ${index + 1}' : gk.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                    ),
+                    if (index == 0) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: cs.primaryContainer,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text('默认',
+                            style: TextStyle(
+                                fontSize: 10, color: cs.onPrimaryContainer)),
+                      ),
+                      if (onRotate != null)
+                        TextButton(
+                          style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8),
+                              textStyle: const TextStyle(fontSize: 12)),
+                          onPressed: onRotate,
+                          child: const Text('轮换'),
+                        ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  revealed ? gk.value : '••••••••••••',
+                  style: const TextStyle(
+                      fontFamily: 'monospace', fontSize: 12.5),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(_fmtLastUsed(gk.lastUsed),
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          IconButton(
+            icon: Icon(revealed ? Icons.visibility_off : Icons.visibility,
+                size: 18),
+            tooltip: revealed ? '隐藏' : '显示',
+            onPressed: onToggleReveal,
+          ),
+          IconButton(
+            icon: const Icon(Icons.copy, size: 18),
+            tooltip: '复制密钥',
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: gk.value));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('已复制'),
+                  duration: Duration(milliseconds: 600)));
+            },
+          ),
+          if (onDelete != null)
+            IconButton(
+              icon: const Icon(Icons.delete_outline, size: 18),
+              tooltip: '删除密钥',
+              onPressed: onDelete,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 添加密钥对话框：标签 + 可选自定义值（留空自动生成）
+class _AddKeyDialog extends StatefulWidget {
+  final GatewayService service;
+  const _AddKeyDialog({required this.service});
+
+  @override
+  State<_AddKeyDialog> createState() => _AddKeyDialogState();
+}
+
+class _AddKeyDialogState extends State<_AddKeyDialog> {
+  final TextEditingController _label = TextEditingController();
+  final TextEditingController _value = TextEditingController();
+
+  @override
+  void dispose() {
+    _label.dispose();
+    _value.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return AlertDialog(
+      title: const Text('添加密钥'),
+      content: SizedBox(
+        width: 380,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _label,
+              autofocus: true,
+              decoration: const InputDecoration(
+                  labelText: '标签', hintText: '如：手机 / 实验室机器（留空自动编号）'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _value,
+              decoration: InputDecoration(
+                  labelText: '密钥值（可选）',
+                  hintText: '留空自动生成 sk-pg-…',
+                  helperText: '自定义值需全局唯一，建议使用工具生成的格式',
+                  helperStyle: TextStyle(
+                      fontSize: 11, color: cs.onSurfaceVariant)),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消')),
+        FilledButton(
+            onPressed: () {
+              widget.service.addGatewayKey(_label.text,
+                  value: _value.text.trim().isEmpty ? null : _value.text);
+              Navigator.of(context).pop();
+            },
+            child: const Text('添加')),
+      ],
+    );
   }
 }

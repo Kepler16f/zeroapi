@@ -241,6 +241,51 @@ void main() {
     expect(resp.statusCode, 401);
   });
 
+  test('密钥池：任意一把命中即放行，未知 key 401', () async {
+    final dir2 = await Directory.systemTemp.createTemp('zeroapi-test-');
+    final p2 = ProxyServer('127.0.0.1', 0, 'sk-gw', registry,
+        usageDir: dir2.path,
+        keys: [GatewayKey('默认', 'sk-gw'), GatewayKey('手机', 'sk-phone')]);
+    await p2.start();
+    Future<int> callWith(String key) async {
+      final req = await client.openUrl(
+          'GET', Uri.parse('http://127.0.0.1:${p2.boundPort}/v1/models'));
+      req.headers.set('Authorization', 'Bearer $key');
+      final r = await req.close();
+      await r.drain();
+      return r.statusCode;
+    }
+    expect(await callWith('sk-gw'), 200);
+    expect(await callWith('sk-phone'), 200);
+    expect(await callWith('nope'), 401);
+    await p2.stop();
+    dir2.deleteSync(recursive: true);
+  });
+
+  test('/v1/models 去重：同一模型只出现一条且优先裸名', () async {
+    final resp = await gw('GET', '/v1/models');
+    final ids =
+        ((jsonDecode(await utf8.decodeStream(resp)) as Map)['data'] as List)
+            .map((m) => m['id'] as String)
+            .toList();
+    // fake 供应商的 gpt-test：裸名可用 → 只暴露 gpt-test，不再有 fake/gpt-test
+    expect(ids, contains('gpt-test'));
+    expect(ids.contains('fake/gpt-test'), false);
+    expect(ids.toSet().length, ids.length, reason: '不应有重复条目');
+  });
+
+  test('非标准字段 thinking 被剥离，不再触发上游 400', () async {
+    // fake 上游回显收到的 model；这里验证带 thinking 的请求不再报错且正常路由
+    final resp = await gw('POST', '/v1/chat/completions', {
+      'model': 'fake/gpt-test',
+      'messages': [],
+      'thinking': {'type': 'enabled', 'budget_tokens': 100},
+    });
+    expect(resp.statusCode, 200);
+    final body = jsonDecode(await utf8.decodeStream(resp));
+    expect(body['choices'][0]['message']['content'], 'hello gpt-test');
+  });
+
   test('重启回填：当日 jsonl 在 start() 时载入内存用量', () async {
     final day = DateTime.now().toIso8601String().substring(0, 10);
     final dir = Directory(usageDir.path)..createSync(recursive: true);

@@ -104,10 +104,37 @@ class UpstreamDef {
   }
 }
 
+/// 网关接入密钥：用户自由增删的密钥池，持有池中任意一把即可访问网关
+/// （本机或局域网设备同理，不与设备绑定）。
+class GatewayKey {
+  String label;
+  String value;
+  /// 最近使用时间（管理视角：哪把 key 还在活跃）
+  DateTime? lastUsed;
+
+  GatewayKey(this.label, this.value, {this.lastUsed});
+
+  factory GatewayKey.fromJson(Map<String, dynamic> j) => GatewayKey(
+        (j['label'] ?? '默认') as String,
+        j['value'] as String,
+        lastUsed: DateTime.tryParse((j['lastUsed'] ?? '') as String),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'label': label,
+        'value': value,
+        if (lastUsed != null) 'lastUsed': lastUsed!.toIso8601String(),
+      };
+}
+
 class GatewayConfig {
   String host;
   int port;
-  String apiKey;
+  /// 密钥池（多把自定义 key）。首项为「默认」key（轮换/兼容语义所在）。
+  List<GatewayKey> keys;
+  /// 允许局域网设备凭 key 接入：true 时监听 0.0.0.0。
+  /// Windows 首次监听会弹防火墙授权，需允许。
+  bool allowLan;
   List<UpstreamDef> upstreams;
   /// system | light | dark
   String themeMode;
@@ -120,12 +147,23 @@ class GatewayConfig {
   GatewayConfig({
     this.host = '127.0.0.1',
     this.port = 8123,
-    required this.apiKey,
+    List<GatewayKey>? keys,
+    this.allowLan = false,
     this.upstreams = const [],
     this.themeMode = 'system',
     this.anthropicEnabled = true,
     this.closeToTray = true,
-  });
+  }) : keys = keys ?? [];
+
+  /// 兼容旧语义：默认 key = 池中第一把
+  String get apiKey => keys.isEmpty ? '' : keys.first.value;
+  set apiKey(String v) {
+    if (keys.isEmpty) {
+      keys.add(GatewayKey('默认', v));
+    } else {
+      keys.first.value = v;
+    }
+  }
 
   static File _file() {
     final base = Platform.isWindows
@@ -154,9 +192,9 @@ class GatewayConfig {
   static GatewayConfig load() {
     _migrateLegacyDir();
     final f = _file();
-    final cfg = GatewayConfig(apiKey: '');
+    final cfg = GatewayConfig();
     if (!f.existsSync()) {
-      cfg.apiKey = 'sk-pg-${_rand()}';
+      cfg.keys = [GatewayKey('默认', 'sk-pg-${_rand()}')];
       cfg.upstreams = [defaultZengate()];
       cfg.save();
       return cfg;
@@ -166,10 +204,18 @@ class GatewayConfig {
       final g = j['gateway'] as Map<String, dynamic>;
       cfg.host = (g['host'] ?? cfg.host) as String;
       cfg.port = (g['port'] ?? cfg.port) as int;
-      cfg.apiKey = (g['apiKey'] ?? 'sk-pg-${_rand()}') as String;
       cfg.themeMode = (g['themeMode'] ?? cfg.themeMode) as String;
       cfg.anthropicEnabled = (g['anthropicEnabled'] ?? cfg.anthropicEnabled) as bool;
       cfg.closeToTray = (g['closeToTray'] ?? cfg.closeToTray) as bool;
+      cfg.allowLan = (g['allowLan'] ?? false) as bool;
+      // 密钥池；旧版单 apiKey 自动迁移成「默认」key
+      final keyList = (g['keys'] as List?) ?? const [];
+      cfg.keys = keyList
+          .map((e) => GatewayKey.fromJson(e as Map<String, dynamic>))
+          .toList();
+      if (cfg.keys.isEmpty) {
+        cfg.keys = [GatewayKey('默认', (g['apiKey'] ?? 'sk-pg-${_rand()}') as String)];
+      }
       cfg.upstreams = ((j['upstreams'] ?? []) as List)
           .map((e) => UpstreamDef.fromJson(e as Map<String, dynamic>))
           .toList();
@@ -183,9 +229,9 @@ class GatewayConfig {
         cfg.upstreams = [defaultZengate()];
         migrated = true;
       }
-      if (migrated) cfg.save();
+      if (migrated || g['keys'] == null) cfg.save();
     } catch (_) {
-      cfg.apiKey = 'sk-pg-${_rand()}';
+      cfg.keys = [GatewayKey('默认', 'sk-pg-${_rand()}')];
       cfg.upstreams = [defaultZengate()];
     }
     return cfg;
@@ -197,7 +243,9 @@ class GatewayConfig {
       'gateway': {
         'host': host,
         'port': port,
-        'apiKey': apiKey,
+        'apiKey': apiKey, // 双写保持旧读取方兼容
+        'keys': keys.map((k) => k.toJson()).toList(),
+        'allowLan': allowLan,
         'themeMode': themeMode,
         'anthropicEnabled': anthropicEnabled,
         'closeToTray': closeToTray,
@@ -283,3 +331,6 @@ String _rand() {
   final r = Random.secure();
   return List.generate(32, (_) => chars[r.nextInt(chars.length)]).join();
 }
+
+/// 生成一把新的网关密钥值（sk-pg- 前缀与历史保持兼容）
+String genGatewayKey() => 'sk-pg-${_rand()}';
