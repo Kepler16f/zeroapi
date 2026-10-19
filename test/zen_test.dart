@@ -278,7 +278,7 @@ void main() {
           ],
         };
 
-    test('超长名截断为 前缀#hash6（恰 64），短名原样保留不入 map', () {
+    test('超长名截断为 前缀-hash6（恰 64），短名原样保留不入 map', () {
       expect(longName.length, 70);
       final body = mkBody();
       final origList = body['tools'];
@@ -288,7 +288,9 @@ void main() {
 
       final sn = (tools[0]['function'] as Map)['name'] as String;
       expect(sn.length, 64);
-      expect(sn, matches(RegExp(r'#[0-9a-f]{6}$')));
+      expect(sn, matches(RegExp(r'-[0-9a-f]{6}$')));
+      // 上游只认 [A-Za-z0-9_-]：改写产物绝不能含 '#' 等非法字符
+      expect(sn, matches(RegExp(r'^[A-Za-z0-9_-]+$')));
       expect(sn.startsWith('mcp__plugin__'), true);
       expect(map[sn], longName);
 
@@ -311,6 +313,45 @@ void main() {
       expect(a.keys.length, 1);
       expect(a, b);
       expect((b.keys.single).length, 64);
+    });
+
+    test('名字含非法字符（# . : / 空格）也改写为合法名并回映', () {
+      final names = ['mcp__a#b', 'mcp__c.d', 'mcp__e:f', 'mcp__g/h', 'mcp__i j'];
+      final body = <String, dynamic>{
+        'tools': [
+          for (final n in names)
+            {'type': 'function', 'function': {'name': n, 'parameters': {}}},
+          shortTool,
+        ],
+      };
+      final map = Zen.shortenToolNames(body);
+      expect(map.length, names.length);
+      for (final t in body['tools'] as List) {
+        final n = (t['function'] as Map)['name'] as String;
+        expect(n, matches(RegExp(r'^[A-Za-z0-9_-]+$')));
+      }
+      // 每个原名都能反查回来，且互不覆盖
+      expect(map.values.toSet(), names.toSet());
+      // 合法短名保持原样、不参与改写
+      expect((body['tools'] as List).last, same(shortTool));
+    });
+
+    test('改写名不与表内已有的合法短名撞名', () {
+      final probe = <String, dynamic>{
+        'tools': [
+          {'type': 'function', 'function': {'name': longName, 'parameters': {}}},
+        ],
+      };
+      final sn = Zen.shortenToolNames(probe).keys.single;
+      final body = <String, dynamic>{
+        'tools': [
+          {'type': 'function', 'function': {'name': longName, 'parameters': {}}},
+          {'type': 'function', 'function': {'name': sn, 'parameters': {}}},
+        ],
+      };
+      final map = Zen.shortenToolNames(body);
+      expect(map.keys.single, isNot(sn));
+      expect(map[map.keys.single], longName);
     });
 
     test('历史 tool_calls 与 tool_choice 同步改写为同一截断名', () {

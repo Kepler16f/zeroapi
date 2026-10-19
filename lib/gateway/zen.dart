@@ -198,35 +198,54 @@ class Zen {
     return h.toRadixString(16).padLeft(8, '0').substring(0, 6);
   }
 
-  /// 上游对工具名有长度上限（实测 64，ZCode 的 MCP 工具名会超），
-  /// 发送前把超长名确定性截断为 `前缀#hash6`（≤64），返回 截断名→原名 映射；
-  /// 响应侧用 restoreToolNames 换回，客户端全程无感知。多轮回传历史里的
-  /// assistant tool_calls / tool_choice 同步改写（哈希确定性保证跨请求一致）。
+  /// 上游工具名只接受 `[A-Za-z0-9_-]`：实测 `#`、`.`、空格、`:`、`/` 一律
+  /// 400（错误体还是空的，客户端只能看到「HTTP 400」）。长度上限虽未实测
+  /// 触发（100 字符仍可用），仍按 64 截断兜底。发送前把「超长或含非法字符」
+  /// 的名字确定性改写为 `前缀-hash6`，返回 改写名→原名 映射；响应侧用
+  /// restoreToolNames 换回，客户端全程无感知。多轮回传历史里的 assistant
+  /// tool_calls / tool_choice 同步改写（哈希确定性保证跨请求一致）。
+  static final _legalToolName = RegExp(r'^[A-Za-z0-9_-]+$');
+
   static Map<String, String> shortenToolNames(Map<String, dynamic> body,
       {int maxLen = 64}) {
     final map = <String, String>{};
-    String shortOf(String name) =>
-        '${name.substring(0, maxLen - 7)}#${_hash6(name)}';
     final tools = body['tools'];
-    if (tools is List) {
-      var changed = false;
-      final rebuilt = <Object>[];
-      for (final t in tools) {
-        if (t is Map && t['function'] is Map) {
-          final fn = t['function'] as Map;
-          final name = fn['name']?.toString() ?? '';
-          if (name.length > maxLen) {
-            final sn = shortOf(name);
-            map[sn] = name;
-            rebuilt.add({...t, 'function': {...fn, 'name': sn}});
-            changed = true;
-            continue;
-          }
-        }
-        rebuilt.add(t);
+    if (tools is! List) return map;
+    // 原样保留（合法且不超长）的名字先占位，改写产物不得与它们撞名
+    final used = <String>{};
+    for (final t in tools) {
+      if (t is Map && t['function'] is Map) {
+        final n = (t['function'] as Map)['name']?.toString() ?? '';
+        if (n.length <= maxLen && _legalToolName.hasMatch(n)) used.add(n);
       }
-      if (changed) body['tools'] = rebuilt;
     }
+    final keep = maxLen - 7; // '-' + 6 位 hash
+    String shortOf(String name) {
+      final clean = name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '-');
+      final prefix = clean.length > keep ? clean.substring(0, keep) : clean;
+      // hash 只剩 24 位，撞名时按盐递增；同一工具表下结果确定
+      for (var salt = 0;; salt++) {
+        final sn = '$prefix-${_hash6(salt == 0 ? name : '$name#$salt')}';
+        if (used.add(sn)) return sn;
+      }
+    }
+    var changed = false;
+    final rebuilt = <Object>[];
+    for (final t in tools) {
+      if (t is Map && t['function'] is Map) {
+        final fn = t['function'] as Map;
+        final name = fn['name']?.toString() ?? '';
+        if (name.length > maxLen || !_legalToolName.hasMatch(name)) {
+          final sn = shortOf(name);
+          map[sn] = name;
+          rebuilt.add({...t, 'function': {...fn, 'name': sn}});
+          changed = true;
+          continue;
+        }
+      }
+      rebuilt.add(t);
+    }
+    if (changed) body['tools'] = rebuilt;
     if (map.isEmpty) return map;
     final reverse = {for (final e in map.entries) e.value: e.key};
     final msgs = body['messages'];
