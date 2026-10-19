@@ -48,9 +48,10 @@ Windows：直接双击 `build/windows/<arch>/runner/Release/zeroapi.exe`
 任何 OpenAI 兼容客户端只需两项（设置页可见、可复制，协议格式可在设置页切换）：
 
 - Base URL：`http://127.0.0.1:8123/v1`（局域网内其他设备用本机局域网地址，见下文）
-- API Key：**多网关密钥**——设置页可创建多把 key（标签 + 值），支持新建/重命名/删除/复制，
-  每把 key 记录最近使用时间，便于按"不同设备/不同客户端一把 key"分发管理；
-  旧的单 key 配置会自动迁移为一把「默认」key。
+- API Key：**多密钥池**——设置页可自由创建多把 key（标签 + 值，支持自定义或自动生成），
+  新建/重命名/删除/轮换/复制，每把记录最近使用时间便于追查；**持有池中任意一把
+  即可接入**（本机与局域网设备通用，不与设备绑定）。旧的单 key 配置会自动迁移为
+  一把「默认」key。
 
 ```bash
 curl http://127.0.0.1:8123/v1/chat/completions \
@@ -68,7 +69,8 @@ API Key 同上；网关暴露 `/v1/messages` 并在 OpenAI ⇄ Anthropic 双向�
 同一 Wi-Fi/内网的其他设备（手机、另一台电脑）即可直接用该地址访问。注意：
 
 - 首次监听会触发 Windows 防火墙授权弹窗，需点击「允许」；
-- 配合多密钥使用，可给每台设备单独发一把 key，分开管理与追查。
+- 配合多密钥池：可按用途建几把 key 分发（如手机一把、实验室机器一把），
+  靠「最近使用」时间即可定位来源，删除即吊销。
 
 ## 已验证行为（本机）
 
@@ -82,7 +84,8 @@ API Key 同上；网关暴露 `/v1/messages` 并在 OpenAI ⇄ Anthropic 双向�
   注意 workers.dev 域名在国内需代理才可达。
 - 非流式 + SSE 流式透传；每条请求日志记录：模型名、所用密钥标签、接口模式
   （chat/anthropic/responses、流式/非流式）、词元用量（输入/输出）、耗时与上游出口；
-  上游返回缓存命中信息时一并显示缓存命中率。
+  上游返回缓存命中信息时一并显示缓存命中率。用量页日志区为固定高度窗口，
+  最新在顶部、窗口内滚动查看，不再无限下堆。
 - 用量页：横向条形图（模型名/条形/行尾词元·次数）、饼图、折线图；词元以中文「万/亿」计；
   用量跨重启持久（当日 jsonl 回填）。
 - `/v1/responses` 端点透传（请求体原样转发供应商 `/responses`，
@@ -114,7 +117,7 @@ powershell -File tool/build.ps1                                    # 交互式�
 Windows 安装包（Inno Setup 6）：
 
 ```bash
-iscc /DMyArch=arm64 /DMyVersion=1.1.0 packaging/zeroapi.iss
+iscc /DMyArch=arm64 /DMyVersion=0.1.11 packaging/zeroapi.iss
 # 产物：installer/zeroapi-setup-arm64-<version>.exe
 ```
 
