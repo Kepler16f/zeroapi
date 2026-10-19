@@ -172,11 +172,14 @@ class ProxyServer {
       final files = dir
           .listSync()
           .whereType<File>()
-          .where((f) => f.path.contains('usage-'))
+          // 严格 .jsonl 结尾：备份/临时文件（*.jsonl.bak-*）不得混入重复计入
+          .where((f) => f.path.contains('usage-') && f.path.endsWith('.jsonl'))
           .toList()
-        ..sort();
+        // File 不可 Comparable：必须显式按路径比较，否则多文件时 sort 抛
+        // 异常被外层 catch 吞掉 → 整个聚合静默返回 0（2026-10-19 线上教训）
+        ..sort((a, b) => a.path.compareTo(b.path));
       for (final f in files) {
-        final m = RegExp(r'usage-(\d{4}-\d{2}-\d{2})\.jsonl').firstMatch(f.path);
+        final m = RegExp(r'usage-(\d{4}-\d{2}-\d{2})\.jsonl$').firstMatch(f.path);
         if (m == null) continue;
         final fileDay = DateTime.tryParse(m.group(1)!);
         if (fileDay == null) continue;

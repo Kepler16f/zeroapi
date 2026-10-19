@@ -212,6 +212,25 @@ void main() {
     expect(text, contains('data: [DONE]'));
   });
 
+  test('usageRange 跨多文件聚合（回归：File 不可 sort 导致全 0 的静默崩溃）', () async {
+    final dir = Directory(usageDir.path)..createSync(recursive: true);
+    final y = DateTime.now().subtract(const Duration(days: 1));
+    final yDay = y.toIso8601String().substring(0, 10);
+    final tDay = DateTime.now().toIso8601String().substring(0, 10);
+    // 昨天的文件（先写，文件名字典序在前）——两个文件才会触发 sort 比较
+    File('${dir.path}/usage-$yDay.jsonl').writeAsStringSync(
+        '${jsonEncode({'ts': '${yDay}T10:00:00.000', 'model': 'old-m', 'upstream': 'zen', 'prompt': 100, 'completion': 50, 'error': false})}\n');
+    // 今天已有内存记账（setUp 的 proxy 处理过 fake 请求）；再加备份文件不得计入
+    File('${dir.path}/usage-$tDay.jsonl.bak-x').writeAsStringSync(
+        '${jsonEncode({'ts': '${tDay}T09:00:00.000', 'model': 'ghost', 'upstream': 'zen', 'prompt': 999999, 'completion': 999999, 'error': false})}\n');
+    final s7 = await proxy.usageRange(days: 7);
+    expect(s7.byModel['old-m'], 1);
+    expect(s7.promptTokens, greaterThanOrEqualTo(100));
+    expect(s7.byModel.containsKey('ghost'), false, reason: '备份文件不得混入');
+    // 昨日桶存在且今日桶来自内存合并
+    expect(s7.byDayTokens.containsKey(yDay.substring(5)), true);
+  });
+
   test('错误网关 key 返回 401', () async {
     final req = await client.openUrl(
         'POST', Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/responses'));
