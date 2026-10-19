@@ -154,9 +154,25 @@ class ProxyServer {
   bool _ipBanSignaled = false;
   DateTime _lastUnknownRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// 模型规范名：`zen/big-pickle` 与 `big-pickle` 指向同一路由时统一为裸名，
+  /// 使记账与所有时间视图（今日/本周/本月/所有）不出现带前缀的重复条目；
+  /// 跨供应商重名（裸名被别家占用）仍保留 供应商id/模型名 消歧。
+  String _canonicalModel(String name) {
+    final r = registry.resolve(name);
+    if (r == null) return name;
+    final bare = registry.resolve(r.upstreamModel);
+    if (bare != null &&
+        bare.upstream.id == r.upstream.id &&
+        bare.upstreamModel == r.upstreamModel) {
+      return r.upstreamModel;
+    }
+    return r.publicName;
+  }
+
   /// 统一记账：内存当日汇总（含小时趋势）+ jsonl 落盘（跨天自动换文件）
   void _account(String model, String upstream, int p, int c, bool err,
       {int cached = 0}) {
+    model = _canonicalModel(model);
     final now = DateTime.now();
     final day = now.toIso8601String().substring(0, 10);
     if (day != _usageDay) {
@@ -242,7 +258,7 @@ class ProxyServer {
           try {
             final j = jsonDecode(l) as Map<String, dynamic>;
             out.add(
-                (j['model'] ?? '?') as String,
+                _canonicalModel((j['model'] ?? '?') as String),
                 (j['prompt'] ?? 0) as int,
                 (j['completion'] ?? 0) as int,
                 (j['error'] ?? false) as bool,
@@ -306,7 +322,7 @@ class ProxyServer {
         try {
           final j = jsonDecode(line) as Map<String, dynamic>;
           usageToday.add(
-              (j['model'] ?? '?') as String,
+              _canonicalModel((j['model'] ?? '?') as String),
               (j['prompt'] ?? 0) as int,
               (j['completion'] ?? 0) as int,
               (j['error'] ?? false) as bool,

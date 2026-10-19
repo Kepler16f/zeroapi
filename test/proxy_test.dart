@@ -169,13 +169,15 @@ void main() {
         {'model': 'gpt-test', 'messages': []});
     final s = await proxy.usageRange(days: 1);
     expect(s.requests, greaterThanOrEqualTo(2));
-    expect(s.byModel['fake/gpt-test'], greaterThanOrEqualTo(1));
+    // 带前缀与裸名归一到同一规范名：合并为 gpt-test 两条，不再分裂
+    expect(s.byModel['gpt-test'], greaterThanOrEqualTo(2));
+    expect(s.byModel.containsKey('fake/gpt-test'), false);
     expect(s.trend.length, greaterThanOrEqualTo(1)); // 小时桶
     // tokens 来自 fake 上游固定值（prompt 10 / completion 5 每次）
     expect(s.promptTokens, greaterThanOrEqualTo(10));
-    // 按 token 聚合：桶值 = prompt+completion，供柱/饼图排序占比
-    expect(s.byModelTokens['fake/gpt-test'], greaterThanOrEqualTo(15));
-    expect(s.byModelTokens['gpt-test'], greaterThanOrEqualTo(15));
+    // 按 token 聚合：两次合并到 gpt-test（每次 15），带前缀键不出现
+    expect(s.byModelTokens['gpt-test'], greaterThanOrEqualTo(30));
+    expect(s.byModelTokens.containsKey('fake/gpt-test'), false);
   });
 
   test('SSE 含 CJK 不崩：/v1/messages 流式（Anthropic 转换路径）完整读回', () async {
