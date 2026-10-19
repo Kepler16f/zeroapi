@@ -190,9 +190,11 @@ void main() {
     late HttpServer fake;
     late ProxyServer proxy;
     late String baseUrl;
+    late Directory usageDir;
     final client = HttpClient();
 
     setUp(() async {
+      usageDir = await Directory.systemTemp.createTemp('zeroapi-ant-test-');
       fake = await HttpServer.bind('127.0.0.1', 0);
       baseUrl = 'http://127.0.0.1:${fake.port}/v1';
       fake.listen((req) async {
@@ -229,13 +231,17 @@ void main() {
       final rt = UpstreamRuntime(UpstreamDef(id: 'fake', baseUrl: baseUrl));
       await rt.probe();
       proxy = ProxyServer(
-          '127.0.0.1', 0, 'sk-gw', ModelRegistry()..rebuild([rt]));
+          '127.0.0.1', 0, 'sk-gw', ModelRegistry()..rebuild([rt]),
+          usageDir: usageDir.path);
       await proxy.start();
     });
 
     tearDown(() async {
       await proxy.stop();
       await fake.close(force: true);
+      try {
+        usageDir.deleteSync(recursive: true);
+      } catch (_) {}
     });
 
     test('非流式 messages 请求返回 Anthropic 结构', () async {
@@ -264,7 +270,7 @@ void main() {
     test('anthropicEnabled=false 时 /v1/messages 返回 404', () async {
       final rt = UpstreamRuntime(UpstreamDef(id: 'x', baseUrl: baseUrl));
       final p2 = ProxyServer('127.0.0.1', 0, 'k', ModelRegistry()..rebuild([rt]),
-          anthropicEnabled: false);
+          anthropicEnabled: false, usageDir: usageDir.path);
       await p2.start();
       final req = await client.openUrl('POST',
           Uri.parse('http://127.0.0.1:${p2.boundPort}/v1/messages'));
