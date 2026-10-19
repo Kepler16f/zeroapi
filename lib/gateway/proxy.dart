@@ -547,12 +547,12 @@ class ProxyServer {
     final ctx = _ctx
       ?..model = publicName
       ..stream = isStream;
-    // 剥离非 OpenAI 标准的 Anthropic 风格字段：ZCode 等客户端会带 thinking
-    // 之类扩展参数，Zen 严格 JSON 解码报 unknown field → 400（glm 实测）。
-    // 只剥这几个明确非标准的；user/store/metadata/reasoning_effort 是
-    // OpenAI 规范字段，保留透传。推理开关语义由输出侧 reasoning_content 体现。
-    body.removeWhere((k, _) =>
-        const {'thinking', 'reasoning', 'thinking_budget'}.contains(k));
+    // 剥离非 OpenAI 标准的客户端扩展字段：ZCode 等会带 thinking/enable_thinking
+    // 之类，Zen 严格 JSON 解码报 unknown field → 400。清单见 Zen.strictDropFields，
+    // 清单外字段由 _zenTurn 的 400 自愈机制（解析报错→剥离→重试）兜底。
+    for (final f in Zen.strictDropFields) {
+      body.remove(f);
+    }
     body['model'] = route.upstreamModel;
     if (u.isZen) {
       await _forwardZen(req, route, publicName, body,
@@ -926,6 +926,20 @@ class ProxyServer {
     }
 
     if (uresp == null) {
+      // 400 自愈：按上游报错修正请求体（未知字段/推理回传/参数归一）后
+      // 透明重试——这是确定性修正，不计错误、不开熔断
+      if (errStatus == 400 &&
+          attempt < maxAttempts - 1 &&
+          (errBody ?? '').isNotEmpty) {
+        final fix = Zen.healBody(errBody!, origBody);
+        if (fix != null) {
+          _log('$publicName ⟳ 上游 400 已自愈（$fix），透明重试');
+          return _zenTurn(req, route, publicName, origBody,
+              clientWantsStream: clientWantsStream,
+              anthropic: anthropic,
+              attempt: attempt + 1);
+        }
+      }
       final retryable = errStatus == null || errStatus == 429 || errStatus >= 500;
       if (retryable) return retryOrFail('HTTP ${errStatus ?? 'conn'}');
       final parsed = (errBody ?? '').isNotEmpty ? _safeJson(errBody!) : null;

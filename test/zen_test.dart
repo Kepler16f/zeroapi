@@ -188,4 +188,76 @@ void main() {
           'client_tool');
     });
   });
+
+  group('400 自愈 healBody', () {
+    test('未知字段：递归剥离顶层与 messages 内字段', () {
+      final body = <String, dynamic>{
+        'model': 'm',
+        'enable_thinking': true,
+        'messages': [
+          {'role': 'user', 'content': 'hi', 'cache_tag': 'x'},
+        ],
+      };
+      final fix = Zen.healBody(
+          'invalid request body: json: unknown field "enable_thinking"', body);
+      expect(fix, contains('enable_thinking'));
+      expect(body.containsKey('enable_thinking'), false);
+      final fix2 =
+          Zen.healBody('json: unknown field "cache_tag"', body);
+      expect(fix2, contains('cache_tag'));
+      expect(
+          (body['messages'] as List).first.containsKey('cache_tag'), false);
+      // 字段不存在时不谎报修复
+      expect(Zen.healBody('json: unknown field "nope"', body), isNull);
+    });
+
+    test('reasoning_content 回传：为缺失的 assistant 注入空串', () {
+      final body = <String, dynamic>{
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+          {'role': 'assistant', 'content': 'hello'},
+          {'role': 'assistant', 'content': 'x', 'reasoning_content': 'kept'},
+        ],
+      };
+      final fix = Zen.healBody(
+          'The `reasoning_content` in the thinking mode must be passed back to the API.',
+          body);
+      expect(fix, contains('reasoning_content'));
+      final msgs = body['messages'] as List;
+      expect(msgs[1]['reasoning_content'], '');
+      expect(msgs[2]['reasoning_content'], 'kept');
+    });
+
+    test('tool_call arguments 归一化为合法 JSON 对象字符串', () {
+      final body = <String, dynamic>{
+        'messages': [
+          {
+            'role': 'assistant',
+            'tool_calls': [
+              {
+                'function': {'name': 'f', 'arguments': ''}
+              },
+              {
+                'function': {'name': 'g', 'arguments': '{"a":1}'}
+              },
+              {
+                'function': {'name': 'h', 'arguments': '[1,2]'}
+              },
+            ]
+          },
+        ],
+      };
+      final fix = Zen.healBody(
+          'Assistant tool call function.arguments must be a JSON object', body);
+      expect(fix, contains('arguments'));
+      final tcs = ((body['messages'] as List).first['tool_calls'] as List);
+      expect(tcs[0]['function']['arguments'], '{}');
+      expect(tcs[1]['function']['arguments'], '{"a":1}');
+      expect(tcs[2]['function']['arguments'], '{}');
+    });
+
+    test('不相关错误不触发修正', () {
+      expect(Zen.healBody('some other error', {'messages': []}), isNull);
+    });
+  });
 }

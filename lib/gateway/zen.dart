@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 
 /// 单模型熔断器：某免费模型被 429/5xx 命中后，在冷却窗口内直接快速失败，
@@ -115,6 +116,97 @@ class Zen {
 
   /// 诱饵工具名集合（与 ensureFreeTools 注入的对应）。
   static const decoyTools = {'bash', 'glob', 'grep', 'read'};
+
+  /// Zen 上游 Go 严格解码（DisallowUnknownFields）实测会拒的客户端扩展字段，
+  /// 转发前预剥离。清单之外由 400 自愈机制兜底（unknownFieldOf/stripKeyDeep）。
+  static const strictDropFields = {
+    'thinking', 'enable_thinking', 'reasoning', 'thinking_budget',
+  };
+
+  /// 从上游 400 错误体提取被拒字段名（Go: json: unknown field "X"）
+  static final _unknownFieldRe = RegExp(r'unknown field "([^"]+)"');
+  static String? unknownFieldOf(String body) =>
+      _unknownFieldRe.firstMatch(body)?.group(1);
+
+  /// 400 自愈：按上游报错修正请求体，返回修正说明（无可修正项返回 null）。
+  /// 覆盖三类实测坑（jcleng/opencode-free-provider 同款经验）：
+  /// 1. unknown field "X" —— 客户端扩展字段被 Go 严格解码拒绝 → 递归剥离
+  /// 2. reasoning_content must be passed back —— thinking 模式要求 assistant
+  ///    历史带回推理内容（ZCode 不回传）→ 缺失的注入空串占位
+  /// 3. tool call function.arguments must be a JSON object —— 空串/坏 JSON
+  ///    参数 → 归一化为合法 JSON 对象字符串
+  static String? healBody(String err, Map<String, dynamic> body) {
+    final field = unknownFieldOf(err);
+    if (field != null) {
+      return stripKeyDeep(body, field) ? '剥离未知字段 "$field"' : null;
+    }
+    final lower = err.toLowerCase();
+    if (lower.contains('reasoning_content') &&
+        lower.contains('must be passed back')) {
+      var n = 0;
+      for (final m in (body['messages'] as List? ?? const [])) {
+        if (m is Map && m['role'] == 'assistant' && !m.containsKey('reasoning_content')) {
+          m['reasoning_content'] = '';
+          n++;
+        }
+      }
+      return n > 0 ? '为 $n 条 assistant 注入空 reasoning_content' : null;
+    }
+    if (lower.contains('arguments') && lower.contains('json object')) {
+      var n = 0;
+      for (final m in (body['messages'] as List? ?? const [])) {
+        if (m is Map && m['tool_calls'] is List) {
+          for (final tc in (m['tool_calls'] as List)) {
+            if (tc is Map && tc['function'] is Map) {
+              final fn = tc['function'] as Map;
+              final norm = normalizeToolArguments(fn['arguments']);
+              if (norm != fn['arguments']) {
+                fn['arguments'] = norm;
+                n++;
+              }
+            }
+          }
+        }
+      }
+      return n > 0 ? '归一化 $n 个 tool_call arguments' : null;
+    }
+    return null;
+  }
+
+  /// tool_call arguments 归一化（OpenAI 规范：必须是 JSON 对象字符串）
+  static String normalizeToolArguments(Object? args) {
+    if (args is String) {
+      final s = args.trim();
+      if (s.isEmpty) return '{}';
+      try {
+        final p = jsonDecode(s);
+        return (p is Map) ? s : '{}';
+      } catch (_) {
+        return '{}';
+      }
+    }
+    if (args is Map) return jsonEncode(args);
+    return '{}';
+  }
+
+  /// 递归剥离指定 key（顶层与 messages/tools 内任意深度），返回是否有删除
+  static bool stripKeyDeep(Object? node, String key) {
+    var removed = false;
+    if (node is Map) {
+      if (node.containsKey(key)) {
+        node.remove(key);
+        removed = true;
+      }
+      for (final v in node.values) {
+        removed = stripKeyDeep(v, key) || removed;
+      }
+    } else if (node is List) {
+      for (final v in node) {
+        removed = stripKeyDeep(v, key) || removed;
+      }
+    }
+    return removed;
+  }
 
   /// 判断某 tool_call 条目是否为诱饵工具（按 function.name）。
   static bool _isDecoyEntry(Object? tc) {

@@ -80,37 +80,45 @@ class _UpstreamCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.circle, size: 10, color: healthColor),
-                const SizedBox(width: 8),
-                Flexible(
-                  child: Text(
-                    d.displayName,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.bold),
+                // 左侧内容整体占满剩余空间（内部标题可省略号），使开关+菜单
+                // 贴右边缘；此前 Flexible(标题) 与 Spacer 各占一半弹性空间，
+                // 导致开关被挤到中间。
+                Expanded(
+                  child: Row(
+                    children: [
+                      Icon(Icons.circle, size: 10, color: healthColor),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          d.displayName,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      if (rt.health == UpstreamHealth.checking) ...[
+                        const SizedBox(width: 8),
+                        Text('启动中…',
+                            style: TextStyle(
+                                fontSize: 11.5, color: cs.onSurfaceVariant)),
+                      ],
+                      if (d.label.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Text('id: ${d.id}',
+                            style: TextStyle(
+                                fontSize: 11,
+                                fontFamily: 'monospace',
+                                color: cs.onSurfaceVariant)),
+                      ],
+                      const SizedBox(width: 8),
+                      Chip(
+                        label: Text(d.typeLabel,
+                            style: const TextStyle(fontSize: 11)),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ],
                   ),
                 ),
-                if (rt.health == UpstreamHealth.checking) ...[
-                  const SizedBox(width: 8),
-                  Text('启动中…',
-                      style: TextStyle(
-                          fontSize: 11.5, color: cs.onSurfaceVariant)),
-                ],
-                if (d.label.isNotEmpty) ...[
-                  const SizedBox(width: 8),
-                  Text('id: ${d.id}',
-                      style: TextStyle(
-                          fontSize: 11,
-                          fontFamily: 'monospace',
-                          color: cs.onSurfaceVariant)),
-                ],
-                const SizedBox(width: 8),
-                Chip(
-                  label: Text(d.typeLabel,
-                      style: const TextStyle(fontSize: 11)),
-                  visualDensity: VisualDensity.compact,
-                ),
-                const Spacer(),
                 Switch(
                   value: d.enabled,
                   onChanged: (v) => service.toggleUpstream(rt, v),

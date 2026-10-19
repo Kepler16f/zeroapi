@@ -89,6 +89,27 @@ void main() {
       expect(tool['function']['parameters'], {'type': 'object'});
       expect(oai['stop'], ['END']);
     });
+
+    test('assistant thinking 块 → 映射为 reasoning_content 回传', () {
+      final oai = AnthropicAdapter.toOpenAIRequest({
+        'model': 'm',
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+          {
+            'role': 'assistant',
+            'content': [
+              {'type': 'thinking', 'thinking': '内部推理'},
+              {'type': 'text', 'text': '回答'},
+            ]
+          },
+        ],
+      });
+      final msgs = oai['messages'] as List;
+      final assistant = msgs.last as Map;
+      expect(assistant['role'], 'assistant');
+      expect(assistant['content'], '回答');
+      expect(assistant['reasoning_content'], '内部推理');
+    });
   });
 
   group('AnthropicAdapter 响应转换', () {

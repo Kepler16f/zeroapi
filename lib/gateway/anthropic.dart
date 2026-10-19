@@ -69,10 +69,17 @@ class AnthropicAdapter {
       final imageParts = <Map<String, dynamic>>[];
       final toolCalls = <Map<String, dynamic>>[];
       final toolResults = <Map<String, dynamic>>[];
+      final reasoningParts = <String>[];
       for (final b in blocks) {
         switch (b['type']) {
           case 'text':
             textParts.add(b['text'] as String? ?? '');
+            break;
+          case 'thinking':
+            // Claude Code 等会把上一轮思考以 thinking 块回传；DeepSeek 系
+            // thinking 模式要求 assistant 历史必须带回 reasoning_content，
+            // 这里映射回去，从源头满足回传要求（而非丢弃后等上游 400）
+            reasoningParts.add(b['thinking'] as String? ?? '');
             break;
           case 'image':
             final src = b['source'] as Map?;
@@ -104,18 +111,19 @@ class AnthropicAdapter {
             });
             break;
           case 'document':
-          case 'thinking':
             break; // 透传不支持的块类型忽略
         }
       }
       // tool_result 实际以 user role 出现，需拆成独立 tool message
       msgs.addAll(toolResults);
       final hasBody = textParts.isNotEmpty || imageParts.isNotEmpty;
+      final reasoning = reasoningParts.join('');
       if (role == 'assistant') {
         msgs.add({
           'role': 'assistant',
           'content': hasBody ? _contentOf(textParts, imageParts) : (toolCalls.isNotEmpty ? '' : null),
           if (toolCalls.isNotEmpty) 'tool_calls': toolCalls,
+          if (reasoning.isNotEmpty) 'reasoning_content': reasoning,
         });
       } else if (hasBody) {
         msgs.add({'role': role, 'content': _contentOf(textParts, imageParts)});
