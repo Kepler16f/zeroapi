@@ -593,8 +593,8 @@ class _UsagePageState extends State<UsagePage> {
               children: [
                 _StatCard('请求', '${u.requests}', cs.primaryContainer),
                 _StatCard('失败', '${u.errors}', cs.errorContainer),
-                _StatCard('输入 tokens', '${u.promptTokens}', cs.secondaryContainer),
-                _StatCard('输出 tokens', '${u.completionTokens}', cs.tertiaryContainer),
+                _StatCard('输入词元', _fmtTokens(u.promptTokens), cs.secondaryContainer),
+                _StatCard('输出词元', _fmtTokens(u.completionTokens), cs.tertiaryContainer),
               ],
             ),
             const SizedBox(height: 16),
@@ -701,8 +701,8 @@ class _UsagePageState extends State<UsagePage> {
 }
 
 String _fmtTokens(int n) {
-  if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(n >= 10000000 ? 0 : 1)}M';
-  if (n >= 1000) return '${(n / 1000).toStringAsFixed(n >= 10000 ? 0 : 1)}K';
+  if (n >= 100000000) return '${(n / 100000000).toStringAsFixed(2)}亿';
+  if (n >= 10000) return '${(n / 10000).toStringAsFixed(n >= 10000000 ? 0 : 1)}万';
   return '$n';
 }
 
@@ -838,7 +838,7 @@ class _PieChart extends StatelessWidget {
                     ),
                     const SizedBox(width: 8),
                     Text(
-                        '${_fmtTokens(entries[i].value)} tok · ${stats.byModel[entries[i].key] ?? 0} 次 · ${(entries[i].value / total * 100).toStringAsFixed(1)}%',
+                        '${_fmtTokens(entries[i].value)} 词元 · ${stats.byModel[entries[i].key] ?? 0} 次 · ${(entries[i].value / total * 100).toStringAsFixed(1)}%',
                         style: TextStyle(
                             fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant)),
                   ]),
