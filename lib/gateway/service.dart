@@ -19,6 +19,10 @@ class GatewayService extends ChangeNotifier {
   final List<UpstreamRuntime> _runtimes = [];
   Timer? _refreshTimer;
 
+  /// IP 级滥用封锁首次检测回调（UI 订阅：提示用户启用出口代理/部署 Worker；
+  /// 该模式默认不开启，只在被封时征询）
+  void Function(String upstreamId)? onIpBanDetected;
+
   Future<void> start() async {
     if (running) return;
     startError = null;
@@ -38,7 +42,8 @@ class GatewayService extends ChangeNotifier {
     }
     server = ProxyServer(config.host, config.port, config.apiKey, registry,
         anthropicEnabled: config.anthropicEnabled)
-      ..onUnknownModel = _refreshRoutes;
+      ..onUnknownModel = _refreshRoutes
+      ..onIpBan = (id) => onIpBanDetected?.call(id);
     try {
       await server!.start();
       running = true;

@@ -125,6 +125,11 @@ class ProxyServer {
   /// 上游模型目录是动态的（如 opencode 随 models.dev 上新/重启后变化），
   /// 本地路由表可能滞后；重探一次仍找不到才 404，与上游目录严格同步。
   Future<void> Function()? onUnknownModel;
+
+  /// 首次检测到 IP 级滥用封锁时回调一次（解封后重置）。UI 据此提示用户
+  /// 启用出口代理或一键部署 Worker——Worker 模式默认不启用，只在被封时问。
+  void Function(String upstreamId)? onIpBan;
+  bool _ipBanSignaled = false;
   DateTime _lastUnknownRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 统一记账：内存当日汇总（含小时趋势）+ jsonl 落盘（跨天自动换文件）
@@ -705,10 +710,12 @@ class ProxyServer {
       return upClient;
     }
     final fp = pool[_zenProxyIdx % pool.length];
-    if (_zenUp != null && _zenProxySig == fp) return _zenUp!;
-    // 出口实际变化（换代理/换池/轮换）：被封的静默窗口是针对旧 IP 的，
-    // 立即解除——用户在代理端换了节点就能马上重试，不必干等
-    if (_zenProxySig.isNotEmpty && _zenProxySig != fp) {
+    // sig 含 baseUrl：切到 Worker/换入口同样视为「出口变化」
+    final sig = '$fp@${def.baseUrl}';
+    if (_zenUp != null && _zenProxySig == sig) return _zenUp!;
+    // 出口实际变化（换代理/换池/换入口）：被封的静默窗口是针对旧出口的，
+    // 立即解除——换节点或切 Worker 后就能马上重试，不必干等
+    if (_zenProxySig.isNotEmpty && _zenProxySig != sig) {
       _zenIpBanUntil = null;
       _zenBanStreak = 0;
     }
@@ -719,7 +726,7 @@ class ProxyServer {
       ..maxConnectionsPerHost = 64
       ..findProxy = (_) => fp;
     _zenUp = c;
-    _zenProxySig = fp;
+    _zenProxySig = sig;
     return c;
   }
 
@@ -837,7 +844,6 @@ class ProxyServer {
             retryAfter: const Duration(seconds: 90));
         if (abuse) {
           // 有代理池：先换出口 IP 立即重试（新 IP 可能直接可用），不进长静默；
-          // 无池或已轮尽本轮才进递增静默窗口
           if (_rotateZenProxy(u.def) && attempt < maxAttempts - 1) {
             _account(publicName, u.id, 0, 0, true);
             _log('$publicName ⟳ 命中 IP 风控，换出口代理重试（第 ${attempt + 1} 次）');
@@ -846,10 +852,29 @@ class ProxyServer {
                 anthropic: anthropic,
                 attempt: attempt + 1);
           }
-          _zenBanStreak = min(_zenBanStreak + 1, 5);
-          final mins = min(60, 5 << (_zenBanStreak - 1)); // 5,10,20,40,60
-          _zenIpBanUntil = DateTime.now().add(Duration(minutes: mins));
-          _log('$publicName ⛔ IP 滥用封锁（第 $_zenBanStreak 次），静默 $mins 分钟');
+          if (u.def.proxyPool.isEmpty) {
+            // 直连被封：出口 IP 固定，继续撞只会延长封锁 → 递增全局静默；
+            // 首次触发时通知 UI 征询用户是否启用出口代理/部署 Worker
+            _zenBanStreak = min(_zenBanStreak + 1, 5);
+            final mins = min(60, 5 << (_zenBanStreak - 1)); // 5,10,20,40,60
+            _zenIpBanUntil = DateTime.now().add(Duration(minutes: mins));
+            _log('$publicName ⛔ IP 滥用封锁（第 $_zenBanStreak 次），静默 $mins 分钟');
+            if (!_ipBanSignaled) {
+              _ipBanSignaled = true;
+              onIpBan?.call(u.id);
+            }
+          } else {
+            // 经代理/Worker 出网时，403 只代表「这一个出口 IP 被标记」：
+            // FlClash 每连接随机节点、CF 也是 IP 池，下一个请求大概率是
+            // 干净 IP。只保留上面的单模型 90s 冷却，绝不全局静默——
+            // 实测教训：全局窗口会把明明可用的其他模型一起误拦几分钟
+            _log('$publicName ⚠ 经代理出口命中 IP 风控（仅冷却 ${route.upstreamModel}，'
+                '其他模型不受影响）');
+            if (!_ipBanSignaled) {
+              _ipBanSignaled = true;
+              onIpBan?.call(u.id);
+            }
+          }
         }
         _account(publicName, u.id, 0, 0, true);
         _log('$publicName ✗ zen 403 ${abuse ? 'IP 滥用封锁' : '门控拒绝'}: $rawMsg');
@@ -870,6 +895,7 @@ class ProxyServer {
     _breaker.onSuccess(route.upstreamModel);
     _zenBanStreak = 0;
     _zenIpBanUntil = null;
+    _ipBanSignaled = false;
     u.health = UpstreamHealth.healthy;
     u.lastError = null;
     // 解码流交给 pump：pump 只在产出首个有效输出后才提交响应头，
