@@ -6,6 +6,7 @@ import 'config.dart';
 import 'modelsdev.dart';
 import 'proxy.dart';
 import 'upstream.dart';
+import 'workbuddy.dart';
 
 /// 聚合所有组件的应用级服务，向 UI 广播状态变化
 class GatewayService extends ChangeNotifier {
@@ -32,6 +33,8 @@ class GatewayService extends ChangeNotifier {
       }
     };
     unawaited(ModelsDev.instance.start());
+    // 首次启动自动接入 WorkBuddy 号池（仅在随包运行时存在时；只做一次）
+    await WorkBuddy.seedIfNeeded(config);
     _runtimes.clear();
     for (final def in config.upstreams) {
       // 供应商预热就绪时立即重建路由表（不等 60s 周期刷新），
@@ -80,6 +83,22 @@ class GatewayService extends ChangeNotifier {
 
   // ---- 供应商管理 ----
 
+  /// 手动接入 WorkBuddy 号池（首次自动接入被跳过，或用户移除后想加回来）。
+  /// 成功返回 null，失败返回给 UI 展示的原因。
+  Future<String?> addWorkBuddy() async {
+    if (config.upstreams.any((u) => u.id == WorkBuddy.id)) {
+      return 'WorkBuddy 号池已在供应商列表中';
+    }
+    final def = await WorkBuddy.buildDef();
+    if (def == null) {
+      return '未找到随包的 WorkBuddy 运行时（vendor/workbuddy2api-hub），'
+          '请重新安装，或运行 tool/vendor_workbuddy.ps1 后重启应用';
+    }
+    config.workbuddySeeded = true;
+    addUpstream(def);
+    return null;
+  }
+
   void addUpstream(UpstreamDef def) {
     config.upstreams.add(def);
     final rt = UpstreamRuntime(def)..onStatusChanged = notifyListeners;
@@ -109,6 +128,7 @@ class GatewayService extends ChangeNotifier {
       ..command = newDef.command
       ..args = newDef.args
       ..env = newDef.env
+      ..healthUrl = newDef.healthUrl
       ..enabled = newDef.enabled;
     final i = config.upstreams.indexWhere((x) => x.id == old.id);
     if (i >= 0) config.upstreams[i] = newDef;

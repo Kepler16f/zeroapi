@@ -10,6 +10,7 @@ import '../gateway/lan.dart';
 import '../gateway/proxy.dart';
 import '../gateway/service.dart';
 import '../gateway/upstream.dart';
+import '../gateway/workbuddy.dart';
 import '../gateway/workerdeploy.dart';
 import '../version.dart';
 
@@ -38,6 +39,8 @@ class UpstreamsPage extends StatelessWidget {
                       child: Text('网关启动失败：${service.startError}（端口被占用？去设置页改端口）'),
                     ),
                   ),
+                if (!ups.any((u) => WorkBuddy.isWorkBuddy(u.def)))
+                  _workbuddyEntryCard(context, service),
                 ...ups.map((u) => _UpstreamCard(service: service, rt: u)),
                 const SizedBox(height: 80),
               ],
@@ -67,6 +70,8 @@ class _UpstreamCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final d = rt.def;
+    final hasPanel = d.healthUrl.isNotEmpty;
+    final noAccounts = rt.accountTotal != null && (rt.accountReady ?? 0) == 0;
     final healthColor = switch (rt.health) {
       UpstreamHealth.healthy => Colors.green,
       UpstreamHealth.down => cs.error,
@@ -162,6 +167,54 @@ class _UpstreamCard extends StatelessWidget {
                         TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
               ],
             ]),
+            if (hasPanel) ...[
+              const SizedBox(height: 6),
+              Row(children: [
+                Icon(Icons.group_outlined, size: 14, color: cs.onSurfaceVariant),
+                const SizedBox(width: 4),
+                Text(
+                  WorkBuddy.accountSummary(rt.accountTotal, rt.accountReady),
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: noAccounts
+                          ? Colors.orange.shade800
+                          : cs.onSurfaceVariant),
+                ),
+              ]),
+              if (noAccounts)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    '还没有可用账号：打开管理面板，用「登录新账号」或「扫描桌面端登录」导入后即可使用。',
+                    style:
+                        TextStyle(fontSize: 11.5, color: Colors.orange.shade800),
+                  ),
+                ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 2,
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: () => WorkBuddy.openPanel(d),
+                      icon: const Icon(Icons.open_in_new, size: 16),
+                      label: const Text('管理面板'),
+                    ),
+                    TextButton.icon(
+                      onPressed: () {
+                        Clipboard.setData(
+                            ClipboardData(text: WorkBuddy.panelPassword(d)));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('管理面板密码已复制')));
+                      },
+                      icon: const Icon(Icons.key_outlined, size: 16),
+                      label: const Text('复制面板密码'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             if (rt.lastError != null && rt.health == UpstreamHealth.down)
               Padding(
                 padding: const EdgeInsets.only(top: 6),
@@ -175,6 +228,29 @@ class _UpstreamCard extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 供应商列表里没有 WorkBuddy 时的接入入口（手动移除后也能加回来）。
+Widget _workbuddyEntryCard(BuildContext context, GatewayService service) {
+  return Card(
+    child: ListTile(
+      leading: const Icon(Icons.workspaces_outline),
+      title: const Text('接入 WorkBuddy 号池'),
+      subtitle: const Text(
+          '内置 workbuddy2api-hub：多账号轮换、登录/桌面端导入、签到保活；账号数据保存在本机。'),
+      trailing: FilledButton.tonal(
+        onPressed: () async {
+          final err = await service.addWorkBuddy();
+          if (!context.mounted) return;
+          if (err != null) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text(err)));
+          }
+        },
+        child: const Text('接入'),
+      ),
+    ),
+  );
 }
 
 Future<void> _showUpstreamEditor(
@@ -310,6 +386,8 @@ class _UpstreamDialogState extends State<_UpstreamDialog> {
               // 编辑供应商不重置出口代理（在设置页统一配置）
               proxy: widget.def?.proxy ?? '',
               proxyEnabled: widget.def?.proxyEnabled ?? false,
+              // 管理面健康地址属于内置供应商的接线信息，编辑时保留
+              healthUrl: widget.def?.healthUrl ?? '',
             );
             if (widget.def == null) {
               widget.service.addUpstream(def);

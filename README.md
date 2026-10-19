@@ -6,6 +6,7 @@
 ```
 你的客户端（本机 / 局域网设备）──(OpenAI API + 网关 key)──▶ ZeroApi(:8123)
                                         ├──▶ OpenCode Zen Free (内置：直连，免费模型自动发现)
+                                        ├──▶ WorkBuddy 号池   (内置：workbuddy2api-hub，本机多账号轮换)
                                         ├──▶ Qoder2API-Hub  (自定义：转发)
                                         ├──▶ niceboat       (自定义：转发)
                                         └──▶ 未来任意兼容供应商  (加一条配置即可)
@@ -29,10 +30,31 @@ Windows：直接双击 `build/windows/<arch>/runner/Release/zeroapi.exe`
 | 类型 | UI 名称 | 含义 | 典型例子 |
 |------|---------|------|----------|
 | `zen`     | 内置 | 网关原生直连 OpenCode Zen 免费通道（纯 Dart 实现，不含 zengate/opencode 等外部二进制）：按客户端指纹请求 `opencode.ai/inference/v1`，只暴露免费档模型（`*-free`/big-pickle，其余默认隐藏），无需任何本地进程 | OpenCode Zen Free |
-| `managed` | 内置 | ZeroApi 负责 `启动命令 + 参数` 拉起子进程；进程退出自动退避重启；端口已有实例则视为外部进程、不重复拉起 | 本地网关类供应商（如自建的 OpenAI 兼容服务） |
+| `managed` | 内置 | ZeroApi 负责 `启动命令 + 参数` 拉起子进程；进程退出自动退避重启；端口已有实例则视为外部进程、不重复拉起 | WorkBuddy 号池、本地网关类供应商（如自建的 OpenAI 兼容服务） |
 | `remote`  | 自定义 | 只做转发与探活，供应商由它自己负责 | Qoder2API-Hub、niceboat、OpenRouter 等任何 OpenAI 兼容端点 |
 
 新增供应商：供应商页 → 「接入新供应商」，填 Base URL（带 `/v1`）与 Key；内置型再填命令与参数。
+
+## WorkBuddy 号池
+
+内置 [workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（MIT，
+纯 Python 标准库实现，随包附带裁剪版 CPython 运行时）：把本机
+WorkBuddy / CodeBuddy 账号接入 OpenAI 兼容网关，支持多账号轮换、冷却熔断、
+会话粘性、每日签到保活与 Web 管理面板。
+
+- **无需安装 Python**：安装包里已带便携运行时（`vendor/workbuddy2api-hub`，
+  约 34MB）；源码构建前跑一次 `powershell -File tool/vendor_workbuddy.ps1`
+  按固定版本 + SHA256 下载（`vendor/` 不入库）。
+- **首次启动自动接入**：检测到随包运行时后自动写入内置供应商（生成专用 API Key
+  与面板密码），用户移除后不会自动加回。启动端口从 8788 起自动顺延避冲突。
+- **数据不随安装目录走**：账号、用量、模型缓存全部落在
+  `%APPDATA%\zeroapi\workbuddy\`，升级/卸载应用不会丢账号。
+- **供应商卡片**显示账号池状态（`账号 N/M 可用`）；没有账号时给出提示，
+  卡片上的「管理面板」打开浏览器看板（默认 `http://127.0.0.1:8788/`），
+  「复制面板密码」复制本次生成的一次性面板密码（密码随启动参数固定，
+  看板里改 key 不会影响已接入的 ZeroApi）。
+- 添加账号：管理面板 → 「登录新账号」（浏览器设备授权）或「扫描桌面端登录」
+  （导入本机 WorkBuddy 桌面客户端的登录态）。账号未就绪时该供应商模型为空。
 
 ## 模型命名规则
 

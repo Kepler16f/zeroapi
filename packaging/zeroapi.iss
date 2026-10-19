@@ -46,7 +46,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\build\windows\{#MyArch}\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
-; 旧版本随包分发的 zengate/opencode vendor（约 176MB）：直连实现后升级时彻底清理
+; 升级时整体替换随包 vendor：旧版 zengate/opencode 已不再分发（直连实现）；
+; 新版这里装的是 WorkBuddy 号池运行时（含便携 Python，约 34MB）。
+; 用户数据在 %APPDATA%\zeroapi\workbuddy，不受安装目录清理影响。
 Type: filesandordirs; Name: "{app}\vendor"
 
 [Icons]

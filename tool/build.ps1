@@ -87,10 +87,27 @@ foreach ($p in $Platforms) {
   if ($LASTEXITCODE -eq 0) {
     Write-Host "  产物: $t.Out" -ForegroundColor Green
     if ($Installer -and $p -like "windows*") {
-      # Zen 免费档由网关原生直连（lib/gateway/zen.dart），无需随包 vendor。
-      # 清理旧构建残留的 Release\vendor（若有），安装包只含应用本体。
+      # Zen 免费档由网关原生直连（lib/gateway/zen.dart），无需 zengate vendor。
+      # WorkBuddy 号池例外：随包分发 vendor\workbuddy2api-hub（含便携 Python）。
+      $wbVendor = Join-Path (Get-Location) "vendor\workbuddy2api-hub"
+      if (-not (Test-Path (Join-Path $wbVendor "python\pythonw.exe"))) {
+        Write-Host "  准备 WorkBuddy 运行时..." -ForegroundColor Cyan
+        try {
+          & (Join-Path $PSScriptRoot "vendor_workbuddy.ps1")
+        } catch {
+          Write-Host "  [警告] 下载 WorkBuddy 运行时失败：$_" -ForegroundColor Yellow
+        }
+      }
       $vendorDest = Join-Path $t.Out "vendor"
       if (Test-Path $vendorDest) { Remove-Item -Recurse -Force $vendorDest }
+      if (Test-Path (Join-Path $wbVendor "python\pythonw.exe")) {
+        $wbDest = Join-Path $vendorDest "workbuddy2api-hub"
+        New-Item -ItemType Directory -Force -Path $wbDest | Out-Null
+        Copy-Item (Join-Path $wbVendor "*") $wbDest -Recurse -Force
+        Write-Host "  已打包 WorkBuddy 运行时" -ForegroundColor Green
+      } else {
+        Write-Host "  [警告] 未找到 WorkBuddy 运行时，安装包不含号池功能" -ForegroundColor Yellow
+      }
       $arch = if ($p -eq "windows-x64") { "x64" } elseif ($p -eq "windows-arm64") { "arm64" } else { $winArch }
       $iscc = @(
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",

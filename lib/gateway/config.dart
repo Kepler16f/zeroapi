@@ -23,6 +23,9 @@ class UpstreamDef {
   String proxy;
   /// 出口代理开关：关闭时保留地址但走直连（proxyPool 返回空）
   bool proxyEnabled;
+  /// 可选的管理面健康地址（如 WorkBuddy 号池的 /health）。
+  /// 探活成功时顺带读取账号池状态，供 UI 显示"账号 N/M 可用"。
+  String healthUrl;
 
   UpstreamDef({
     required this.id,
@@ -36,6 +39,7 @@ class UpstreamDef {
     this.env = const {},
     this.proxy = '',
     this.proxyEnabled = false,
+    this.healthUrl = '',
   });
 
   bool get isManaged => type == 'managed';
@@ -58,6 +62,7 @@ class UpstreamDef {
         env: ((j['env'] ?? {}) as Map).cast<String, String>(),
         proxy: (j['proxy'] ?? '') as String,
         proxyEnabled: (j['proxyEnabled'] ?? false) as bool,
+        healthUrl: (j['healthUrl'] ?? '') as String,
       );
 
   Map<String, dynamic> toJson() => {
@@ -71,6 +76,7 @@ class UpstreamDef {
         if (env.isNotEmpty) 'env': env,
         if (proxy.isNotEmpty) 'proxy': proxy,
         if (proxyEnabled) 'proxyEnabled': true,
+        if (healthUrl.isNotEmpty) 'healthUrl': healthUrl,
         'enabled': enabled,
       };
 
@@ -143,6 +149,8 @@ class GatewayConfig {
   /// 点击关闭窗口按钮的行为：true=收起到系统托盘（默认），false=退出应用。
   /// 由 windows/runner 的 C++ 层直接读 config.json 生效。
   bool closeToTray;
+  /// WorkBuddy 号池的自动接入只做一次：用户主动移除后不再偷偷加回来。
+  bool workbuddySeeded;
 
   GatewayConfig({
     this.host = '127.0.0.1',
@@ -153,6 +161,7 @@ class GatewayConfig {
     this.themeMode = 'system',
     this.anthropicEnabled = true,
     this.closeToTray = true,
+    this.workbuddySeeded = false,
   }) : keys = keys ?? [];
 
   /// 兼容旧语义：默认 key = 池中第一把
@@ -208,6 +217,8 @@ class GatewayConfig {
       cfg.anthropicEnabled = (g['anthropicEnabled'] ?? cfg.anthropicEnabled) as bool;
       cfg.closeToTray = (g['closeToTray'] ?? cfg.closeToTray) as bool;
       cfg.allowLan = (g['allowLan'] ?? false) as bool;
+      cfg.workbuddySeeded =
+          (g['workbuddySeeded'] ?? cfg.workbuddySeeded) as bool;
       // 密钥池；旧版单 apiKey 自动迁移成「默认」key
       final keyList = (g['keys'] as List?) ?? const [];
       cfg.keys = keyList
@@ -221,7 +232,7 @@ class GatewayConfig {
           .toList();
       var migrated = false;
       for (final u in cfg.upstreams) {
-        _resolvePlaceholders(u);
+        resolvePlaceholders(u);
         _normalizeZenLabel(u);
         if (_migrateZenToNative(u)) migrated = true;
       }
@@ -249,6 +260,7 @@ class GatewayConfig {
         'themeMode': themeMode,
         'anthropicEnabled': anthropicEnabled,
         'closeToTray': closeToTray,
+        'workbuddySeeded': workbuddySeeded,
       },
       'upstreams': upstreams.map((u) => u.toJson()).toList(),
     }));
@@ -314,13 +326,43 @@ class GatewayConfig {
     return null;
   }
 
-  static void _resolvePlaceholders(UpstreamDef u) {
+  /// 定位随包分发的 WorkBuddy 网关运行时（`vendor/workbuddy2api-hub`）。
+  /// 安装版与 exe 同目录；开发态从构建产物目录向上找到仓库根。
+  static Directory? findWorkBuddyVendor() {
+    final exeDir = File(Platform.resolvedExecutable).parent;
+    var dir = exeDir;
+    for (var i = 0; i < 7; i++) {
+      final candidate =
+          Directory('${dir.path}/vendor/workbuddy2api-hub');
+      if (_looksLikeWorkBuddyVendor(candidate)) return candidate;
+      final parent = dir.parent;
+      if (parent.path == dir.path) break;
+      dir = parent;
+    }
+    final cwd = Directory.current;
+    final candidate = Directory('${cwd.path}/vendor/workbuddy2api-hub');
+    return _looksLikeWorkBuddyVendor(candidate) ? candidate : null;
+  }
+
+  static bool _looksLikeWorkBuddyVendor(Directory d) =>
+      File('${d.path}/wb_proxy.py').existsSync() &&
+      File('${d.path}/python/pythonw.exe').existsSync();
+
+  /// 解析内置供应商命令/参数里的占位符。`{{wbdir}}` 在运行时缺失时保留原样，
+  /// 等下次启动（或安装完成后）再解析。
+  static void resolvePlaceholders(UpstreamDef u) {
     final npmGlobal = Platform.isWindows
         ? '${Platform.environment['APPDATA'] ?? ''}\\npm'
         : '${Platform.environment['HOME'] ?? ''}/.npm-global';
-    String r(String s) => s
-        .replaceAll('{{node}}', _findNodeExecutable() ?? Platform.executable)
-        .replaceAll('{{npm-global}}', npmGlobal);
+    final wbDir = findWorkBuddyVendor()?.path;
+    String r(String s) {
+      var out = s
+          .replaceAll('{{node}}', _findNodeExecutable() ?? Platform.executable)
+          .replaceAll('{{npm-global}}', npmGlobal);
+      if (wbDir != null) out = out.replaceAll('{{wbdir}}', wbDir);
+      return out;
+    }
+
     u.command = u.command == null ? null : r(u.command!);
     u.args = u.args.map(r).toList();
   }

@@ -17,6 +17,10 @@ class UpstreamRuntime {
   final Map<String, ModelInfo> modelInfo = {};
   String? lastError;
   Process? child;
+  /// 带管理面的内置供应商（目前是 WorkBuddy）：管理面 /health 的账号池状态
+  int? accountTotal;
+  int? accountReady;
+  Map<String, dynamic>? hostInfo;
   int requests = 0, promptTokens = 0, completionTokens = 0, errors = 0;
   DateTime? lastSpawnAt;
   bool _stopping = false;
@@ -53,7 +57,18 @@ class UpstreamRuntime {
       final resp = await req.close().timeout(const Duration(seconds: 10));
       final body = await resp.transform(utf8.decoder).join();
       client.close(force: true);
-      if (resp.statusCode != 200) throw HttpException('HTTP ${resp.statusCode}');
+      if (resp.statusCode != 200) {
+        // 号池网关卡在"进程已就绪但还没添加账号"时，/v1/models 可能返回
+        // 503。这属于待配置而不是故障：保持可用状态，由卡片提示去面板登录。
+        await _probeHostInfo();
+        if (_noAccounts) {
+          models = const [];
+          health = UpstreamHealth.healthy;
+          lastError = null;
+          return true;
+        }
+        throw HttpException('HTTP ${resp.statusCode}');
+      }
       final j = jsonDecode(body) as Map<String, dynamic>;
       final data = (j['data'] as List?) ?? const [];
       final entries = data
@@ -71,6 +86,7 @@ class UpstreamRuntime {
       health = UpstreamHealth.healthy;
       lastError = null;
       _backoffMs = 1000;
+      await _probeHostInfo();
       return true;
     } catch (e) {
       if (_warming) {
@@ -82,6 +98,34 @@ class UpstreamRuntime {
         lastError = e.toString();
       }
       return false;
+    }
+  }
+
+  bool get _noAccounts => accountTotal != null && (accountReady ?? 0) == 0;
+
+  /// 管理面健康检查：顺带把账号池状态读到 UI 层（WorkBuddy 卡片用）。
+  /// 失败静默——主探活已经决定了供应商状态。
+  Future<void> _probeHostInfo() async {
+    final url = def.healthUrl;
+    if (url.isEmpty) return;
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 3);
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      _headers().forEach((k, v) => req.headers.set(k, v));
+      final resp = await req.close().timeout(const Duration(seconds: 4));
+      final body = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode != 200) return;
+      final j = jsonDecode(body);
+      if (j is Map<String, dynamic>) {
+        hostInfo = j;
+        accountTotal = (j['accounts'] as num?)?.toInt();
+        accountReady = (j['accounts_ready'] as num?)?.toInt();
+      }
+    } catch (_) {
+      // 管理面不可达不影响主探活结论
+    } finally {
+      client.close(force: true);
     }
   }
 
