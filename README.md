@@ -117,7 +117,7 @@ powershell -File tool/build.ps1                                    # 交互式�
 Windows 安装包（Inno Setup 6）：
 
 ```bash
-iscc /DMyArch=arm64 /DMyVersion=0.1.11 packaging/zeroapi.iss
+iscc /DMyArch=arm64 /DMyVersion=0.1.12 packaging/zeroapi.iss
 # 产物：installer/zeroapi-setup-arm64-<version>.exe
 ```
 
