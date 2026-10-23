@@ -8,8 +8,8 @@
 param([switch]$Force)
 $ErrorActionPreference = "Stop"
 
-$Version = "1.7.16"
-$Sha256 = "2033da004188b62aa4b7761cc2b2aae61364d536d47dfb7923cab45ef5b45724"
+$Version = "1.7.30"
+$Sha256 = "61bb6315f1a7d8f3fc2f7745e6c58f4f4b24d9e0d61bf7b7a6cfa74922f01b1f"
 $Url = "https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/download/v$Version/workbuddy2api-hub-v$Version.zip"
 
 $root = Split-Path -Parent $PSScriptRoot
