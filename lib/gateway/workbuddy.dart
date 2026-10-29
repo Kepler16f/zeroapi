@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:math';
 
 import 'config.dart';
 
@@ -15,7 +14,7 @@ import 'config.dart';
 /// 安装目录不会丢数据。
 class WorkBuddy {
   static const id = 'workbuddy';
-  static const hubVersion = '1.7.16';
+  static const hubVersion = '1.7.30';
 
   /// hub 的默认端口；被占用时顺延（最多试 11 个）。
   static const defaultPort = 8788;
@@ -32,10 +31,14 @@ class WorkBuddy {
   }
 
   /// 管理面板地址：baseUrl 去掉 `/v1` 后的 origin。
-  static String panelUrl(UpstreamDef d) {
+  /// 传入 [token] 时带 `?panel_token=`：本机打开不必再输密码（面板页把它
+  /// 存进 sessionStorage 后从地址栏抹掉）。
+  static String panelUrl(UpstreamDef d, {String? token}) {
     final uri = Uri.parse(d.baseUrl);
     final port = uri.hasPort ? ':${uri.port}' : '';
-    return '${uri.scheme}://${uri.host}$port/';
+    final base = '${uri.scheme}://${uri.host}$port/';
+    if (token == null || token.isEmpty) return base;
+    return '$base?panel_token=${Uri.encodeQueryComponent(token)}';
   }
 
   /// hub 的管理面板密码（由 ZeroApi 生成，存在启动参数里）。
@@ -52,11 +55,15 @@ class WorkBuddy {
   }
 
   /// 用系统默认浏览器打开号池管理面板。
-  static Future<void> openPanel(UpstreamDef d) async {
-    final url = panelUrl(d);
+  ///
+  /// Windows 用 explorer.exe 而不是 `cmd.exe /c start`：cmd 是控制台子系统
+  /// 进程，从本应用（GUI 子系统）拉起时会闪一下黑窗；explorer 是 GUI 进程。
+  static Future<void> openPanel(UpstreamDef d, {String? token}) async {
+    final url = panelUrl(d, token: token);
     if (Platform.isWindows) {
-      await Process.start('cmd.exe', ['/c', 'start', '', url],
-          mode: ProcessStartMode.detached);
+      await Process.start('explorer.exe', [
+        url,
+      ], mode: ProcessStartMode.detached);
     } else if (Platform.isMacOS) {
       await Process.start('open', [url], mode: ProcessStartMode.detached);
     } else {
@@ -87,30 +94,33 @@ class WorkBuddy {
 
     final port = await _pickPort();
     final root = dataRoot();
-    final accounts = Directory('${root.path}/accounts')..createSync(recursive: true);
+    final accounts = Directory('${root.path}/accounts')
+      ..createSync(recursive: true);
     final usage = Directory('${root.path}/usage')..createSync(recursive: true);
-    final catalog = Directory('${root.path}/catalog')..createSync(recursive: true);
+    final catalog = Directory('${root.path}/catalog')
+      ..createSync(recursive: true);
 
-    final apiKey = _token('sk-zb-', 40);
-    final panelPassword = _token('', 16);
-
+    // 本地免密：只监听 127.0.0.1，不传 --api-key/--panel-password。
+    // hub 的 auth_required() 在无启动器密钥且面板未配置密钥时为 False，
+    // 网关也不发 Authorization（见 proxy.dart 的 apiKey.isNotEmpty 判定）；
+    // 面板回落默认密码 admin，「复制面板密码」仍拿到正确值。
     final def = UpstreamDef(
       id: id,
       type: 'managed',
-      label: 'WorkBuddy 号池（腾讯 CodeBuddy）',
+      label: 'WorkBuddy',
       baseUrl: 'http://127.0.0.1:$port/v1',
-      apiKey: apiKey,
+      apiKey: '',
       command: '{{wbdir}}/python/pythonw.exe',
       args: [
         '{{wbdir}}/wb_proxy.py',
-        '--host', '127.0.0.1',
-        '--port', '$port',
-        // 固定 --api-key，面板里改 key 不会影响已接入的 ZeroApi
-        '--api-key', apiKey,
-        // 每次启动重申密码，保证卡片上的「复制面板密码」长期有效
-        '--panel-password', panelPassword,
-        '--accounts-dir', accounts.path,
-        '--usage-dir', usage.path,
+        '--host',
+        '127.0.0.1',
+        '--port',
+        '$port',
+        '--accounts-dir',
+        accounts.path,
+        '--usage-dir',
+        usage.path,
       ],
       env: {
         'WB_PROXY_CATALOG_DIR': catalog.path,
@@ -118,6 +128,12 @@ class WorkBuddy {
         'PYTHONDONTWRITEBYTECODE': '1',
       },
       healthUrl: 'http://127.0.0.1:$port/health',
+      // 对外调用名统一为 WorkBuddy/<模型名>（如 WorkBuddy/deepseek-v4-pro）
+      modelPrefix: 'WorkBuddy',
+      // 双出口目录合并：国内与国际两个 realm 各探一次再合并清单，
+      // 两个出口的模型同时对外可见；实际请求由 hub 按模型名自动选出口
+      // （detect_model_realm），不受 CURRENT_REALM 影响。
+      catalogPaths: const ['/models?realm=intl', '/models?realm=cn'],
       enabled: true,
     );
     // 立即把 {{wbdir}} 解析成绝对路径：seed 发生在 load() 之后，运行时
@@ -138,12 +154,5 @@ class WorkBuddy {
       }
     }
     return defaultPort;
-  }
-
-  static String _token(String prefix, int length) {
-    const chars =
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    final r = Random.secure();
-    return '$prefix${List.generate(length, (_) => chars[r.nextInt(chars.length)]).join()}';
   }
 }

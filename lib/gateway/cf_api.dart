@@ -45,17 +45,22 @@ class CloudflareApi {
     });
     final body = <int>[];
     void part(String s) => body.addAll(utf8.encode(s));
-    part('--$boundary\r\n'
-        'Content-Disposition: form-data; name="metadata"\r\n'
-        'Content-Type: application/json\r\n\r\n$meta\r\n');
-    part('--$boundary\r\n'
-        'Content-Disposition: form-data; name="index.js"; filename="index.js"\r\n'
-        'Content-Type: application/javascript+module\r\n\r\n');
+    part(
+      '--$boundary\r\n'
+      'Content-Disposition: form-data; name="metadata"\r\n'
+      'Content-Type: application/json\r\n\r\n$meta\r\n',
+    );
+    part(
+      '--$boundary\r\n'
+      'Content-Disposition: form-data; name="index.js"; filename="index.js"\r\n'
+      'Content-Type: application/javascript+module\r\n\r\n',
+    );
     part(code);
     part('\r\n--$boundary--\r\n');
 
-    final uri =
-        Uri.parse('$_api/accounts/$accountId/workers/scripts/$scriptName');
+    final uri = Uri.parse(
+      '$_api/accounts/$accountId/workers/scripts/$scriptName',
+    );
     final req = await _client.openUrl('PUT', uri);
     req.headers.set('Authorization', 'Bearer $token');
     req.headers.set('Content-Type', 'multipart/form-data; boundary=$boundary');

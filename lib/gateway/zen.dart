@@ -15,9 +15,9 @@ class ModelBreaker {
   void onFailure(String model, {Duration? retryAfter}) {
     final n = (_failures[model] ?? 0) + 1;
     _failures[model] = n;
-    final cooldown = retryAfter ??
-        Duration(
-            milliseconds: n < 3 ? 1000 : (min(60, 5 * n) * 1000));
+    final cooldown =
+        retryAfter ??
+        Duration(milliseconds: n < 3 ? 1000 : (min(60, 5 * n) * 1000));
     final until = DateTime.now().add(cooldown);
     final cur = _blockedUntil[model];
     if (cur == null || until.isAfter(cur)) _blockedUntil[model] = until;
@@ -43,6 +43,25 @@ class Zen {
   /// 付费 id 虽在 /models 里返回但补全会被拒，故这里直接过滤掉、不对客户端展示。
   static bool isFreeModel(String id) =>
       id == 'big-pickle' || (id.contains('-free') && !id.contains('['));
+
+  /// 免费额度耗尽的判定。上游文案：
+  ///   "Free usage limit reached. Subscribe to OpenCode Go to keep going: …"
+  /// 这是账号级硬配额（不是 IP 限流）：换出口 IP、退避重试都救不了，
+  /// 只能如实告知并引导订阅，或者换别的免费模型。
+  static bool isQuotaExhausted(String msg) {
+    final m = msg.toLowerCase();
+    if (m.isEmpty) return false;
+    return m.contains('free usage limit') ||
+        (m.contains('usage limit') && m.contains('subscribe')) ||
+        (m.contains('quota') && m.contains('exceed'));
+  }
+
+  /// 地理屏蔽判定。上游文案（2026-10-22 实测，经 workers.dev 出口时偶发）：
+  ///   "This model is not available in your country"
+  /// Cloudflare 按连接落在不同国家机房，同一模型换个出口就可能可用——
+  /// 与额度同类，属于「换出口重试」而非「等冷却」。
+  static bool isGeoBlocked(String msg) =>
+      msg.toLowerCase().contains('not available in your country');
 
   /// opencode 的降序标识符：12 位小写 hex + 14 位 base62。
   /// hex = (~(ts*0x1000+counter)) 的低 48 位；服务端只校验低 12 位 counter<=63
@@ -103,7 +122,7 @@ class Zen {
             'parameters': {
               'type': 'object',
               'properties': {
-                'p': {'type': 'string'}
+                'p': {'type': 'string'},
               },
               'required': ['p'],
             },
@@ -120,7 +139,10 @@ class Zen {
   /// Zen 上游 Go 严格解码（DisallowUnknownFields）实测会拒的客户端扩展字段，
   /// 转发前预剥离。清单之外由 400 自愈机制兜底（unknownFieldOf/stripKeyDeep）。
   static const strictDropFields = {
-    'thinking', 'enable_thinking', 'reasoning', 'thinking_budget',
+    'thinking',
+    'enable_thinking',
+    'reasoning',
+    'thinking_budget',
   };
 
   /// 从上游 400 错误体提取被拒字段名（Go: json: unknown field "X"）
@@ -145,7 +167,9 @@ class Zen {
         lower.contains('must be passed back')) {
       var n = 0;
       for (final m in (body['messages'] as List? ?? const [])) {
-        if (m is Map && m['role'] == 'assistant' && !m.containsKey('reasoning_content')) {
+        if (m is Map &&
+            m['role'] == 'assistant' &&
+            m['reasoning_content'] == null) {
           m['reasoning_content'] = '';
           n++;
         }
@@ -206,8 +230,10 @@ class Zen {
   /// tool_calls / tool_choice 同步改写（哈希确定性保证跨请求一致）。
   static final _legalToolName = RegExp(r'^[A-Za-z0-9_-]+$');
 
-  static Map<String, String> shortenToolNames(Map<String, dynamic> body,
-      {int maxLen = 64}) {
+  static Map<String, String> shortenToolNames(
+    Map<String, dynamic> body, {
+    int maxLen = 64,
+  }) {
     final map = <String, String>{};
     final tools = body['tools'];
     if (tools is! List) return map;
@@ -224,11 +250,12 @@ class Zen {
       final clean = name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '-');
       final prefix = clean.length > keep ? clean.substring(0, keep) : clean;
       // hash 只剩 24 位，撞名时按盐递增；同一工具表下结果确定
-      for (var salt = 0;; salt++) {
+      for (var salt = 0; ; salt++) {
         final sn = '$prefix-${_hash6(salt == 0 ? name : '$name#$salt')}';
         if (used.add(sn)) return sn;
       }
     }
+
     var changed = false;
     final rebuilt = <Object>[];
     for (final t in tools) {
@@ -238,7 +265,10 @@ class Zen {
         if (name.length > maxLen || !_legalToolName.hasMatch(name)) {
           final sn = shortOf(name);
           map[sn] = name;
-          rebuilt.add({...t, 'function': {...fn, 'name': sn}});
+          rebuilt.add({
+            ...t,
+            'function': {...fn, 'name': sn},
+          });
           changed = true;
           continue;
         }
@@ -261,7 +291,10 @@ class Zen {
               final sn = reverse[fn['name']?.toString()];
               if (sn != null) {
                 touched = true;
-                return {...tc, 'function': {...fn, 'name': sn}};
+                return {
+                  ...tc,
+                  'function': {...fn, 'name': sn},
+                };
               }
             }
             return tc;
@@ -281,15 +314,20 @@ class Zen {
       final fn = tcf['function'] as Map;
       final sn = reverse[fn['name']?.toString()];
       if (sn != null) {
-        body['tool_choice'] = {...tcf, 'function': {...fn, 'name': sn}};
+        body['tool_choice'] = {
+          ...tcf,
+          'function': {...fn, 'name': sn},
+        };
       }
     }
     return map;
   }
 
   /// 响应回映：把 chunk（delta/message 的 tool_calls）里的截断工具名换回原名
-  static void restoreToolNames(Map<String, dynamic> chunk,
-      Map<String, String> map) {
+  static void restoreToolNames(
+    Map<String, dynamic> chunk,
+    Map<String, String> map,
+  ) {
     if (map.isEmpty) return;
     final choices = chunk['choices'];
     if (choices is! List) return;
@@ -341,8 +379,10 @@ class Zen {
   /// 非诱饵条目返回可能被修剪过（去掉误入的诱饵增量）的行。
   /// chunkJson 为已解码的 chunk Map；injected 为本代理补加的工具名集合。
   static Map<String, dynamic>? filterDecoyChunk(
-      Map<String, dynamic> chunk, Set<String> injected,
-      {Map<int, bool>? decoyIndex}) {
+    Map<String, dynamic> chunk,
+    Set<String> injected, {
+    Map<int, bool>? decoyIndex,
+  }) {
     if (injected.isEmpty) return chunk;
     final dm = decoyIndex ?? <int, bool>{};
     final choices = chunk['choices'];
@@ -360,11 +400,13 @@ class Zen {
           final kept = <Object>[];
           for (final tc in (m['tool_calls'] as List)) {
             final idx = tc is Map ? tc['index'] : null;
-            final isDecoy = _isDecoyEntry(tc) ||
-                (idx is int && dm[idx] == true);
+            final isDecoy =
+                _isDecoyEntry(tc) || (idx is int && dm[idx] == true);
             if (idx is int && !dm.containsKey(idx)) {
-              dm[idx] = _isDecoyEntry(tc) ||
-                  (tc is Map && tc['function'] is Map &&
+              dm[idx] =
+                  _isDecoyEntry(tc) ||
+                  (tc is Map &&
+                      tc['function'] is Map &&
                       injected.contains('${(tc['function'] as Map)['name']}'));
             }
             if (isDecoy) continue;
@@ -379,8 +421,8 @@ class Zen {
       }
       // 若 delta/message 已空且 finish_reason 也为空，整条 choice 可丢
       final d = cm['delta'];
-      final emptyDelta = d is Map &&
-          d.isEmpty; // content/reasoning/tool_calls 都被摘除
+      final emptyDelta =
+          d is Map && d.isEmpty; // content/reasoning/tool_calls 都被摘除
       if (!(emptyDelta && cm['finish_reason'] == null)) newChoices.add(cm);
     }
     if (newChoices.isEmpty && chunk['usage'] == null) return null;
@@ -390,8 +432,11 @@ class Zen {
 
   /// 非流式客户端：把上游 SSE（强制 stream:true）聚合成一个 completion 对象。
   /// 诱饵工具调用（injected/decoy）在聚合结果 message 里整体丢弃。
-  static Map<String, dynamic> aggregate(List<Map<String, dynamic>> chunks,
-      String model, Set<String> injected) {
+  static Map<String, dynamic> aggregate(
+    List<Map<String, dynamic>> chunks,
+    String model,
+    Set<String> injected,
+  ) {
     final text = StringBuffer();
     final reasoning = StringBuffer();
     final toolCallsByIndex = <int, Map<String, dynamic>>{};
@@ -403,7 +448,9 @@ class Zen {
     for (final j in chunks) {
       id ??= j['id'] as String?;
       created ??= j['created'] as int?;
-      if (j['usage'] is Map) usage = Map<String, dynamic>.from(j['usage'] as Map);
+      if (j['usage'] is Map) {
+        usage = Map<String, dynamic>.from(j['usage'] as Map);
+      }
       for (final c in (j['choices'] as List? ?? const [])) {
         if (c is! Map) continue;
         if (c['finish_reason'] != null) finish = c['finish_reason'] as String?;
@@ -415,20 +462,26 @@ class Zen {
         }
         for (final tc in (delta['tool_calls'] as List? ?? const [])) {
           if (tc is! Map) continue;
-          final idx = (tc['index'] is int) ? tc['index'] as int : toolCallsByIndex.length;
+          final idx = (tc['index'] is int)
+              ? tc['index'] as int
+              : toolCallsByIndex.length;
           final fn = tc['function'];
-          final isDecoy = _isDecoyEntry(tc) ||
+          final isDecoy =
+              _isDecoyEntry(tc) ||
               (fn is Map && injected.contains('${fn['name']}')) ||
               decoyIdx.contains(idx);
           if (isDecoy) {
             decoyIdx.add(idx);
             continue;
           }
-          final slot = toolCallsByIndex.putIfAbsent(idx, () => <String, dynamic>{
-                'id': tc['id'],
-                'type': 'function',
-                'function': {'name': null, 'arguments': ''},
-              });
+          final slot = toolCallsByIndex.putIfAbsent(
+            idx,
+            () => <String, dynamic>{
+              'id': tc['id'],
+              'type': 'function',
+              'function': {'name': null, 'arguments': ''},
+            },
+          );
           slot['id'] ??= tc['id'];
           if (fn is Map) {
             if (fn['name'] != null) {
@@ -451,7 +504,9 @@ class Zen {
       'role': 'assistant',
       'content': text.isEmpty ? null : text.toString(),
     };
-    if (reasoning.isNotEmpty) message['reasoning_content'] = reasoning.toString();
+    if (reasoning.isNotEmpty) {
+      message['reasoning_content'] = reasoning.toString();
+    }
     if (toolCallsByIndex.isNotEmpty) {
       final ordered = (toolCallsByIndex.keys.toList()..sort())
           .map((i) => toolCallsByIndex[i]!)
@@ -467,8 +522,9 @@ class Zen {
         {
           'index': 0,
           'message': message,
-          'finish_reason': finish ?? (toolCallsByIndex.isNotEmpty ? 'tool_calls' : 'stop'),
-        }
+          'finish_reason':
+              finish ?? (toolCallsByIndex.isNotEmpty ? 'tool_calls' : 'stop'),
+        },
       ],
       'usage': ?usage,
     };

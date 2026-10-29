@@ -1,18 +1,59 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zeroapi/gateway/zen.dart';
 import 'package:zeroapi/gateway/config.dart';
+import 'package:zeroapi/gateway/socksrelay.dart';
 
 void main() {
   group('出口代理池解析', () {
-    test('开关关/空→直连；http/socks5 归一为 findProxy 格式；逗号分隔成池', () {
+    test('开关关/空→直连；http/socks5 归一为带 scheme 条目；逗号/换行成池', () {
       UpstreamDef mk(String p, {bool on = true}) => UpstreamDef(
-          id: 'z', baseUrl: 'https://x/v1', proxy: p, proxyEnabled: on);
+        id: 'z',
+        baseUrl: 'https://x/v1',
+        proxy: p,
+        proxyEnabled: on,
+      );
       expect(mk('').proxyPool, isEmpty);
       expect(mk('http://127.0.0.1:7890', on: false).proxyPool, isEmpty);
-      expect(mk('socks5://127.0.0.1:7891').proxyPool, ['SOCKS5 127.0.0.1:7891']);
-      expect(mk('http://127.0.0.1:7890').proxyPool, ['PROXY 127.0.0.1:7890']);
-      expect(mk('127.0.0.1:7890, socks5://1.2.3.4:1080').proxyPool,
-          ['PROXY 127.0.0.1:7890', 'SOCKS5 1.2.3.4:1080']);
+      expect(mk('socks5://127.0.0.1:7891').proxyPool, [
+        'socks5://127.0.0.1:7891',
+      ]);
+      expect(mk('http://127.0.0.1:7890').proxyPool, ['http://127.0.0.1:7890']);
+      // 无 scheme 的裸 host:port 按 http 处理；缺端口补默认端口
+      expect(mk('127.0.0.1:7890, socks5://1.2.3.4').proxyPool, [
+        'http://127.0.0.1:7890',
+        'socks5://1.2.3.4:1080',
+      ]);
+      expect(mk('socks://u:p@h.example:1080/path').proxyPool, [
+        'socks5://u:p@h.example:1080',
+      ]);
+    });
+
+    test('directives：http 项映射 PROXY；socks5 项解析为本地中转指令', () async {
+      final hub = SocksRelayHub();
+      UpstreamDef mk(String p) => UpstreamDef(
+        id: 'z',
+        baseUrl: 'https://x/v1',
+        proxy: p,
+        proxyEnabled: true,
+      );
+
+      expect(await mk('http://127.0.0.1:7890').directives(hub), [
+        'PROXY 127.0.0.1:7890',
+      ]);
+      expect(await mk('').directives(hub), isEmpty);
+
+      // 没有真实 SOCKS 服务器时 ensure() 仍能起本地监听（连接失败发生在转发时），
+      // 所以 socks5 项也会得到一条 PROXY <local> 指令
+      final d = await mk('socks5://127.0.0.1:1').directives(hub);
+      expect(d.length, 1);
+      expect(d.single, startsWith('PROXY 127.0.0.1:'));
+      expect(hub.directiveFor('socks5://127.0.0.1:1'), d.single);
+
+      // 混合池：http 在前、socks5 在后，顺序保持
+      final mixed = await mk('http://a:1, socks5://b:2').directives(hub);
+      expect(mixed.first, 'PROXY a:1');
+      expect(mixed.length, 2);
+      await hub.stopAll();
     });
   });
 
@@ -25,6 +66,24 @@ void main() {
       expect(Zen.isFreeModel('gpt-5.3-codex'), false);
       expect(Zen.isFreeModel('glm-5.3-flash'), false); // 无 -free 后缀=付费
     });
+
+    test('免费额度耗尽判定：额度类 vs 普通限流', () {
+      // 上游真实文案（2026-10-22 实测）
+      expect(
+        Zen.isQuotaExhausted(
+          'Free usage limit reached. Subscribe to OpenCode Go to keep going: '
+          'https://opencode.ai/go',
+        ),
+        true,
+      );
+      expect(Zen.isQuotaExhausted('free usage limit reached'), true);
+      expect(Zen.isQuotaExhausted('Quota exceeded'), true);
+      // 普通 IP 限流/风控不是额度耗尽：换出口 IP 或退避有机会恢复
+      expect(Zen.isQuotaExhausted('usage exceeds frequency limit'), false);
+      expect(Zen.isQuotaExhausted('too many requests'), false);
+      expect(Zen.isQuotaExhausted('abusive traffic detected'), false);
+      expect(Zen.isQuotaExhausted(''), false);
+    });
   });
 
   group('客户端指纹', () {
@@ -36,8 +95,7 @@ void main() {
         final body = sid.substring(4);
         expect(body.length, 26);
         expect(RegExp(r'^[0-9a-f]{12}').hasMatch(body), true);
-        expect(
-            RegExp(r'^[0-9A-Za-z]{14}$').hasMatch(body.substring(12)), true);
+        expect(RegExp(r'^[0-9A-Za-z]{14}$').hasMatch(body.substring(12)), true);
         final low12 = int.parse(body.substring(8, 12), radix: 16) & 0xfff;
         // low12 = 0xfff - counter，counter ∈ [0,63] → low12 ≥ 0xfc0
         expect(low12 >= 0xfc0, true, reason: 'counter>63: $sid');
@@ -64,11 +122,10 @@ void main() {
       final list = Zen.ensureFreeTools([
         {
           'type': 'function',
-          'function': {'name': 'bash', 'parameters': {}}
-        }
+          'function': {'name': 'bash', 'parameters': {}},
+        },
       ], injected);
-      final names =
-          list.map((t) => (t['function'] as Map)['name']).toList();
+      final names = list.map((t) => (t['function'] as Map)['name']).toList();
       expect(names, ['bash', 'glob', 'grep', 'read']);
       expect(injected, {'glob', 'grep', 'read'});
     });
@@ -88,12 +145,12 @@ void main() {
                   {
                     'index': 0,
                     'id': 'call_a',
-                    'function': {'name': 'read', 'arguments': '{"p'}
-                  }
-                ]
-              }
-            }
-          ]
+                    'function': {'name': 'read', 'arguments': '{"p'},
+                  },
+                ],
+              },
+            },
+          ],
         },
         {
           'choices': [
@@ -103,27 +160,34 @@ void main() {
                 'tool_calls': [
                   {
                     'index': 0,
-                    'function': {'arguments': '"x"}'}
+                    'function': {'arguments': '"x"}'},
                   },
                   {
                     'index': 1,
                     'id': 'call_b',
-                    'function': {'name': 'my_tool', 'arguments': '{}'}
-                  }
-                ]
-              }
-            }
-          ]
+                    'function': {'name': 'my_tool', 'arguments': '{}'},
+                  },
+                ],
+              },
+            },
+          ],
         },
         {
           'choices': [
-            {'index': 0, 'delta': {'content': 'he'}, 'finish_reason': null},
-            {'index': 0, 'delta': {'content': 'llo'}},
-            {'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}
-          ]
+            {
+              'index': 0,
+              'delta': {'content': 'he'},
+              'finish_reason': null,
+            },
+            {
+              'index': 0,
+              'delta': {'content': 'llo'},
+            },
+            {'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'},
+          ],
         },
         {
-          'usage': {'prompt_tokens': 7, 'completion_tokens': 3}
+          'usage': {'prompt_tokens': 7, 'completion_tokens': 3},
         },
       ];
       final agg = Zen.aggregate(chunks, 'big-pickle', {'glob', 'grep', 'read'});
@@ -142,50 +206,60 @@ void main() {
     test('诱饵增量被丢弃，正常工具与 content 透传', () {
       final injected = {'glob', 'grep', 'read'};
       final decoy = <int, bool>{};
-      final c1 = Zen.filterDecoyChunk({
-        'choices': [
-          {
-            'index': 0,
-            'delta': {
-              'tool_calls': [
-                {
-                  'index': 0,
-                  'id': 'x',
-                  'function': {'name': 'grep', 'arguments': ''}
-                }
-              ]
-            }
-          }
-        ]
-      }, injected, decoyIndex: decoy);
+      final c1 = Zen.filterDecoyChunk(
+        {
+          'choices': [
+            {
+              'index': 0,
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'id': 'x',
+                    'function': {'name': 'grep', 'arguments': ''},
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        injected,
+        decoyIndex: decoy,
+      );
       expect(c1, isNull); // 整条都是诱饵 → 丢弃
-      final c2 = Zen.filterDecoyChunk({
-        'choices': [
-          {
-            'index': 0,
-            'delta': {
-              'content': 'hi',
-              'tool_calls': [
-                {
-                  'index': 0,
-                  'function': {'arguments': '{"p"'} // grep 的后续增量
-                },
-                {
-                  'index': 1,
-                  'id': 'y',
-                  'function': {'name': 'client_tool', 'arguments': '{}'}
-                }
-              ]
-            }
-          }
-        ]
-      }, injected, decoyIndex: decoy);
+      final c2 = Zen.filterDecoyChunk(
+        {
+          'choices': [
+            {
+              'index': 0,
+              'delta': {
+                'content': 'hi',
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'function': {'arguments': '{"p"'}, // grep 的后续增量
+                  },
+                  {
+                    'index': 1,
+                    'id': 'y',
+                    'function': {'name': 'client_tool', 'arguments': '{}'},
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        injected,
+        decoyIndex: decoy,
+      );
       expect(c2, isNotNull);
       final d = (c2!['choices'] as List).first['delta'] as Map;
       expect(d['content'], 'hi');
       expect((d['tool_calls'] as List).length, 1);
-      expect(((d['tool_calls'] as List).first['function'] as Map)['name'],
-          'client_tool');
+      expect(
+        ((d['tool_calls'] as List).first['function'] as Map)['name'],
+        'client_tool',
+      );
     });
   });
 
@@ -199,14 +273,14 @@ void main() {
         ],
       };
       final fix = Zen.healBody(
-          'invalid request body: json: unknown field "enable_thinking"', body);
+        'invalid request body: json: unknown field "enable_thinking"',
+        body,
+      );
       expect(fix, contains('enable_thinking'));
       expect(body.containsKey('enable_thinking'), false);
-      final fix2 =
-          Zen.healBody('json: unknown field "cache_tag"', body);
+      final fix2 = Zen.healBody('json: unknown field "cache_tag"', body);
       expect(fix2, contains('cache_tag'));
-      expect(
-          (body['messages'] as List).first.containsKey('cache_tag'), false);
+      expect((body['messages'] as List).first.containsKey('cache_tag'), false);
       // 字段不存在时不谎报修复
       expect(Zen.healBody('json: unknown field "nope"', body), isNull);
     });
@@ -220,12 +294,28 @@ void main() {
         ],
       };
       final fix = Zen.healBody(
-          'The `reasoning_content` in the thinking mode must be passed back to the API.',
-          body);
+        'The `reasoning_content` in the thinking mode must be passed back to the API.',
+        body,
+      );
       expect(fix, contains('reasoning_content'));
       final msgs = body['messages'] as List;
       expect(msgs[1]['reasoning_content'], '');
       expect(msgs[2]['reasoning_content'], 'kept');
+    });
+
+    test('reasoning_content 为 null（客户端显式回传 null）也要注入空串', () {
+      final body = <String, dynamic>{
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+          {'role': 'assistant', 'content': 'x', 'reasoning_content': null},
+        ],
+      };
+      final fix = Zen.healBody(
+        'The `reasoning_content` in the thinking mode must be passed back to the API.',
+        body,
+      );
+      expect(fix, contains('1 条'));
+      expect((body['messages'] as List)[1]['reasoning_content'], '');
     });
 
     test('tool_call arguments 归一化为合法 JSON 对象字符串', () {
@@ -235,20 +325,22 @@ void main() {
             'role': 'assistant',
             'tool_calls': [
               {
-                'function': {'name': 'f', 'arguments': ''}
+                'function': {'name': 'f', 'arguments': ''},
               },
               {
-                'function': {'name': 'g', 'arguments': '{"a":1}'}
+                'function': {'name': 'g', 'arguments': '{"a":1}'},
               },
               {
-                'function': {'name': 'h', 'arguments': '[1,2]'}
+                'function': {'name': 'h', 'arguments': '[1,2]'},
               },
-            ]
+            ],
           },
         ],
       };
       final fix = Zen.healBody(
-          'Assistant tool call function.arguments must be a JSON object', body);
+        'Assistant tool call function.arguments must be a JSON object',
+        body,
+      );
       expect(fix, contains('arguments'));
       final tcs = ((body['messages'] as List).first['tool_calls'] as List);
       expect(tcs[0]['function']['arguments'], '{}');
@@ -265,18 +357,18 @@ void main() {
     final longName = 'mcp__plugin__${'x' * 57}'; // 70 字符
     final shortTool = {
       'type': 'function',
-      'function': {'name': 'bash', 'parameters': {}}
+      'function': {'name': 'bash', 'parameters': {}},
     };
     Map<String, dynamic> mkBody() => {
-          'model': 'big-pickle',
-          'tools': [
-            {
-              'type': 'function',
-              'function': {'name': longName, 'parameters': {}}
-            },
-            shortTool,
-          ],
-        };
+      'model': 'big-pickle',
+      'tools': [
+        {
+          'type': 'function',
+          'function': {'name': longName, 'parameters': {}},
+        },
+        shortTool,
+      ],
+    };
 
     test('超长名截断为 前缀-hash6（恰 64），短名原样保留不入 map', () {
       expect(longName.length, 70);
@@ -316,11 +408,20 @@ void main() {
     });
 
     test('名字含非法字符（# . : / 空格）也改写为合法名并回映', () {
-      final names = ['mcp__a#b', 'mcp__c.d', 'mcp__e:f', 'mcp__g/h', 'mcp__i j'];
+      final names = [
+        'mcp__a#b',
+        'mcp__c.d',
+        'mcp__e:f',
+        'mcp__g/h',
+        'mcp__i j',
+      ];
       final body = <String, dynamic>{
         'tools': [
           for (final n in names)
-            {'type': 'function', 'function': {'name': n, 'parameters': {}}},
+            {
+              'type': 'function',
+              'function': {'name': n, 'parameters': {}},
+            },
           shortTool,
         ],
       };
@@ -339,14 +440,23 @@ void main() {
     test('改写名不与表内已有的合法短名撞名', () {
       final probe = <String, dynamic>{
         'tools': [
-          {'type': 'function', 'function': {'name': longName, 'parameters': {}}},
+          {
+            'type': 'function',
+            'function': {'name': longName, 'parameters': {}},
+          },
         ],
       };
       final sn = Zen.shortenToolNames(probe).keys.single;
       final body = <String, dynamic>{
         'tools': [
-          {'type': 'function', 'function': {'name': longName, 'parameters': {}}},
-          {'type': 'function', 'function': {'name': sn, 'parameters': {}}},
+          {
+            'type': 'function',
+            'function': {'name': longName, 'parameters': {}},
+          },
+          {
+            'type': 'function',
+            'function': {'name': sn, 'parameters': {}},
+          },
         ],
       };
       final map = Zen.shortenToolNames(body);
@@ -360,11 +470,17 @@ void main() {
         {
           'role': 'assistant',
           'tool_calls': [
-            {'id': 'c1', 'function': {'name': longName, 'arguments': '{}'}}
-          ]
+            {
+              'id': 'c1',
+              'function': {'name': longName, 'arguments': '{}'},
+            },
+          ],
         },
       ];
-      body['tool_choice'] = {'type': 'function', 'function': {'name': longName}};
+      body['tool_choice'] = {
+        'type': 'function',
+        'function': {'name': longName},
+      };
 
       final map = Zen.shortenToolNames(body);
       final sn = map.keys.single;
@@ -393,17 +509,19 @@ void main() {
                 {
                   'index': 0,
                   'id': 'c1',
-                  'function': {'name': sn, 'arguments': '{'}
-                }
-              ]
-            }
-          }
-        ]
+                  'function': {'name': sn, 'arguments': '{'},
+                },
+              ],
+            },
+          },
+        ],
       };
       Zen.restoreToolNames(chunk, map);
-      final dFn = (((chunk['choices'] as List).first['delta'] as Map)['tool_calls']
-          as List)
-          .first['function'] as Map;
+      final dFn =
+          (((chunk['choices'] as List).first['delta'] as Map)['tool_calls']
+                      as List)
+                  .first['function']
+              as Map;
       expect(dFn['name'], longName);
       expect(dFn['arguments'], '{');
 
@@ -417,17 +535,19 @@ void main() {
                 {
                   'index': 0,
                   'id': 'c2',
-                  'function': {'name': sn, 'arguments': '{}'}
-                }
-              ]
-            }
-          }
-        ]
+                  'function': {'name': sn, 'arguments': '{}'},
+                },
+              ],
+            },
+          },
+        ],
       };
       Zen.restoreToolNames(msgChunk, map);
-      final mFn = (((msgChunk['choices'] as List).first['message'] as Map)['tool_calls']
-          as List)
-          .first['function'] as Map;
+      final mFn =
+          (((msgChunk['choices'] as List).first['message'] as Map)['tool_calls']
+                      as List)
+                  .first['function']
+              as Map;
       expect(mFn['name'], longName);
     });
 
@@ -441,26 +561,40 @@ void main() {
             'index': 0,
             'delta': {
               'tool_calls': [
-                {'index': 0, 'function': {'name': sn}}
-              ]
-            }
-          }
-        ]
+                {
+                  'index': 0,
+                  'function': {'name': sn},
+                },
+              ],
+            },
+          },
+        ],
       };
       Zen.restoreToolNames(frozen, {});
-      final fFn = (((frozen['choices'] as List).first['delta'] as Map)['tool_calls']
-          as List)
-          .first['function'] as Map;
+      final fFn =
+          (((frozen['choices'] as List).first['delta'] as Map)['tool_calls']
+                      as List)
+                  .first['function']
+              as Map;
       expect(fFn['name'], sn);
 
       expect(
-          () => Zen.restoreToolNames({'foo': 1}, {'a': 'b'}), returnsNormally);
+        () => Zen.restoreToolNames({'foo': 1}, {'a': 'b'}),
+        returnsNormally,
+      );
       expect(
-          () => Zen.restoreToolNames({'choices': 'nope'}, {'a': 'b'}),
-          returnsNormally);
+        () => Zen.restoreToolNames({'choices': 'nope'}, {'a': 'b'}),
+        returnsNormally,
+      );
       expect(
-          () => Zen.restoreToolNames({'choices': [null, 5, 3.14]}, {'a': 'b'}),
-          returnsNormally);
+        () => Zen.restoreToolNames(
+          {
+            'choices': [null, 5, 3.14],
+          },
+          {'a': 'b'},
+        ),
+        returnsNormally,
+      );
 
       final unknown = {
         'choices': [
@@ -470,17 +604,19 @@ void main() {
               'tool_calls': [
                 {
                   'index': 0,
-                  'function': {'name': 'other_tool', 'arguments': '{}'}
-                }
-              ]
-            }
-          }
-        ]
+                  'function': {'name': 'other_tool', 'arguments': '{}'},
+                },
+              ],
+            },
+          },
+        ],
       };
       Zen.restoreToolNames(unknown, map);
-      final uFn = (((unknown['choices'] as List).first['delta'] as Map)['tool_calls']
-          as List)
-          .first['function'] as Map;
+      final uFn =
+          (((unknown['choices'] as List).first['delta'] as Map)['tool_calls']
+                      as List)
+                  .first['function']
+              as Map;
       expect(uFn['name'], 'other_tool');
       expect(uFn['arguments'], '{}');
     });

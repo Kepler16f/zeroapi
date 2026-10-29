@@ -25,12 +25,14 @@ void main() {
       if (path.endsWith('/models')) {
         req.response
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode({
-            'data': [
-              {'id': 'gpt-test'},
-              {'id': 'other-model'},
-            ]
-          }));
+          ..write(
+            jsonEncode({
+              'data': [
+                {'id': 'gpt-test'},
+                {'id': 'other-model'},
+              ],
+            }),
+          );
         await req.response.close();
         return;
       }
@@ -39,24 +41,37 @@ void main() {
         if (body['stream'] == true) {
           // 含 CJK 与 em-dash 的流式输出：latin1 编码会在写响应体时抛
           // 'Contains invalid characters'，用于回归 SSE utf-8 修复
-          req.response.headers.contentType =
-              ContentType('text', 'event-stream', charset: 'utf-8');
-          req.response.add(utf8.encode(
-              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"你好 — 底层"}}]}\n\n'));
-          req.response.add(utf8.encode(
-              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\n'));
+          req.response.headers.contentType = ContentType(
+            'text',
+            'event-stream',
+            charset: 'utf-8',
+          );
+          req.response.add(
+            utf8.encode(
+              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"你好 — 底层"}}]}\n\n',
+            ),
+          );
+          req.response.add(
+            utf8.encode(
+              'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\n',
+            ),
+          );
           req.response.add(utf8.encode('data: [DONE]\n\n'));
           await req.response.close();
           return;
         }
         req.response
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode({
-            'choices': [
-              {'message': {'content': 'hello ${body['model']}'}}
-            ],
-            'usage': {'prompt_tokens': 10, 'completion_tokens': 5}
-          }));
+          ..write(
+            jsonEncode({
+              'choices': [
+                {
+                  'message': {'content': 'hello ${body['model']}'},
+                },
+              ],
+              'usage': {'prompt_tokens': 10, 'completion_tokens': 5},
+            }),
+          );
         await req.response.close();
         return;
       }
@@ -64,13 +79,15 @@ void main() {
         final body = jsonDecode(await utf8.decodeStream(req));
         req.response
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode({
-            'id': 'resp_1',
-            'object': 'response',
-            'model': body['model'],
-            'output': [],
-            'usage': {'input_tokens': 7, 'output_tokens': 3}
-          }));
+          ..write(
+            jsonEncode({
+              'id': 'resp_1',
+              'object': 'response',
+              'model': body['model'],
+              'output': [],
+              'usage': {'input_tokens': 7, 'output_tokens': 3},
+            }),
+          );
         await req.response.close();
         return;
       }
@@ -82,8 +99,13 @@ void main() {
     runtime = UpstreamRuntime(def);
     await runtime.probe();
     registry = ModelRegistry()..rebuild([runtime]);
-    proxy = ProxyServer('127.0.0.1', 0, 'sk-gw', registry,
-        usageDir: usageDir.path);
+    proxy = ProxyServer(
+      '127.0.0.1',
+      0,
+      'sk-gw',
+      registry,
+      usageDir: usageDir.path,
+    );
     await proxy.start();
   });
 
@@ -95,10 +117,15 @@ void main() {
     } catch (_) {}
   });
 
-  Future<HttpClientResponse> gw(String method, String path,
-      [Object? json]) async {
+  Future<HttpClientResponse> gw(
+    String method,
+    String path, [
+    Object? json,
+  ]) async {
     final req = await client.openUrl(
-        method, Uri.parse('http://127.0.0.1:${proxy.boundPort}$path'));
+      method,
+      Uri.parse('http://127.0.0.1:${proxy.boundPort}$path'),
+    );
     req.headers.set('Authorization', 'Bearer sk-gw');
     if (json != null) {
       req.headers.contentType = ContentType.json;
@@ -114,16 +141,20 @@ void main() {
   });
 
   test('chat/completions 透传并翻译模型名', () async {
-    final resp = await gw('POST', '/v1/chat/completions',
-        {'model': 'fake/gpt-test', 'messages': []});
+    final resp = await gw('POST', '/v1/chat/completions', {
+      'model': 'fake/gpt-test',
+      'messages': [],
+    });
     expect(resp.statusCode, 200);
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(body['choices'][0]['message']['content'], 'hello gpt-test');
   });
 
   test('responses 透传并按 input/output_tokens 记账', () async {
-    final resp =
-        await gw('POST', '/v1/responses', {'model': 'fake/gpt-test', 'input': 'hi'});
+    final resp = await gw('POST', '/v1/responses', {
+      'model': 'fake/gpt-test',
+      'input': 'hi',
+    });
     expect(resp.statusCode, 200);
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(body['object'], 'response');
@@ -144,8 +175,10 @@ void main() {
       await runtime.probe();
       registry.rebuild([runtime]);
     };
-    final resp = await gw('POST', '/v1/chat/completions',
-        {'model': 'gpt-test', 'messages': []});
+    final resp = await gw('POST', '/v1/chat/completions', {
+      'model': 'gpt-test',
+      'messages': [],
+    });
     expect(resp.statusCode, 200);
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(body['choices'][0]['message']['content'], 'hello gpt-test');
@@ -157,16 +190,22 @@ void main() {
       await runtime.probe();
       registry.rebuild([runtime]);
     };
-    final resp = await gw('POST', '/v1/chat/completions',
-        {'model': 'truly-unknown', 'messages': []});
+    final resp = await gw('POST', '/v1/chat/completions', {
+      'model': 'truly-unknown',
+      'messages': [],
+    });
     expect(resp.statusCode, 404);
   });
 
   test('usageRange 今日聚合含内存记账与小时趋势', () async {
-    await gw('POST', '/v1/chat/completions',
-        {'model': 'fake/gpt-test', 'messages': []});
-    await gw('POST', '/v1/chat/completions',
-        {'model': 'gpt-test', 'messages': []});
+    await gw('POST', '/v1/chat/completions', {
+      'model': 'fake/gpt-test',
+      'messages': [],
+    });
+    await gw('POST', '/v1/chat/completions', {
+      'model': 'gpt-test',
+      'messages': [],
+    });
     final s = await proxy.usageRange(days: 1);
     expect(s.requests, greaterThanOrEqualTo(2));
     // 带前缀与裸名归一到同一规范名：合并为 gpt-test 两条，不再分裂
@@ -181,18 +220,24 @@ void main() {
   });
 
   test('SSE 含 CJK 不崩：/v1/messages 流式（Anthropic 转换路径）完整读回', () async {
-    final req = await client.openUrl('POST',
-        Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/messages'));
+    final req = await client.openUrl(
+      'POST',
+      Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/messages'),
+    );
     req.headers.set('Authorization', 'Bearer sk-gw');
     req.headers.contentType = ContentType.json;
-    req.add(utf8.encode(jsonEncode({
-      'model': 'fake/gpt-test',
-      'messages': [
-        {'role': 'user', 'content': 'hi'}
-      ],
-      'stream': true,
-      'max_tokens': 64,
-    })));
+    req.add(
+      utf8.encode(
+        jsonEncode({
+          'model': 'fake/gpt-test',
+          'messages': [
+            {'role': 'user', 'content': 'hi'},
+          ],
+          'stream': true,
+          'max_tokens': 64,
+        }),
+      ),
+    );
     final resp = await req.close();
     expect(resp.statusCode, 200);
     expect(resp.headers.contentType?.charset?.toLowerCase(), 'utf-8');
@@ -204,8 +249,11 @@ void main() {
   });
 
   test('SSE 含 CJK 不崩：/v1/chat/completions 流式（透传字节路径）', () async {
-    final resp = await gw('POST', '/v1/chat/completions',
-        {'model': 'fake/gpt-test', 'messages': [], 'stream': true});
+    final resp = await gw('POST', '/v1/chat/completions', {
+      'model': 'fake/gpt-test',
+      'messages': [],
+      'stream': true,
+    });
     expect(resp.statusCode, 200);
     expect(resp.headers.contentType?.charset?.toLowerCase(), 'utf-8');
     final text = await utf8.decodeStream(resp);
@@ -221,10 +269,12 @@ void main() {
     final tDay = DateTime.now().toIso8601String().substring(0, 10);
     // 昨天的文件（先写，文件名字典序在前）——两个文件才会触发 sort 比较
     File('${dir.path}/usage-$yDay.jsonl').writeAsStringSync(
-        '${jsonEncode({'ts': '${yDay}T10:00:00.000', 'model': 'old-m', 'upstream': 'zen', 'prompt': 100, 'completion': 50, 'error': false})}\n');
+      '${jsonEncode({'ts': '${yDay}T10:00:00.000', 'model': 'old-m', 'upstream': 'zen', 'prompt': 100, 'completion': 50, 'error': false})}\n',
+    );
     // 今天已有内存记账（setUp 的 proxy 处理过 fake 请求）；再加备份文件不得计入
     File('${dir.path}/usage-$tDay.jsonl.bak-x').writeAsStringSync(
-        '${jsonEncode({'ts': '${tDay}T09:00:00.000', 'model': 'ghost', 'upstream': 'zen', 'prompt': 999999, 'completion': 999999, 'error': false})}\n');
+      '${jsonEncode({'ts': '${tDay}T09:00:00.000', 'model': 'ghost', 'upstream': 'zen', 'prompt': 999999, 'completion': 999999, 'error': false})}\n',
+    );
     final s7 = await proxy.usageRange(days: 7);
     expect(s7.byModel['old-m'], 1);
     expect(s7.promptTokens, greaterThanOrEqualTo(100));
@@ -235,7 +285,9 @@ void main() {
 
   test('错误网关 key 返回 401', () async {
     final req = await client.openUrl(
-        'POST', Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/responses'));
+      'POST',
+      Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/responses'),
+    );
     req.headers.set('Authorization', 'Bearer wrong');
     req.headers.contentType = ContentType.json;
     req.add(utf8.encode(jsonEncode({'model': 'fake/gpt-test'})));
@@ -245,18 +297,26 @@ void main() {
 
   test('密钥池：任意一把命中即放行，未知 key 401', () async {
     final dir2 = await Directory.systemTemp.createTemp('zeroapi-test-');
-    final p2 = ProxyServer('127.0.0.1', 0, 'sk-gw', registry,
-        usageDir: dir2.path,
-        keys: [GatewayKey('默认', 'sk-gw'), GatewayKey('手机', 'sk-phone')]);
+    final p2 = ProxyServer(
+      '127.0.0.1',
+      0,
+      'sk-gw',
+      registry,
+      usageDir: dir2.path,
+      keys: [GatewayKey('默认', 'sk-gw'), GatewayKey('手机', 'sk-phone')],
+    );
     await p2.start();
     Future<int> callWith(String key) async {
       final req = await client.openUrl(
-          'GET', Uri.parse('http://127.0.0.1:${p2.boundPort}/v1/models'));
+        'GET',
+        Uri.parse('http://127.0.0.1:${p2.boundPort}/v1/models'),
+      );
       req.headers.set('Authorization', 'Bearer $key');
       final r = await req.close();
       await r.drain();
       return r.statusCode;
     }
+
     expect(await callWith('sk-gw'), 200);
     expect(await callWith('sk-phone'), 200);
     expect(await callWith('nope'), 401);
@@ -264,15 +324,15 @@ void main() {
     dir2.deleteSync(recursive: true);
   });
 
-  test('/v1/models 去重：同一模型只出现一条且优先裸名', () async {
+  test('/v1/models 去重：同一模型只出现一条且优先来源前缀调用名', () async {
     final resp = await gw('GET', '/v1/models');
     final ids =
         ((jsonDecode(await utf8.decodeStream(resp)) as Map)['data'] as List)
             .map((m) => m['id'] as String)
             .toList();
-    // fake 供应商的 gpt-test：裸名可用 → 只暴露 gpt-test，不再有 fake/gpt-test
-    expect(ids, contains('gpt-test'));
-    expect(ids.contains('fake/gpt-test'), false);
+    // 规范调用名是 <来源>/<模型>；裸名只作为兼容入口保留，不在清单里重复出现
+    expect(ids, contains('fake/gpt-test'));
+    expect(ids.contains('gpt-test'), false);
     expect(ids.toSet().length, ids.length, reason: '不应有重复条目');
   });
 
@@ -298,8 +358,13 @@ void main() {
       mode: FileMode.append,
     );
     // 模拟重启：全新 ProxyServer 启动即带回今天的记账
-    final p2 = ProxyServer('127.0.0.1', 0, 'sk-gw', ModelRegistry(),
-        usageDir: usageDir.path);
+    final p2 = ProxyServer(
+      '127.0.0.1',
+      0,
+      'sk-gw',
+      ModelRegistry(),
+      usageDir: usageDir.path,
+    );
     await p2.start();
     expect(p2.usageToday.requests, greaterThanOrEqualTo(3));
     expect(p2.usageToday.errors, greaterThanOrEqualTo(1));

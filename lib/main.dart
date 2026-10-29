@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import 'account_page.dart';
 import 'gateway/service.dart';
 import 'pages.dart';
 
@@ -56,9 +58,18 @@ class _HomePageState extends State<HomePage> {
   bool _banPromptOpen = false;
   DateTime _lastBanPrompt = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// 原生 → Dart 通道：托盘菜单的「重启网关」由此进来
+  static const _hostChannel = MethodChannel('zeroapi/host');
+
   @override
   void initState() {
     super.initState();
+    _hostChannel.setMethodCallHandler((call) async {
+      if (call.method == 'restartGateway') {
+        await _restartGateway();
+      }
+      return null;
+    });
     // 出口 IP 被封时（每次封锁只问一次）：征询用户启用出口代理/部署 Worker
     widget.service.onIpBanDetected = (upstreamId) {
       if (_banPromptOpen || !mounted) return;
@@ -71,8 +82,7 @@ class _HomePageState extends State<HomePage> {
           .toList();
       final u = zen.isEmpty ? null : zen.first;
       // 已启用出口代理时：还没切 Worker 才建议部署；都配齐了不再打扰
-      final viaWorker =
-          u != null && !u.baseUrl.contains('opencode.ai');
+      final viaWorker = u != null && !u.baseUrl.contains('opencode.ai');
       if (u == null || (u.proxyEnabled && viaWorker)) return;
       _banPromptOpen = true;
       // 等当前帧结束再弹（回调来自网关 isolate 事件）
@@ -82,32 +92,37 @@ class _HomePageState extends State<HomePage> {
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('出口 IP 被上游临时封锁'),
-            content: Text(u.proxyEnabled
-                ? '已开启出口代理但当前出口仍被 OpenCode 标记。\n\n'
-                    '建议「一键部署 Cloudflare Worker」：流量走 Cloudflare 的'
-                    '海量边缘 IP 池，OpenCode 封不完，比机场固定节点更稳'
-                    '（免费账号即可；workers.dev 域名仍需借助当前代理可达）。'
-                    '或者在代理端换一个干净的节点/地区。'
-                : 'OpenCode 检测到本机出口 IP 的滥用流量，免费通道暂时不可用'
-                    '（与账号无关，多为短时风控）。\n\n要开启「出口换 IP」吗？'
-                    '两种方式任选其一：\n'
-                    '· 设置 → 出口代理：填本地代理地址（如 Clash 的 127.0.0.1:7890），'
-                    '经代理换干净 IP\n'
-                    '· 一键部署 Cloudflare Worker：流量走 Cloudflare 的海量边缘 IP，'
-                    '最稳（免费账号即可；workers.dev 域名需借助代理可达）'),
+            content: Text(
+              u.proxyEnabled
+                  ? '已开启出口代理但当前出口仍被 OpenCode 标记。\n\n'
+                        '建议「一键部署 Cloudflare Worker」：流量走 Cloudflare 的'
+                        '海量边缘 IP 池，OpenCode 封不完，比机场固定节点更稳'
+                        '（免费账号即可；workers.dev 域名仍需借助当前代理可达）。'
+                        '或者在代理端换一个干净的节点/地区。'
+                  : 'OpenCode 检测到本机出口 IP 的滥用流量，免费通道暂时不可用'
+                        '（与账号无关，多为短时风控）。\n\n要开启「出口换 IP」吗？'
+                        '两种方式任选其一：\n'
+                        '· 设置 → 出口代理：填本地代理地址（如 Clash 的 127.0.0.1:7890），'
+                        '经代理换干净 IP\n'
+                        '· 一键部署 Cloudflare Worker：流量走 Cloudflare 的海量边缘 IP，'
+                        '最稳（免费账号即可；workers.dev 域名需借助代理可达）',
+            ),
             actions: [
               TextButton(
-                  onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text('暂不处理')),
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('暂不处理'),
+              ),
               FilledButton(
-                  onPressed: () => Navigator.pop(ctx, true),
-                  child: const Text('去设置')),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('去设置'),
+              ),
             ],
           ),
         );
         _banPromptOpen = false;
         if (go == true && mounted) {
-          setState(() => _index = 3); // 切到「设置」tab（出口代理/一键部署都在那）
+          // 「账号」页插在「用量」之后，设置页下标由 4 变成 5
+          setState(() => _index = 5); // 切到「设置」tab（出口代理/一键部署都在那）
         }
       });
     };
@@ -116,7 +131,26 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     widget.service.onIpBanDetected = null;
+    _hostChannel.setMethodCallHandler(null);
     super.dispose();
+  }
+
+  Future<void> _restartGateway() async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('正在重启网关…'), duration: Duration(seconds: 2)),
+    );
+    await widget.service.restartServer();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          widget.service.running
+              ? '网关已重启'
+              : '网关重启失败：${widget.service.startError ?? '未知原因'}',
+        ),
+      ),
+    );
   }
 
   @override
@@ -130,39 +164,52 @@ class _HomePageState extends State<HomePage> {
           UpstreamsPage(service: s),
           ModelsPage(service: s),
           UsagePage(service: s),
+          AccountPage(service: s),
+          ProxyPoolPage(service: s),
           SettingsPage(service: s),
         ];
         return Scaffold(
           appBar: AppBar(
             title: Row(
               children: [
-                const Text('ZeroApi',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text(
+                  'ZeroApi',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
                 const SizedBox(width: 12),
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
                   decoration: BoxDecoration(
-                    color:
-                        s.running ? cs.secondaryContainer : cs.errorContainer,
+                    color: s.running
+                        ? cs.secondaryContainer
+                        : cs.errorContainer,
                     borderRadius: BorderRadius.circular(20),
                   ),
-                  child: Row(children: [
-                    Icon(s.running ? Icons.check_circle : Icons.error,
+                  child: Row(
+                    children: [
+                      Icon(
+                        s.running ? Icons.check_circle : Icons.error,
                         size: 14,
-                        color: s.running ? Colors.green : cs.error),
-                    const SizedBox(width: 6),
-                    Text(s.running ? '网关运行中' : '未运行',
-                        style: const TextStyle(fontSize: 12)),
-                  ]),
+                        color: s.running ? Colors.green : cs.error,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        s.running ? '网关运行中' : '未运行',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
             actions: [
               IconButton(
-                tooltip: '立即刷新供应商与路由',
-                icon: const Icon(Icons.refresh),
-                onPressed: () => s.refreshRoutesNow(),
+                tooltip: '重启网关',
+                icon: const Icon(Icons.restart_alt),
+                onPressed: _restartGateway,
               ),
               const SizedBox(width: 8),
             ],
@@ -177,21 +224,35 @@ class _HomePageState extends State<HomePage> {
                 minExtendedWidth: 150,
                 destinations: const [
                   NavigationRailDestination(
-                      icon: Icon(Icons.dns_outlined),
-                      selectedIcon: Icon(Icons.dns),
-                      label: Text('供应商')),
+                    icon: Icon(Icons.dns_outlined),
+                    selectedIcon: Icon(Icons.dns),
+                    label: Text('供应商'),
+                  ),
                   NavigationRailDestination(
-                      icon: Icon(Icons.view_list_outlined),
-                      selectedIcon: Icon(Icons.view_list),
-                      label: Text('模型')),
+                    icon: Icon(Icons.view_list_outlined),
+                    selectedIcon: Icon(Icons.view_list),
+                    label: Text('模型'),
+                  ),
                   NavigationRailDestination(
-                      icon: Icon(Icons.query_stats_outlined),
-                      selectedIcon: Icon(Icons.query_stats),
-                      label: Text('用量')),
+                    icon: Icon(Icons.query_stats_outlined),
+                    selectedIcon: Icon(Icons.query_stats),
+                    label: Text('用量'),
+                  ),
                   NavigationRailDestination(
-                      icon: Icon(Icons.settings_outlined),
-                      selectedIcon: Icon(Icons.settings),
-                      label: Text('设置')),
+                    icon: Icon(Icons.manage_accounts_outlined),
+                    selectedIcon: Icon(Icons.manage_accounts),
+                    label: Text('账号'),
+                  ),
+                  NavigationRailDestination(
+                    icon: Icon(Icons.alt_route_outlined),
+                    selectedIcon: Icon(Icons.alt_route),
+                    label: Text('代理'),
+                  ),
+                  NavigationRailDestination(
+                    icon: Icon(Icons.settings_outlined),
+                    selectedIcon: Icon(Icons.settings),
+                    label: Text('设置'),
+                  ),
                 ],
               ),
               const VerticalDivider(width: 1),

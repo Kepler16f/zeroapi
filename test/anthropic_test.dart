@@ -20,8 +20,8 @@ void main() {
           {
             'role': 'assistant',
             'content': [
-              {'type': 'text', 'text': '回答'}
-            ]
+              {'type': 'text', 'text': '回答'},
+            ],
           },
           {'role': 'user', 'content': '继续'},
         ],
@@ -46,23 +46,24 @@ void main() {
                 'type': 'tool_use',
                 'id': 't1',
                 'name': 'get_weather',
-                'input': {'city': 'Beijing'}
-              }
-            ]
+                'input': {'city': 'Beijing'},
+              },
+            ],
           },
           {
             'role': 'user',
             'content': [
-              {'type': 'tool_result', 'tool_use_id': 't1', 'content': '晴'}
-            ]
+              {'type': 'tool_result', 'tool_use_id': 't1', 'content': '晴'},
+            ],
           },
         ],
       });
       final msgs = oai['messages'] as List;
       final asst = msgs.firstWhere((m) => m['role'] == 'assistant');
       expect(asst['tool_calls'][0]['function']['name'], 'get_weather');
-      expect(jsonDecode(asst['tool_calls'][0]['function']['arguments']),
-          {'city': 'Beijing'});
+      expect(jsonDecode(asst['tool_calls'][0]['function']['arguments']), {
+        'city': 'Beijing',
+      });
       final tool = msgs.firstWhere((m) => m['role'] == 'tool');
       expect(tool['tool_call_id'], 't1');
       expect(tool['content'], '晴');
@@ -72,14 +73,14 @@ void main() {
       final oai = AnthropicAdapter.toOpenAIRequest({
         'model': 'm',
         'messages': [
-          {'role': 'user', 'content': 'x'}
+          {'role': 'user', 'content': 'x'},
         ],
         'tools': [
           {
             'name': 'f',
             'description': 'd',
-            'input_schema': {'type': 'object'}
-          }
+            'input_schema': {'type': 'object'},
+          },
         ],
         'stop_sequences': ['END'],
       });
@@ -100,7 +101,7 @@ void main() {
             'content': [
               {'type': 'thinking', 'thinking': '内部推理'},
               {'type': 'text', 'text': '回答'},
-            ]
+            ],
           },
         ],
       });
@@ -120,8 +121,8 @@ void main() {
         'choices': [
           {
             'message': {'role': 'assistant', 'content': 'Hi'},
-            'finish_reason': 'stop'
-          }
+            'finish_reason': 'stop',
+          },
         ],
         'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
       });
@@ -147,15 +148,12 @@ void main() {
                 {
                   'id': 'c1',
                   'type': 'function',
-                  'function': {
-                    'name': 'f',
-                    'arguments': '{"a":1}'
-                  }
-                }
-              ]
+                  'function': {'name': 'f', 'arguments': '{"a":1}'},
+                },
+              ],
             },
-            'finish_reason': 'tool_calls'
-          }
+            'finish_reason': 'tool_calls',
+          },
         ],
         'usage': {'prompt_tokens': 1, 'completion_tokens': 1},
       });
@@ -173,8 +171,8 @@ void main() {
         'choices': [
           {
             'message': {'content': 't'},
-            'finish_reason': 'length'
-          }
+            'finish_reason': 'length',
+          },
         ],
         'usage': {},
       });
@@ -184,16 +182,24 @@ void main() {
 
   test('Anthropic 流式转换器产出合法事件序列', () {
     final t = AnthropicAdapter.streamTransformer('m');
-    final e1 = t.feed(jsonEncode({
-      'choices': [
-        {'delta': {'content': 'Hel'}}
-      ]
-    }));
-    final e2 = t.feed(jsonEncode({
-      'choices': [
-        {'delta': {'content': 'lo'}}
-      ]
-    }));
+    final e1 = t.feed(
+      jsonEncode({
+        'choices': [
+          {
+            'delta': {'content': 'Hel'},
+          },
+        ],
+      }),
+    );
+    final e2 = t.feed(
+      jsonEncode({
+        'choices': [
+          {
+            'delta': {'content': 'lo'},
+          },
+        ],
+      }),
+    );
     final e3 = t.finish();
     final all = [...e1, ...e2, ...e3].join();
     expect(all, contains('message_start'));
@@ -223,37 +229,46 @@ void main() {
         if (path.endsWith('/models')) {
           req.response
             ..headers.contentType = ContentType.json
-            ..write(jsonEncode({
-              'data': [
-                {'id': 'mm', 'owned_by': 'opencode'}
-              ]
-            }));
+            ..write(
+              jsonEncode({
+                'data': [
+                  {'id': 'mm', 'owned_by': 'opencode'},
+                ],
+              }),
+            );
         } else if (path.endsWith('/chat/completions')) {
           final body = jsonDecode(await utf8.decodeStream(req));
           req.response
             ..headers.contentType = ContentType.json
-            ..write(jsonEncode({
-              'id': 'chatcmpl-1',
-              'model': body['model'],
-              'choices': [
-                {
-                  'message': {
-                    'role': 'assistant',
-                    'content': 'echo:${(body['messages'] as List).last['content']}'
+            ..write(
+              jsonEncode({
+                'id': 'chatcmpl-1',
+                'model': body['model'],
+                'choices': [
+                  {
+                    'message': {
+                      'role': 'assistant',
+                      'content':
+                          'echo:${(body['messages'] as List).last['content']}',
+                    },
+                    'finish_reason': 'stop',
                   },
-                  'finish_reason': 'stop'
-                }
-              ],
-              'usage': {'prompt_tokens': 3, 'completion_tokens': 4},
-            }));
+                ],
+                'usage': {'prompt_tokens': 3, 'completion_tokens': 4},
+              }),
+            );
         }
         await req.response.close();
       });
       final rt = UpstreamRuntime(UpstreamDef(id: 'fake', baseUrl: baseUrl));
       await rt.probe();
       proxy = ProxyServer(
-          '127.0.0.1', 0, 'sk-gw', ModelRegistry()..rebuild([rt]),
-          usageDir: usageDir.path);
+        '127.0.0.1',
+        0,
+        'sk-gw',
+        ModelRegistry()..rebuild([rt]),
+        usageDir: usageDir.path,
+      );
       await proxy.start();
     });
 
@@ -266,21 +281,28 @@ void main() {
     });
 
     test('非流式 messages 请求返回 Anthropic 结构', () async {
-      final req = await client.openUrl('POST',
-          Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/messages'));
+      final req = await client.openUrl(
+        'POST',
+        Uri.parse('http://127.0.0.1:${proxy.boundPort}/v1/messages'),
+      );
       req.headers.set('x-api-key', 'sk-gw');
       req.headers.set('anthropic-version', '2023-06-01');
       req.headers.contentType = ContentType.json;
-      req.add(utf8.encode(jsonEncode({
-        'model': 'fake/mm',
-        'max_tokens': 50,
-        'messages': [
-          {'role': 'user', 'content': 'hi'}
-        ],
-      })));
+      req.add(
+        utf8.encode(
+          jsonEncode({
+            'model': 'fake/mm',
+            'max_tokens': 50,
+            'messages': [
+              {'role': 'user', 'content': 'hi'},
+            ],
+          }),
+        ),
+      );
       final resp = await req.close();
       expect(resp.statusCode, 200);
-      final j = jsonDecode(await utf8.decodeStream(resp)) as Map<String, dynamic>;
+      final j =
+          jsonDecode(await utf8.decodeStream(resp)) as Map<String, dynamic>;
       expect(j['type'], 'message');
       expect(j['role'], 'assistant');
       expect((j['content'] as List).first['type'], 'text');
@@ -290,11 +312,19 @@ void main() {
 
     test('anthropicEnabled=false 时 /v1/messages 返回 404', () async {
       final rt = UpstreamRuntime(UpstreamDef(id: 'x', baseUrl: baseUrl));
-      final p2 = ProxyServer('127.0.0.1', 0, 'k', ModelRegistry()..rebuild([rt]),
-          anthropicEnabled: false, usageDir: usageDir.path);
+      final p2 = ProxyServer(
+        '127.0.0.1',
+        0,
+        'k',
+        ModelRegistry()..rebuild([rt]),
+        anthropicEnabled: false,
+        usageDir: usageDir.path,
+      );
       await p2.start();
-      final req = await client.openUrl('POST',
-          Uri.parse('http://127.0.0.1:${p2.boundPort}/v1/messages'));
+      final req = await client.openUrl(
+        'POST',
+        Uri.parse('http://127.0.0.1:${p2.boundPort}/v1/messages'),
+      );
       req.headers.set('Authorization', 'Bearer k');
       req.headers.contentType = ContentType.json;
       req.add(utf8.encode(jsonEncode({'model': 'x/mm', 'messages': []})));
@@ -309,7 +339,14 @@ void main() {
     final info = ModelInfo.fromMaps(
       {'id': 'mm'},
       ModelsDev.instance.lookup('opencode', 'nonexistent-model') ??
-          {'limit': {'context': 200000, 'output': 8000}, 'modalities': {'input': ['text', 'image']}, 'reasoning': true, 'cost': {'input': 0, 'output': 0}},
+          {
+            'limit': {'context': 200000, 'output': 8000},
+            'modalities': {
+              'input': ['text', 'image'],
+            },
+            'reasoning': true,
+            'cost': {'input': 0, 'output': 0},
+          },
     );
     expect(info.contextWindow, 200000);
     expect(info.maxOutputTokens, 8000);

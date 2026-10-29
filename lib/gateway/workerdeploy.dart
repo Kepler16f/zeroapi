@@ -25,11 +25,13 @@ class CfWorkerDeployer {
     final api = CloudflareApi(token);
     try {
       final code = await rootBundle.loadString(
-          'deploy/cloudflare-worker/index.js');
+        'deploy/cloudflare-worker/index.js',
+      );
       await api.deployScript(
-          accountId: accountId,
-          code: code,
-          compatibilityDate: '2026-10-01');
+        accountId: accountId,
+        code: code,
+        compatibilityDate: '2026-10-01',
+      );
       final sub = await api.subdomain(accountId);
       return 'https://${CloudflareApi.scriptName}.$sub.workers.dev';
     } finally {

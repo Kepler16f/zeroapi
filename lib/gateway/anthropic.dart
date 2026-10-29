@@ -19,15 +19,16 @@ class AnthropicAdapter {
     final tools = body['tools'] as List?;
     if (tools != null && tools.isNotEmpty) {
       out['tools'] = tools
-          .map((t) => {
-                'type': 'function',
-                'function': {
-                  'name': t['name'],
-                  if (t['description'] != null) 'description': t['description'],
-                  if (t['input_schema'] != null)
-                    'parameters': t['input_schema'],
-                }
-              })
+          .map(
+            (t) => {
+              'type': 'function',
+              'function': {
+                'name': t['name'],
+                if (t['description'] != null) 'description': t['description'],
+                if (t['input_schema'] != null) 'parameters': t['input_schema'],
+              },
+            },
+          )
           .toList();
     }
     final tc = body['tool_choice'];
@@ -36,9 +37,9 @@ class AnthropicAdapter {
         'auto' => 'auto',
         'any' => 'required',
         'tool' => {
-            'type': 'function',
-            'function': {'name': tc['name']}
-          },
+          'type': 'function',
+          'function': {'name': tc['name']},
+        },
         _ => 'auto',
       };
     }
@@ -52,8 +53,8 @@ class AnthropicAdapter {
       final text = system is String
           ? system
           : (system as List)
-              .map((b) => (b as Map)['text'] as String? ?? '')
-              .join('\n');
+                .map((b) => (b as Map)['text'] as String? ?? '')
+                .join('\n');
       if (text.isNotEmpty) msgs.add({'role': 'system', 'content': text});
     }
     for (final m in (body['messages'] as List? ?? const [])) {
@@ -89,7 +90,7 @@ class AnthropicAdapter {
                   : 'data:${src['media_type']};base64,${src['data']}';
               imageParts.add({
                 'type': 'image_url',
-                'image_url': {'url': url}
+                'image_url': {'url': url},
               });
             }
             break;
@@ -99,8 +100,8 @@ class AnthropicAdapter {
               'type': 'function',
               'function': {
                 'name': b['name'],
-                'arguments': jsonEncode(b['input'] ?? {})
-              }
+                'arguments': jsonEncode(b['input'] ?? {}),
+              },
             });
             break;
           case 'tool_result':
@@ -121,7 +122,9 @@ class AnthropicAdapter {
       if (role == 'assistant') {
         msgs.add({
           'role': 'assistant',
-          'content': hasBody ? _contentOf(textParts, imageParts) : (toolCalls.isNotEmpty ? '' : null),
+          'content': hasBody
+              ? _contentOf(textParts, imageParts)
+              : (toolCalls.isNotEmpty ? '' : null),
           if (toolCalls.isNotEmpty) 'tool_calls': toolCalls,
           if (reasoning.isNotEmpty) 'reasoning_content': reasoning,
         });
@@ -132,7 +135,10 @@ class AnthropicAdapter {
     return msgs;
   }
 
-  static dynamic _contentOf(List<String> textParts, List<Map<String, dynamic>> images) {
+  static dynamic _contentOf(
+    List<String> textParts,
+    List<Map<String, dynamic>> images,
+  ) {
     final text = textParts.join('');
     if (images.isEmpty) return text;
     return [
@@ -177,7 +183,8 @@ class AnthropicAdapter {
     }
     final us = oai['usage'] as Map?;
     return {
-      'id': 'msg_${oai['id']?.toString().replaceFirst('chatcmpl-', '') ?? DateTime.now().microsecondsSinceEpoch}',
+      'id':
+          'msg_${oai['id']?.toString().replaceFirst('chatcmpl-', '') ?? DateTime.now().microsecondsSinceEpoch}',
       'type': 'message',
       'role': 'assistant',
       'content': content,
@@ -206,13 +213,13 @@ class AnthropicAdapter {
   }
 
   static String? _stopReason(dynamic finish) => switch (finish) {
-        'stop' => 'end_turn',
-        'length' => 'max_tokens',
-        'tool_calls' => 'tool_use',
-        'function_call' => 'tool_use',
-        'content_filter' => 'end_turn',
-        _ => null,
-      };
+    'stop' => 'end_turn',
+    'length' => 'max_tokens',
+    'tool_calls' => 'tool_use',
+    'function_call' => 'tool_use',
+    'content_filter' => 'end_turn',
+    _ => null,
+  };
 }
 
 /// 有状态转换：把 OpenAI chat SSE chunk 逐条转成 Anthropic 事件。
@@ -221,7 +228,8 @@ class AnthropicStreamTransformer {
   final String model;
   bool _started = false;
   int _textBlockIndex = -1;
-  final Map<int, int> _toolBlockIndex = {}; // openai tc index -> anthropic content index
+  final Map<int, int> _toolBlockIndex =
+      {}; // openai tc index -> anthropic content index
   int _nextBlock = 0;
   int _inputTokens = 0;
   int _outputTokens = 0;
@@ -257,11 +265,14 @@ class AnthropicStreamTransformer {
     final content = delta['content'];
     if (content is String && content.isNotEmpty) {
       _ensureTextBlock();
-      _pending.add(('content_block_delta', {
-        'type': 'content_block_delta',
-        'index': _textBlockIndex,
-        'delta': {'type': 'text_delta', 'text': content},
-      }));
+      _pending.add((
+        'content_block_delta',
+        {
+          'type': 'content_block_delta',
+          'index': _textBlockIndex,
+          'delta': {'type': 'text_delta', 'text': content},
+        },
+      ));
     }
     for (final raw in (delta['tool_calls'] as List? ?? const [])) {
       final t = raw as Map<String, dynamic>;
@@ -269,25 +280,33 @@ class AnthropicStreamTransformer {
       final fn = t['function'] as Map?;
       final blockIdx = _toolBlockIndex.putIfAbsent(oi, () {
         final idx = _nextBlock++;
-        _pending.add(('content_block_start', {
-          'type': 'content_block_start',
-          'index': idx,
-          'content_block': {
-            'type': 'tool_use',
-            'id': t['id'] ?? 'toolu_${DateTime.now().microsecondsSinceEpoch}_$oi',
-            'name': fn?['name'] ?? '',
-            'input': <String, dynamic>{},
+        _pending.add((
+          'content_block_start',
+          {
+            'type': 'content_block_start',
+            'index': idx,
+            'content_block': {
+              'type': 'tool_use',
+              'id':
+                  t['id'] ??
+                  'toolu_${DateTime.now().microsecondsSinceEpoch}_$oi',
+              'name': fn?['name'] ?? '',
+              'input': <String, dynamic>{},
+            },
           },
-        }));
+        ));
         return idx;
       });
       final argDelta = fn?['arguments'] as String?;
       if (argDelta != null && argDelta.isNotEmpty) {
-        _pending.add(('content_block_delta', {
-          'type': 'content_block_delta',
-          'index': blockIdx,
-          'delta': {'type': 'input_json_delta', 'partial_json': argDelta},
-        }));
+        _pending.add((
+          'content_block_delta',
+          {
+            'type': 'content_block_delta',
+            'index': blockIdx,
+            'delta': {'type': 'input_json_delta', 'partial_json': argDelta},
+          },
+        ));
       }
     }
 
@@ -304,14 +323,23 @@ class AnthropicStreamTransformer {
         if (_textBlockIndex >= 0) _textBlockIndex,
         ..._toolBlockIndex.values,
       ]) {
-        _pending.add(('content_block_stop', {'type': 'content_block_stop', 'index': i}));
+        _pending.add((
+          'content_block_stop',
+          {'type': 'content_block_stop', 'index': i},
+        ));
       }
     }
-    _pending.add(('message_delta', {
-      'type': 'message_delta',
-      'delta': {'stop_reason': AnthropicAdapter._stopReason(_finish) ?? 'end_turn', 'stop_sequence': null},
-      'usage': {'output_tokens': _outputTokens},
-    }));
+    _pending.add((
+      'message_delta',
+      {
+        'type': 'message_delta',
+        'delta': {
+          'stop_reason': AnthropicAdapter._stopReason(_finish) ?? 'end_turn',
+          'stop_sequence': null,
+        },
+        'usage': {'output_tokens': _outputTokens},
+      },
+    ));
     _pending.add(('message_stop', {'type': 'message_stop'}));
     return _pending.map(_ev).toList();
   }
@@ -319,29 +347,35 @@ class AnthropicStreamTransformer {
   void _ensureStart() {
     if (_started) return;
     _started = true;
-    _pending.add(('message_start', {
-      'type': 'message_start',
-      'message': {
-        'id': 'msg_${DateTime.now().microsecondsSinceEpoch}',
-        'type': 'message',
-        'role': 'assistant',
-        'content': <dynamic>[],
-        'model': model,
-        'stop_reason': null,
-        'stop_sequence': null,
-        'usage': {'input_tokens': _inputTokens, 'output_tokens': 0},
+    _pending.add((
+      'message_start',
+      {
+        'type': 'message_start',
+        'message': {
+          'id': 'msg_${DateTime.now().microsecondsSinceEpoch}',
+          'type': 'message',
+          'role': 'assistant',
+          'content': <dynamic>[],
+          'model': model,
+          'stop_reason': null,
+          'stop_sequence': null,
+          'usage': {'input_tokens': _inputTokens, 'output_tokens': 0},
+        },
       },
-    }));
+    ));
     _pending.add(('ping', {'type': 'ping'}));
   }
 
   void _ensureTextBlock() {
     if (_textBlockIndex >= 0) return;
     _textBlockIndex = _nextBlock++;
-    _pending.add(('content_block_start', {
-      'type': 'content_block_start',
-      'index': _textBlockIndex,
-      'content_block': {'type': 'text', 'text': ''},
-    }));
+    _pending.add((
+      'content_block_start',
+      {
+        'type': 'content_block_start',
+        'index': _textBlockIndex,
+        'content_block': {'type': 'text', 'text': ''},
+      },
+    ));
   }
 }

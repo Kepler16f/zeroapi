@@ -11,10 +11,25 @@
 param(
   [string[]]$Platforms = @(),
   [switch]$Installer,
+  [switch]$Install,
   [switch]$Clean
 )
 $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")
+
+# flutter 必须显式入 PATH：从 Git Bash / 精简环境启动 powershell 时 PATH 里
+# 没有 C:\flutter\bin，命令找不到会被 $ErrorActionPreference=Continue 吞掉，
+# 随后 ISCC 会把上一次的旧产物打进安装包（0.2.1 曾这样静默产出过旧包）。
+$flutterHome = "C:\flutter\bin"
+if (Test-Path (Join-Path $flutterHome "flutter.bat")) {
+  $env:Path = "$flutterHome;" + $env:Path
+}
+$flutterExe = (Get-Command flutter -ErrorAction SilentlyContinue).Source
+if (-not $flutterExe) {
+  Write-Host "错误：找不到 flutter（期望 $flutterHome\flutter.bat）" -ForegroundColor Red
+  exit 1
+}
+Write-Host "flutter: $flutterExe"
 
 # 版本号单一来源：lib/version.dart
 $appVersion = (Select-String -Path "lib\version.dart" -Pattern "kAppVersion = '([^']+)'" | Select-Object -First 1).Matches[0].Groups[1].Value
@@ -82,11 +97,48 @@ foreach ($p in $Platforms) {
     $skipped += $p; continue
   }
   Write-Host "`n== 构建 $p ==" -ForegroundColor Cyan
-  if ($Clean) { flutter clean }
-  flutter $t.Cmd[1..($t.Cmd.Count - 1)]
-  if ($LASTEXITCODE -eq 0) {
-    Write-Host "  产物: $t.Out" -ForegroundColor Green
-    if ($Installer -and $p -like "windows*") {
+  if ($Clean) {
+    & $flutterExe clean
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "  构建失败: $p（flutter clean 退出码 $LASTEXITCODE）" -ForegroundColor Red
+      $failed += $p; continue
+    }
+  }
+  $buildArgs = @($t.Cmd[1..($t.Cmd.Count - 1)])
+  & $flutterExe @buildArgs
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  构建失败: $p（flutter 退出码 $LASTEXITCODE）" -ForegroundColor Red
+    $failed += $p; continue
+  }
+  # 新鲜度校验：产物必须不早于其源码的最新修改时间。曾因 flutter 命令
+  # 未执行（PATH 缺失被吞）而把旧产物重新打成安装包——这里硬性拦下。
+  # 判据用源码 mtime 而不是"本次构建开始时间"：只改安装器配置等不触发
+  # 重编译的场景不应误报。
+  $appSo = Join-Path $t.Out "data\app.so"
+  if (-not (Test-Path $appSo)) {
+    Write-Host "  构建失败: $p（找不到 $appSo）" -ForegroundColor Red
+    $failed += $p; continue
+  }
+  $dartSrc = Get-ChildItem lib -Recurse -Filter *.dart -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  $cfgSrc = @(Get-Item pubspec.yaml, pubspec.lock -ErrorAction SilentlyContinue) |
+      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  $dartNewest = @($dartSrc, $cfgSrc) | Where-Object { $_ } |
+      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ($dartNewest -and (Get-Item $appSo).LastWriteTime -lt $dartNewest.LastWriteTime) {
+    Write-Host "  构建失败: $p（app.so 早于最新 Dart 源码 $($dartNewest.Name)，拒绝打包旧产物）" -ForegroundColor Red
+    $failed += $p; continue
+  }
+  $exePath = Join-Path $t.Out "zeroapi.exe"
+  $winSrc = Get-ChildItem windows -Recurse -Include *.cpp,*.h,*.cc,*.txt -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ((Test-Path $exePath) -and $winSrc -and
+      (Get-Item $exePath).LastWriteTime -lt $winSrc.LastWriteTime) {
+    Write-Host "  构建失败: $p（zeroapi.exe 早于最新 Windows 源码 $($winSrc.Name)，拒绝打包旧产物）" -ForegroundColor Red
+    $failed += $p; continue
+  }
+  Write-Host "  产物: $($t.Out)" -ForegroundColor Green
+  if ($Installer -and $p -like "windows*") {
       # Zen 免费档由网关原生直连（lib/gateway/zen.dart），无需 zengate vendor。
       # WorkBuddy 号池例外：随包分发 vendor\workbuddy2api-hub（含便携 Python）。
       $wbVendor = Join-Path (Get-Location) "vendor\workbuddy2api-hub"
@@ -108,6 +160,17 @@ foreach ($p in $Platforms) {
       } else {
         Write-Host "  [警告] 未找到 WorkBuddy 运行时，安装包不含号池功能" -ForegroundColor Yellow
       }
+      # 加密协议（ss/vmess/vless/trojan/hysteria2/tuic）本地内核：随包分发
+      # vendor\proxy-core\mihomo.exe（每个节点一个 loopback listener）。
+      $coreSrc = Join-Path (Get-Location) "vendor\proxy-core"
+      if (Test-Path (Join-Path $coreSrc "mihomo.exe")) {
+        $coreDest = Join-Path $vendorDest "proxy-core"
+        New-Item -ItemType Directory -Force -Path $coreDest | Out-Null
+        Copy-Item (Join-Path $coreSrc "*") $coreDest -Recurse -Force
+        Write-Host "  已打包代理内核（mihomo）" -ForegroundColor Green
+      } else {
+        Write-Host "  [警告] 未找到 vendor\proxy-core\mihomo.exe，加密协议节点将不可用" -ForegroundColor Yellow
+      }
       $arch = if ($p -eq "windows-x64") { "x64" } elseif ($p -eq "windows-arm64") { "arm64" } else { $winArch }
       $iscc = @(
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
@@ -117,15 +180,34 @@ foreach ($p in $Platforms) {
         & $iscc "/DMyArch=$arch" "/DMyVersion=$appVersion" "packaging\zeroapi.iss"
         if ($LASTEXITCODE -eq 0) {
           Write-Host "  安装包: installer\zeroapi-setup-$arch-$appVersion.exe" -ForegroundColor Green
+          if ($Install) {
+            # 关键：必须经 Start-Process 传参。从 Git Bash 直接调用时 MSYS 会把
+            # /VERYSILENT 改写成 C:/Program Files/Git/VERYSILENT，安装器退化成
+            # 交互向导（表现为"每次都要手点"）。
+            $setup = Join-Path (Get-Location) "installer\zeroapi-setup-$arch-$appVersion.exe"
+            if (Test-Path $setup) {
+              Write-Host "  静默覆盖安装..." -ForegroundColor Cyan
+              $proc = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+                '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/FORCECLOSEAPPLICATIONS')
+              if ($proc.ExitCode -eq 0) {
+                Write-Host "  已安装（无交互）" -ForegroundColor Green
+                # 安装器配置为 RestartApplications=yes；若未自动拉起则手动启动
+                Start-Sleep -Seconds 2
+                if (-not (Get-Process -Name "zeroapi" -ErrorAction SilentlyContinue)) {
+                  $exe = Join-Path $env:ProgramFiles "ZeroApi\zeroapi.exe"
+                  if (Test-Path $exe) { Start-Process $exe }
+                }
+              } else {
+                Write-Host "  安装失败（退出码 $($proc.ExitCode)）" -ForegroundColor Red
+                $failed += "$p-install"
+              }
+            }
+          }
         } else { $failed += "$p-installer" }
       } else {
         Write-Host "  未找到 ISCC.exe（Inno Setup），跳过安装包" -ForegroundColor Yellow
         $failed += "$p-installer"
       }
-    }
-  } else {
-    Write-Host "  构建失败: $p (exit $LASTEXITCODE)" -ForegroundColor Red
-    $failed += $p
   }
 }
 

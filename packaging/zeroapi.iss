@@ -9,7 +9,7 @@
 #ifdef MyVersion
   #define MyAppVersion MyVersion
 #else
-  #define MyAppVersion "0.1.11"
+  #define MyAppVersion "0.2.5"
 #endif
 #ifndef MyArch
   #define MyArch "arm64"
@@ -33,6 +33,11 @@ ArchitecturesAllowed={#MyArch}
 ArchitecturesInstallIn64BitMode={#MyArch}
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+; 覆盖安装时由安装器自动结束正在运行的 ZeroApi 及号池子进程（不弹
+; "文件被占用/是否关闭"对话框），配合 /VERYSILENT /FORCECLOSEAPPLICATIONS
+; 实现完全无人值守重装。
+CloseApplications=force
+RestartApplications=yes
 SetupIconFile=..\assets\icon\zeroapi.ico
 ; 卸载时保留用户配置 %APPDATA%\zeroapi（网关 key 与供应商配置），不做清理
 
