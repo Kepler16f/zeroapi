@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'zen.dart';
+
 /// opencode serve 原生协议的客户端 + OpenAI/Anthropic 翻译层。
 ///
 /// serve 的接口（2026-10-26 实测，opencode-ai 1.19.3）：
@@ -30,6 +32,9 @@ class OpenCodeApi {
 
   final String baseUrl;
   final HttpClient _client;
+
+  /// 最近一轮的真实 token 用量（serve 的 info.tokens）；流完成前读到 0。
+  ({int input, int output}) lastUsage = (input: 0, output: 0);
 
   static const _model = {'providerID': 'opencode'};
 
@@ -84,6 +89,8 @@ class OpenCodeApi {
       eventResp = await evReq.close().timeout(const Duration(seconds: 30));
 
       final lastText = <String, String>{};
+      // 本轮 assistant 消息的 id 集合（serve 会回显用户消息的 part，需过滤）
+      final assistantMsgIds = <String>{};
       var done = false;
       final finished = Completer<void>();
       // 错误可能在无人监听时发生（Future.any 先胜出、消费者已关流），
@@ -106,12 +113,12 @@ class OpenCodeApi {
           return;
         }
         final type = j['type'];
-        final props = (j['properties'] ?? const {}) as Map<String, dynamic>;
+        final props = (j['properties'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
         if (props['sessionID'] != null && props['sessionID'] != sid) return;
 
         if (type == 'session.error') {
-          final err = (props['error'] ?? const {}) as Map<String, dynamic>;
-          final data = (err['data'] ?? const {}) as Map<String, dynamic>;
+          final err = (props['error'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
+          final data = (err['data'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
           final e = OpenCodeUpstreamError(
             message: (data['message'] ?? err['name'] ?? '上游错误').toString(),
             statusCode: (data['statusCode'] as int?) ??
@@ -121,9 +128,26 @@ class OpenCodeApi {
           if (!finished.isCompleted) finished.completeError(e);
           return;
         }
+        // 追踪 assistant 消息 id：serve 会把「用户消息的回显 part」也推到
+        // 事件流里（messageID 属于用户消息），不过滤会把客户端的输入原样
+        // 转发回去、混进答案里（实测输出变成 "User: xxxOK"）。
+        // message.updated(role=assistant) 一定先于它的 part 事件到达。
+        if (type == 'message.updated') {
+          final info =
+              (props['info'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
+          if (info['role'] == 'assistant') {
+            final mid = info['id'] as String?;
+            if (mid != null) assistantMsgIds.add(mid);
+          }
+          return;
+        }
         if (type == 'message.part.updated') {
-          final part = (props['part'] ?? const {}) as Map<String, dynamic>;
+          final part = (props['part'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
           if (part['type'] != 'text') return;
+          final mid = part['messageID'] as String?;
+          // 只转发 assistant 消息的文本；用户消息的回显 part 跳过
+          // （messageID 缺失的旧事件保守放行）
+          if (mid != null && !assistantMsgIds.contains(mid)) return;
           final id = part['id'] as String? ?? '';
           final text = (part['text'] ?? '') as String;
           final prev = lastText[id] ?? '';
@@ -135,7 +159,20 @@ class OpenCodeApi {
         }
         // 会话回到 idle = 本轮结束
         if (type == 'session.status') {
-          final st = (props['status'] ?? const {}) as Map<String, dynamic>;
+          final st = (props['status'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
+          // 额度耗尽时 CLI 发的是 status.type='retry'（message 里带
+          // "Free usage exceeded, subscri…"），不是 session.error；而且
+          // 它会一直重试下去、message 端点永不返回（实测 100s+ 不返回）。
+          // 识别出来立即报错，别让客户端干等。
+          if (st['type'] == 'retry') {
+            final msg = (st['message'] ?? '').toString();
+            if (msg.isNotEmpty && Zen.isQuotaExhausted(msg)) {
+              final e = OpenCodeUpstreamError(message: msg, statusCode: 429);
+              if (!upstreamError.isCompleted) upstreamError.completeError(e);
+              if (!finished.isCompleted) finished.completeError(e);
+              return;
+            }
+          }
           if (st['type'] == 'idle' && !finished.isCompleted) {
             finished.complete();
           }
@@ -170,15 +207,21 @@ class OpenCodeApi {
           }
           // 同步返回体里也可能带 error（上游失败但 HTTP 200）
           final j = jsonDecode(body) as Map<String, dynamic>;
-          final info = (j['info'] ?? const {}) as Map<String, dynamic>;
+          final info = (j['info'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
           final err = info['error'];
           if (err is Map) {
-            final data = (err['data'] ?? const {}) as Map<String, dynamic>;
+            final data = (err['data'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
             throw OpenCodeUpstreamError(
               message: (data['message'] ?? err['name'] ?? '上游错误').toString(),
               statusCode: data['statusCode'] as int?,
             );
           }
+          // 记账：serve 返回真实 token 数（info.tokens.{input,output}）
+          final tokens = (info['tokens'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
+          lastUsage = (
+            input: (tokens['input'] as num?)?.toInt() ?? 0,
+            output: (tokens['output'] as num?)?.toInt() ?? 0,
+          );
           return r.statusCode;
         }),
       ]);
@@ -272,13 +315,10 @@ class OpenCodeUpstreamError implements Exception {
   const OpenCodeUpstreamError({required this.message, this.statusCode});
 
   /// 上游文案里常见的额度耗尽关键词——命中时网关回 429 rate_limit_exceeded，
-  /// 免得客户端把「额度用完」当成认证失败。
-  bool get isQuotaExhausted {
-    final m = message.toLowerCase();
-    return m.contains('free usage limit') ||
-        m.contains('usage limit') && m.contains('subscribe') ||
-        m.contains('quota');
-  }
+  /// 免得客户端把「额度用完」当成认证失败。判定统一走 [Zen.isQuotaExhausted]
+  /// （两处文案：补全的 "Free usage limit reached"、重试事件的
+  /// "Free usage exceeded"），别在这里再维护一份。
+  bool get isQuotaExhausted => Zen.isQuotaExhausted(message);
 
   @override
   String toString() => message;

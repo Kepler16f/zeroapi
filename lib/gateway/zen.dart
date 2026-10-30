@@ -51,7 +51,12 @@ class Zen {
   static bool isQuotaExhausted(String msg) {
     final m = msg.toLowerCase();
     if (m.isEmpty) return false;
+    // 上游有两种文案：
+    //   补全返回 "Free usage limit reached. Subscribe to OpenCode Go…"
+    //   CLI 重试事件里是 "Free usage exceeded, subscri…"
+    // 两者都是账号级额度耗尽，换出口/退避都救不了，只能如实报错。
     return m.contains('free usage limit') ||
+        m.contains('free usage exceeded') ||
         (m.contains('usage limit') && m.contains('subscribe')) ||
         (m.contains('quota') && m.contains('exceed'));
   }

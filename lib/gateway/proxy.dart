@@ -1506,6 +1506,9 @@ class ProxyServer {
               })}\n\n'));
           await req.response.flush();
         }
+        // 流结束 = 同步响应已回来：换上 serve 给的真实 token 数
+        prompt = api.lastUsage.input;
+        completion = api.lastUsage.output;
         req.response.add(utf8.encode('data: ${jsonEncode({
               'id': id,
               'object': 'chat.completion.chunk',
@@ -1530,6 +1533,9 @@ class ProxyServer {
           text.write(piece);
           completion += piece.length;
         }
+        // 流结束 = 同步响应已回来：换上 serve 给的真实 token 数
+        prompt = api.lastUsage.input;
+        completion = api.lastUsage.output;
         final out = {
           'id': id,
           'object': 'chat.completion',
@@ -1556,6 +1562,9 @@ class ProxyServer {
             : out));
         await req.response.close();
       }
+      // serve 在同步响应里给真实 token 数（字符数只是流式期间的近似值）
+      prompt = api.lastUsage.input;
+      completion = api.lastUsage.output;
       _account(publicName, u.id, prompt, completion, false);
       _log('$publicName ✓ ${u.id}${_tail(_ctx, prompt, completion)}');
     } catch (e) {

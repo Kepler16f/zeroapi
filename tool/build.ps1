@@ -18,10 +18,13 @@ $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")
 
 # flutter 必须显式入 PATH：从 Git Bash / 精简环境启动 powershell 时 PATH 里
-# 没有 C:\flutter\bin，命令找不到会被 $ErrorActionPreference=Continue 吞掉，
+# 没有 flutter，命令找不到会被 $ErrorActionPreference=Continue 吞掉，
 # 随后 ISCC 会把上一次的旧产物打进安装包（0.2.1 曾这样静默产出过旧包）。
-$flutterHome = "C:\flutter\bin"
-if (Test-Path (Join-Path $flutterHome "flutter.bat")) {
+# 优先 arm64 引擎的 SDK（本机 ARM Windows，安装包也是 arm64）；SDK 曾从
+# C:\flutter 迁到 C:\dev\flutter-arm64，逐个探测。
+$flutterHomes = @("C:\dev\flutter-arm64\bin", "C:\flutter\bin", "C:\dev\flutter\bin")
+$flutterHome = $flutterHomes | Where-Object { Test-Path (Join-Path $_ "flutter.bat") } | Select-Object -First 1
+if ($flutterHome) {
   $env:Path = "$flutterHome;" + $env:Path
 }
 $flutterExe = (Get-Command flutter -ErrorAction SilentlyContinue).Source

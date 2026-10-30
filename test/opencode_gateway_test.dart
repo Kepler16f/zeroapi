@@ -18,6 +18,7 @@ void main() {
   late Directory usageDir;
   bool serveClosed = false;
   String? injectError; // 非空则 message 端点返回该错误
+  String? injectRetry; // 非空则推 session.status=retry 事件（CLI 额度耗尽的真实形态）
   late StreamController<String> events;
   final client = HttpClient();
 
@@ -95,16 +96,57 @@ void main() {
             as Map<String, dynamic>;
         final sid = msgMatch.group(1);
         final text = (body['parts'] as List)[0]['text'] as String;
-        // 先推两段增量 + idle，再返回同步结果
+        // 真实 serve 的事件序：先回显「用户消息」（role=user + 它的 text
+        // part），再推 assistant 消息的增量。回显必须被网关过滤掉。
+        events.add(jsonEncode({
+          'type': 'message.updated',
+          'properties': {
+            'sessionID': sid,
+            'info': {'id': 'msg_user', 'role': 'user'}
+          }
+        }));
+        events.add(jsonEncode({
+          'type': 'message.part.updated',
+          'properties': {
+            'sessionID': sid,
+            'part': {'type': 'text', 'id': 'prt_echo', 'messageID': 'msg_user',
+                     'text': text}
+          }
+        }));
+        events.add(jsonEncode({
+          'type': 'message.updated',
+          'properties': {
+            'sessionID': sid,
+            'info': {'id': 'msg_asst', 'role': 'assistant'}
+          }
+        }));
+        // assistant 的两段增量 + idle，再返回同步结果
         void emit(String t) => events.add(jsonEncode({
               'type': 'message.part.updated',
               'properties': {
                 'sessionID': sid,
-                'part': {'type': 'text', 'id': 'prt_1', 'text': t}
+                'part': {'type': 'text', 'id': 'prt_1', 'messageID': 'msg_asst',
+                         'text': t}
               }
             }));
         emit('Hel');
         emit('Hello <$text>');
+        if (injectRetry != null) {
+          // CLI 额度耗尽的真实形态：只发 retry 事件、不发 idle（CLI 一直
+          // 重试，message 端点永不返回）。retry 必须在 idle 位置之前——
+          // idle 一到网关侧 /event 订阅就该结束，再发的都收不到。
+          events.add(jsonEncode({
+            'type': 'session.status',
+            'properties': {
+              'sessionID': sid,
+              'status': {'type': 'retry', 'attempt': 1, 'message': injectRetry}
+            }
+          }));
+          await Future.delayed(const Duration(seconds: 30));
+          req.response.statusCode = 504;
+          await req.response.close();
+          return;
+        }
         events.add(jsonEncode({
           'type': 'session.status',
           'properties': {
@@ -197,8 +239,9 @@ void main() {
       ],
       'stream': false
     });
-    expect(resp.statusCode, 200);
-    final body = jsonDecode(await utf8.decodeStream(resp));
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 200, reason: raw);
+    final body = jsonDecode(raw);
     expect(body['choices'][0]['message']['content'], contains('ping'));
     expect(body['choices'][0]['message']['content'], startsWith('Hello'));
     expect(body['model'], 'big-pickle');
@@ -288,5 +331,21 @@ void main() {
     expect(resp.statusCode, 502);
     expect(body['error']['message'], contains('Invalid credential'));
     injectError = null;
+  }, timeout: const Timeout(Duration(seconds: 40)));
+
+  test('CLI 额度耗尽（status=retry 事件）→ 快速 429，不等 CLI 重试结束', () async {
+    injectRetry = 'Free usage exceeded, subscribe to OpenCode Go to keep going';
+    final sw = Stopwatch()..start();
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'hi'}
+      ]
+    });
+    final body = jsonDecode(await utf8.decodeStream(resp));
+    expect(resp.statusCode, 429, reason: '$body');
+    expect(body['error']['code'], 'free_quota_exhausted');
+    expect(sw.elapsedMilliseconds / 1000, lessThan(15));
+    injectRetry = null;
   }, timeout: const Timeout(Duration(seconds: 40)));
 }
