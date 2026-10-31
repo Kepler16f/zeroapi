@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zeroapi/gateway/config.dart';
+import 'package:zeroapi/gateway/opencode_api.dart';
 import 'package:zeroapi/gateway/proxy.dart';
 import 'package:zeroapi/gateway/upstream.dart';
 
@@ -18,6 +19,7 @@ void main() {
   late Directory usageDir;
   bool serveClosed = false;
   String? injectError; // 非空则 message 端点返回该错误
+  bool hangMessage = false;
   String? injectRetry; // 非空则推 session.status=retry 事件（CLI 额度耗尽的真实形态）
   late StreamController<String> events;
   final client = HttpClient();
@@ -132,6 +134,13 @@ void main() {
                          'text': t}
               }
             }));
+        if (hangMessage) {
+          // 上游 hang 形态：message 端点永不返回，也不发任何本会话事件
+          await Future.delayed(const Duration(seconds: 30));
+          req.response.statusCode = 504;
+          await req.response.close();
+          return;
+        }
         if (injectRetry != null) {
           // 真实形态：额度耗尽 → 没有任何内容增量，retry 事件先于首增量
           events.add(jsonEncode({
@@ -381,4 +390,29 @@ void main() {
     final body = jsonDecode(raw);
     expect(body['choices'][0]['message']['content'], contains('你好'));
   });
+
+  test('看门狗：只有心跳没有会话事件时停滞被中止（心跳不续命）', () async {
+    // 上游 hang：message 端点挂住，/event 只推心跳（进程活着≠本轮有进展）
+    hangMessage = true;
+    final ticker = Timer.periodic(const Duration(milliseconds: 200), (_) {
+      events.add(jsonEncode({'type': 'server.heartbeat', 'properties': {}}));
+    });
+    addTearDown(ticker.cancel);
+    OpenCodeApi.stallTimeout = const Duration(seconds: 2);
+    addTearDown(() => OpenCodeApi.stallTimeout = const Duration(seconds: 120));
+    final sw = Stopwatch()..start();
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'hi'}
+      ],
+      'stream': false
+    });
+    final body = jsonDecode(await utf8.decodeStream(resp));
+    expect(resp.statusCode, 502, reason: '$body');
+    expect(body['error']['message'], contains('无任何响应'));
+    // 心跳若在续命，这里会是 30s+
+    expect(sw.elapsedMilliseconds / 1000, lessThan(10));
+    hangMessage = false;
+  }, timeout: const Timeout(Duration(seconds: 40)));
 }

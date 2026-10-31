@@ -141,7 +141,6 @@ class OpenCodeApi {
           .listen((line) {
         if (done) return;
         if (!line.startsWith('data:')) return;
-        ping();
         Map<String, dynamic> j;
         try {
           j = jsonDecode(line.substring(5)) as Map<String, dynamic>;
@@ -151,6 +150,11 @@ class OpenCodeApi {
         final type = j['type'];
         final props = (j['properties'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
         if (props['sessionID'] != null && props['sessionID'] != sid) return;
+        // 心跳只证明 serve 进程活着，不代表本轮有进展——不刷新看门狗：
+        // serve 每 10s 推一个 heartbeat，若照单全收，上游真 hang 时
+        // 看门狗永远不触发（实测挂 7 分钟无任何报错就是这么来的）。
+        if (type == 'server.heartbeat') return;
+        ping();
 
         if (type == 'session.error') {
           final err = (props['error'] ?? const <String, dynamic>{}) as Map<String, dynamic>;
