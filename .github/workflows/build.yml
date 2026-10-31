@@ -25,7 +25,9 @@ jobs:
 
   windows-x64:
     needs: test
-    runs-on: windows-latest
+    # windows-latest 已升到 VS18，其 STL 硬禁 webview_windows 用的 /await
+    # 旧式协程（STL1011）；钉 2022（VS17）直到插件适配 C++20 coroutine
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
