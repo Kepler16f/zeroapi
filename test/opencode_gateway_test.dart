@@ -65,7 +65,8 @@ void main() {
       }
       if (path == '/event') {
         req.response
-          ..headers.contentType = ContentType('text', 'event-stream')
+          ..headers.contentType =
+              ContentType('text', 'event-stream', charset: 'utf-8')
           ..headers.set('cache-control', 'no-cache');
         // 真 serve 一连上就推 server.connected；mock 同构，否则网关
         // 等 /event 响应头、mock 等消息事件，两边死锁
@@ -75,9 +76,11 @@ void main() {
         final done = Completer<void>();
         late StreamSubscription<String> sub;
         sub = events.stream.listen((e) {
-          // 网关读完即 detachSocket，此时再写会抛 Bad state——忽略即可
+          // 网关读完即 detachSocket，此时再写会抛 Bad state——忽略即可。
+          // 事件里可能含 CJK：必须 utf8 字节写入（无 charset 的
+          // write(String) 会按 latin1 抛异常、事件被静默吞掉）
           try {
-            req.response.write('data: $e\n\n');
+            req.response.add(utf8.encode('data: $e\n\n'));
           } catch (_) {}
           if (jsonDecode(e)['type'] == 'session.status' &&
               !done.isCompleted) {
@@ -361,4 +364,21 @@ void main() {
     expect(body['error']['code'], 'free_quota_exhausted');
     injectRetry = null;
   }, timeout: const Timeout(Duration(seconds: 40)));
+
+  test('中文内容（系统提示/用户输入）不再触发 latin1 编码崩溃', () async {
+    // 回归：content-type 无 charset 时 Dart write(String) 按 latin1 编码，
+    // CJK 直接抛 "Contains invalid characters"（ZCode 提示词必含中文）
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'system', 'content': '你是 ZCode 编码助手（胡天泽的中文提示词）'},
+        {'role': 'user', 'content': '你好，请回复 OK'}
+      ],
+      'stream': false
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 200, reason: raw);
+    final body = jsonDecode(raw);
+    expect(body['choices'][0]['message']['content'], contains('你好'));
+  });
 }

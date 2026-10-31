@@ -48,7 +48,7 @@ class OpenCodeApi {
   Future<String> createSession() async {
     final req = await _client.postUrl(Uri.parse('$baseUrl/session'));
     _headers.forEach((k, v) => req.headers.set(k, v));
-    req.write('{}');
+    req.add(utf8.encode('{}'));
     final resp = await req.close().timeout(const Duration(seconds: 30));
     final body = await resp.transform(utf8.decoder).join();
     if (resp.statusCode != 200) {
@@ -187,8 +187,12 @@ class OpenCodeApi {
       // session.error 一到就立刻如实报错，不让客户端干等重试结束。
       final msgReq = await _client.postUrl(
           Uri.parse('$baseUrl/session/$sid/message'));
-      _headers.forEach((k, v) => msgReq.headers.set(k, v));
-      msgReq.write(jsonEncode({
+      // content-type 必须带 charset=utf-8：Dart 的 HttpRequest.write(String)
+      // 在无 charset 时按 latin1 编码，系统提示/用户输入含 CJK 即抛
+      // "Contains invalid characters"（ZCode 的提示词必然有中文，必踩）。
+      // 体一律按 utf8 字节写入，不走 write(String)。
+      msgReq.headers.set('content-type', 'application/json; charset=utf-8');
+      msgReq.add(utf8.encode(jsonEncode({
         'model': {..._model, 'modelID': model},
         'parts': [
           {
@@ -196,7 +200,7 @@ class OpenCodeApi {
             'text': _flattenMessages(messages),
           }
         ],
-      }));
+      })));
       final msgFuture = msgReq.close().timeout(const Duration(hours: 2));
       final status = await Future.any<Object>([
         upstreamError.future, // 出错即抛（completeError）
