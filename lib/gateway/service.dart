@@ -90,6 +90,12 @@ class GatewayService extends ChangeNotifier {
     await ProxyCore.instance.sync(proxies!);
     _runtimes.clear();
     for (final def in config.upstreams) {
+      // zen CLI 通路：出口走池（自动探测优先；家宽直连仅兜底——免费额度
+      // 按出口 IP × 天计，家宽单 IP 撑不住长上下文对话）
+      if (def.id == OpenCode.id && def.type == 'managed') {
+        final url = _pickZenCliEgress(def.id);
+        if (url != null) _setZenCliEgressEnv(def, url);
+      }
       // 供应商预热就绪时立即重建路由表（不等 60s 周期刷新），
       // 否则冷启动后模型要干等下一轮刷新才出现
       final rt = UpstreamRuntime(def)..onStatusChanged = refreshRoutesNow;
@@ -241,41 +247,65 @@ class GatewayService extends ChangeNotifier {
   ///
   /// CLI 进程通过 HTTP_PROXY 绑定出口，换 IP 必须换进程——所以这里改
   /// def.env 再杀子进程，由 managed 生命周期按退避重新拉起。
+  /// zen CLI 通路的出口游标：每次轮换推进一格，保证换到不同节点
+  /// （旧实现 candidates.first 永远同一个节点，5 次重试全打同一出口）。
+  final Map<String, int> _zenCliEgressCursor = {};
+
+  /// 从池里挑一个 zen CLI 出口（跳过当天额度已烧穿的节点）。
+  /// 返回 HTTP 代理 URL（本地 mihomo listener / socks 中转）；无可用返回 null。
+  String? _pickZenCliEgress(String upstreamId, {bool advance = false}) {
+    final pool = proxies;
+    if (pool == null) return null;
+    final purpose = ProxyPool.pUpstream(upstreamId);
+    final cands = poolCandidatesFor(pool, purpose)
+        .where((c) => c.nodeId == null || !pool.isQuotaSpent(c.nodeId!))
+        .toList();
+    if (cands.isEmpty) {
+      // 全烧穿：清掉当天的标记重头轮换（额度按 UTC 零点翻篇）
+      for (final c in poolCandidatesFor(pool, purpose)) {
+        if (c.nodeId != null) pool.clearQuotaSpent(c.nodeId!);
+      }
+      return null;
+    }
+    final i = (_zenCliEgressCursor[upstreamId] ?? 0) % cands.length;
+    if (advance) {
+      _zenCliEgressCursor[upstreamId] = (_zenCliEgressCursor[upstreamId] ?? 0) + 1;
+    }
+    final m = RegExp(r'PROXY\s+(\S+)').firstMatch(cands[i].directive);
+    return m == null ? null : 'http://${m.group(1)}';
+  }
+
+  /// 把出口写进 zen CLI 的 env（HTTP_PROXY 等）。返回是否发生变化。
+  bool _setZenCliEgressEnv(UpstreamDef def, String url) {
+    final changed = (def.env['HTTPS_PROXY'] ?? '') != url;
+    def.env['HTTP_PROXY'] = url;
+    def.env['HTTPS_PROXY'] = url;
+    def.env['http_proxy'] = url;
+    def.env['https_proxy'] = url;
+    return changed;
+  }
+
+  /// 额度耗尽 → 标记当前节点烧穿，轮换到下一个出口并重启 serve。
   void _rotateZenEgress(String upstreamId) {
     final rt = _runtimes.where((r) => r.def.id == upstreamId).firstOrNull;
     if (rt == null) return;
     final pool = proxies;
     if (pool == null) return;
-    final purpose = ProxyPool.pUpstream(upstreamId);
-    // 跳过已判定额度烧穿的节点，直到下一个
-    final candidates = poolCandidatesFor(pool, purpose)
-        .where((c) => c.nodeId == null || !pool.isQuotaSpent(c.nodeId!))
-        .toList();
-    if (candidates.isEmpty) {
-      // 全烧穿：清标记重头轮换
-      for (final c in poolCandidatesFor(pool, purpose)) {
-        if (c.nodeId != null) pool.clearQuotaSpent(c.nodeId!);
-      }
-      return;
-    }
-    final pick = candidates.first;
-    final m = RegExp(r'PROXY\s+(\S+)').firstMatch(pick.directive);
-    final url = m == null ? '' : 'http://${m.group(1)}';
-    if (url.isEmpty) return;
-    // 标记旧节点额度烧穿，避免下次又选回它
-    final old = rt.def.env['HTTPS_PROXY'];
-    final oldPort = RegExp(r':(\d+)$').firstMatch(old ?? '');
+    // 标记旧节点额度烧穿（按 corePorts 反查节点），避免轮换又选回它
+    final old = rt.def.env['HTTPS_PROXY'] ?? '';
+    final oldPort = RegExp(r':(\d+)$').firstMatch(old);
     if (oldPort != null) {
-      final node = pool.allNodes.where((n) {
-        final d = pool.directiveOf(n);
-        return d != null && d.endsWith(oldPort.group(1)!);
-      }).firstOrNull;
-      if (node != null) pool.markQuotaSpent(node.id);
+      final oldPortNum = int.parse(oldPort.group(1)!);
+      String? oldNodeId;
+      pool.corePorts.forEach((nodeId, port) {
+        if (port == oldPortNum) oldNodeId = nodeId;
+      });
+      if (oldNodeId != null) pool.markQuotaSpent(oldNodeId!);
     }
-    rt.def.env['HTTP_PROXY'] = url;
-    rt.def.env['HTTPS_PROXY'] = url;
-    rt.def.env['http_proxy'] = url;
-    rt.def.env['https_proxy'] = url;
+    final url = _pickZenCliEgress(upstreamId, advance: true);
+    if (url == null || url == old) return;
+    _setZenCliEgressEnv(rt.def, url);
+    server?.log('⟳ zen CLI 换出口 → $url（旧出口额度烧穿）');
     // 重启子进程：新的 env 才生效。用 restartChild（只换进程）而不是
     // stop()——后者会置 _stopping，之后 ensure() 不会重新拉起。
     rt.restartChild();

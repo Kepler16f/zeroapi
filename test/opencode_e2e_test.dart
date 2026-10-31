@@ -83,10 +83,12 @@ void main() {
           // 上游免费额度被 CF 共享池里的流量烧穿（波动，与本机无关）：
           // 额度按出口 IP × 天计、UTC 零点重置。跳过而不是判失败。
           markTestSkipped('上游免费额度暂时耗尽：${raw.length > 200 ? raw.substring(0, 200) : raw}');
+          return; // markTestSkipped 只记录不中断
         }
         if (resp.statusCode == 502) {
           // 上游 5xx/网络失败同样是上游侧状态，不算本机回归
           markTestSkipped('上游暂时不可用：${raw.length > 200 ? raw.substring(0, 200) : raw}');
+          return;
         }
         expect(resp.statusCode, 200, reason: raw);
         final content =

@@ -398,6 +398,9 @@ class ProxyServer {
 
   List<String> get logs => List.unmodifiable(_logLines);
 
+  /// 供 service 层写网关日志（轮换等网关外事件）。
+  void log(String s) => _log(s);
+
   /// 实际监听端口（port 传 0 时由系统分配，测试用）
   int get boundPort => _server?.port ?? port;
 
@@ -1461,7 +1464,6 @@ class ProxyServer {
     final messages = (body['messages'] as List?) ?? const [];
     OpenCodeApi.onRetryEvent = (msg) =>
         _log('$publicName ⟳ CLI 重试上游失败：$msg');
-    final api = OpenCodeApi(u.def.baseUrl);
     // 请求一开始就落日志：CLI 挂起期间（上游 hang/重试）此前一片空白，
     // 用户看日志分不清「在跑」还是「死了」
     _log('$publicName → ${u.id}（CLI 通路）');
@@ -1470,11 +1472,16 @@ class ProxyServer {
     final model = route.upstreamModel;
     var prompt = 0, completion = 0;
 
+    // 额度错误（未提交）→ 原地轮换出口重试。jcleng/opencode-free-provider
+    // 的 fast-rotation 同款：429 的 IP 立即 dustbin，同一请求换下一个出口
+    // 重发，客户端无感；最多换 3 个，全烧穿才如实报 429。
+    var committed = false;
+    final api = OpenCodeApi(u.def.baseUrl);
+
     // 与 _forwardZen 同一原则：**收到上游第一个增量之前不向客户端提交 200**。
     // CLI 额度耗尽时会在 ~1s 内报错——若此时已提交 200，错误只能走流内
     // error 帧，客户端（ZCode）解析不了就显示 reason=unknown；未提交时
     // 则能以干净的 429 JSON 返回，客户端按限流语义自动重试。
-    var committed = false;
     try {
       if (clientWantsStream) {
         final pieces = api.chat(
