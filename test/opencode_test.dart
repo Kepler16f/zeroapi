@@ -12,7 +12,12 @@ void main() {
       final paths = OpenCodeRuntime.candidatePaths();
       expect(paths, isNotEmpty);
       expect(paths.first, contains('zeroapi'));
-      expect(paths.any((p) => p.contains('opencode.exe')), true);
+      // Linux 候选以 /opencode 结尾；Windows 以 opencode.exe 结尾
+      if (Platform.isWindows) {
+        expect(paths.any((p) => p.contains('opencode.exe')), true);
+      } else {
+        expect(paths.any((p) => p.endsWith('/opencode')), true);
+      }
     });
 
     test('平台包名随架构变化', () {
