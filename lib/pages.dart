@@ -397,12 +397,52 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
                   ],
                 ),
               )
-            : FilledButton.tonal(
-                onPressed: _ready ? _attach : _download,
-                child: Text(_ready ? '接入' : '下载运行时'),
+            : Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 自动探测优先，但允许用户手动指定 CLI 路径
+                  TextButton(
+                    onPressed: _downloading ? null : _pickCliPath,
+                    child: const Text('指定路径'),
+                  ),
+                  const SizedBox(width: 4),
+                  FilledButton.tonal(
+                    onPressed: _ready ? _attach : _download,
+                    child: Text(_ready ? '接入' : '下载运行时'),
+                  ),
+                ],
               ),
       ),
     );
+  }
+
+  /// 让用户手动选择 opencode CLI：存进 config（最高优先级），已接入时
+  /// 热替换命令并重启子进程。
+  Future<void> _pickCliPath() async {
+    final file = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'opencode', extensions: ['exe'])
+      ],
+    );
+    if (file == null) return;
+    final path = file.path;
+    if (!File(path).existsSync()) return;
+    widget.service.config.opencodeCliPath = path;
+    OpenCodeRuntime.overridePath = path;
+    widget.service.config.save();
+    if (!mounted) return;
+    final existing = widget.service.config.upstreams
+        .where((u) => OpenCode.isOpenCode(u))
+        .toList();
+    if (existing.isEmpty) {
+      await _attach();
+      return;
+    }
+    // 已接入：热替换 serve 命令并重启，新路径立即生效
+    final err = await widget.service.updateOpenCodeCommand(path);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(err ?? '已改用 $path，CLI 正在重启')));
   }
 }
 

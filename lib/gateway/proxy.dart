@@ -1459,7 +1459,12 @@ class ProxyServer {
     }
 
     final messages = (body['messages'] as List?) ?? const [];
+    OpenCodeApi.onRetryEvent = (msg) =>
+        _log('$publicName ⟳ CLI 重试上游失败：$msg');
     final api = OpenCodeApi(u.def.baseUrl);
+    // 请求一开始就落日志：CLI 挂起期间（上游 hang/重试）此前一片空白，
+    // 用户看日志分不清「在跑」还是「死了」
+    _log('$publicName → ${u.id}（CLI 通路）');
     final id = 'chatcmpl-${DateTime.now().millisecondsSinceEpoch}';
     final created = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final model = route.upstreamModel;

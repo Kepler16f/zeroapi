@@ -1109,7 +1109,10 @@ void _coreKernelCompatTests() {
       test('$type：mihomo -t $kernelExpectation（127.0.0.1:$port）', () async {
         final bin = File(_coreKernelBin);
         if (!bin.existsSync()) {
+          // markTestSkipped 只记录跳过、不中断执行，必须显式 return，
+          // 否则下面的 Process.run 在没有 mihomo 的机器（CI）上直接炸
           markTestSkipped('未找到内置内核 $_coreKernelBin，跳过内核校验');
+          return;
         }
 
         final pool = ProxyPool();

@@ -58,6 +58,9 @@ class GatewayService extends ChangeNotifier {
     };
     unawaited(ModelsDev.instance.start());
     // 首次启动自动接入 WorkBuddy 号池（仅在随包运行时存在时；只做一次）
+    // 用户手动指定的 CLI 路径优先于自动探测
+    OpenCodeRuntime.overridePath =
+        config.opencodeCliPath.isEmpty ? null : config.opencodeCliPath;
     await WorkBuddy.seedIfNeeded(config);
     // 旧的 zen 直连条目自 2026-10-24 起全量 429（上游改按 TLS 指纹识别），
     // 迁移成 CLI 通路（id/模型前缀不变，客户端配置无需改）
@@ -92,6 +95,11 @@ class GatewayService extends ChangeNotifier {
       final rt = UpstreamRuntime(def)..onStatusChanged = refreshRoutesNow;
       _runtimes.add(rt);
       rt.startPeriodicProbe();
+      // managed 立即拉起/探活：此前只靠 30s 的周期定时器，冷启动后
+      // 内置供应商（zen CLI/号池）要干等 30s 才出现，期间请求全 404
+      if (def.enabled && def.type == 'managed') {
+        unawaited(rt.ensure());
+      }
     }
     server =
         ProxyServer(
@@ -286,6 +294,19 @@ class GatewayService extends ChangeNotifier {
           '（约 177MB，来自 npm 官方包），或自行安装 opencode-ai 后重启应用。';
     }
     addUpstream(def);
+    return null;
+  }
+
+  /// 用户手动指定了新的 CLI 路径：更新 def.command 并重启 serve 子进程。
+  /// 返回 null=成功；否则为失败原因。
+  Future<String?> updateOpenCodeCommand(String exePath) async {
+    final rt = _runtimes.where((r) => r.def.id == OpenCode.id).firstOrNull;
+    if (rt == null) return 'OpenCode CLI 尚未接入';
+    rt.def
+      ..command = exePath
+      ..env['OPENCODE_API_KEY'] = '';
+    rt.restartChild();
+    unawaited(Future.delayed(const Duration(milliseconds: 500), rt.ensure));
     return null;
   }
 

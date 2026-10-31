@@ -269,6 +269,10 @@ class GatewayConfig {
   /// 独占模型不受此影响（恒走自己唯一的出口区）。
   String workbuddyPreferredRealm;
 
+  /// 用户手动指定的 opencode CLI 可执行文件路径。非空时优先于自动探测
+  /// （自动探测=PATH/npm 全局/常见安装位，见 OpenCodeRuntime.findExecutable）。
+  String opencodeCliPath;
+
   GatewayConfig({
     this.host = '127.0.0.1',
     this.port = 8123,
@@ -280,6 +284,7 @@ class GatewayConfig {
     this.closeToTray = true,
     this.workbuddySeeded = false,
     this.workbuddyPreferredRealm = '',
+    this.opencodeCliPath = '',
   }) : keys = keys ?? [];
 
   /// 兼容旧语义：默认 key = 池中第一把
@@ -340,6 +345,7 @@ class GatewayConfig {
       cfg.allowLan = (g['allowLan'] ?? false) as bool;
       cfg.workbuddySeeded =
           (g['workbuddySeeded'] ?? cfg.workbuddySeeded) as bool;
+      cfg.opencodeCliPath = (g['opencodeCliPath'] ?? cfg.opencodeCliPath) as String;
       cfg.workbuddyPreferredRealm =
           (g['workbuddyPreferredRealm'] ?? cfg.workbuddyPreferredRealm)
               as String;
@@ -388,6 +394,7 @@ class GatewayConfig {
           'anthropicEnabled': anthropicEnabled,
           'closeToTray': closeToTray,
           'workbuddySeeded': workbuddySeeded,
+          if (opencodeCliPath.isNotEmpty) 'opencodeCliPath': opencodeCliPath,
           'workbuddyPreferredRealm': workbuddyPreferredRealm,
         },
         'upstreams': upstreams.map((u) => u.toJson()).toList(),

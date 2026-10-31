@@ -33,6 +33,14 @@ class OpenCodeApi {
   final String baseUrl;
   final HttpClient _client;
 
+  /// retry 事件回调（可选）：CLI 重试上游失败时通知（网关记日志用）。
+  static void Function(String message)? onRetryEvent;
+
+  /// 停滞看门狗时长：超过此时长没有任何 SSE 事件/响应即中止本轮。
+  /// 默认 120s；测试注入短值。模型思考几分钟属正常——事件流会持续
+  /// 推 retry/heartbeat 等事件刷新活动时间，只有真 hang 才会触发。
+  static Duration stallTimeout = const Duration(seconds: 120);
+
   /// 最近一轮的真实 token 用量（serve 的 info.tokens）；流完成前读到 0。
   ({int input, int output}) lastUsage = (input: 0, output: 0);
 
@@ -82,6 +90,7 @@ class OpenCodeApi {
   ) async {
     HttpClientResponse? eventResp;
     StreamSubscription<String>? sub;
+    Timer? stall;
     try {
       final sid = await createSession();
       // 1) 先订阅事件流，再发消息——否则可能错过开头增量
@@ -100,12 +109,39 @@ class OpenCodeApi {
       // 等它重试完再报错会让客户端干等数分钟——错误一到就立刻如实抛出
       final upstreamError = Completer<Object>();
 
+      // 停滞看门狗：serve 可能既不返回响应、也不发任何事件（上游 hang，
+      // CLI 干等），实测挂 7 分钟无任何输出。任何事件都会刷新 lastActivity；
+      // 超过 stallTimeout 无活动（或压根没等到 /event）就报错收场，
+      // 不让客户端无限等。时长可注入（测试用短值）。
+      var lastActivity = DateTime.now();
+      void ping() => lastActivity = DateTime.now();
+      void startStall() {
+        stall = Timer.periodic(stallTimeout ~/ 4, (t) {
+          if (done || finished.isCompleted || upstreamError.isCompleted) {
+            t.cancel();
+            return;
+          }
+          if (DateTime.now().difference(lastActivity) > stallTimeout) {
+            t.cancel();
+            final e = OpenCodeUpstreamError(
+              message: 'opencode CLI ${stallTimeout.inSeconds}s 无任何响应'
+                  '（上游可能已挂起），已中止本轮',
+              statusCode: 504,
+            );
+            if (!upstreamError.isCompleted) upstreamError.completeError(e);
+            if (!finished.isCompleted) finished.completeError(e);
+          }
+        });
+      }
+      startStall();
+
       sub = eventResp
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
         if (done) return;
         if (!line.startsWith('data:')) return;
+        ping();
         Map<String, dynamic> j;
         try {
           j = jsonDecode(line.substring(5)) as Map<String, dynamic>;
@@ -166,6 +202,7 @@ class OpenCodeApi {
           // 识别出来立即报错，别让客户端干等。
           if (st['type'] == 'retry') {
             final msg = (st['message'] ?? '').toString();
+            if (msg.isNotEmpty) onRetryEvent?.call(msg);
             if (msg.isNotEmpty && Zen.isQuotaExhausted(msg)) {
               final e = OpenCodeUpstreamError(message: msg, statusCode: 429);
               if (!upstreamError.isCompleted) upstreamError.completeError(e);
@@ -235,15 +272,13 @@ class OpenCodeApi {
       // 3) 等事件流自然结束（idle）或短暂兜底
       await finished.future.timeout(const Duration(seconds: 5), onTimeout: () {});
       done = true;
-      await ctrl.close();
     } catch (e, st) {
-      if (!ctrl.isClosed) {
-        ctrl.addError(e, st);
-        await ctrl.close();
-      }
+      if (!ctrl.isClosed) ctrl.addError(e, st);
     } finally {
+      stall?.cancel();
       await sub?.cancel();
       eventResp?.detachSocket();
+      if (!ctrl.isClosed) await ctrl.close();
     }
   }
 

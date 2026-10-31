@@ -63,31 +63,57 @@ class OpenCodeRuntime {
   /// 本地候选可执行文件路径，按优先级排列。
   static List<String> candidatePaths() {
     final out = <String>[];
-    if (Platform.isWindows) {
-      final appData = Platform.environment['APPDATA'] ?? '';
-      final localAppData = Platform.environment['LOCALAPPDATA'] ?? '';
-      final home = Platform.environment['USERPROFILE'] ?? '';
-      // 我们按需下载落地的位置
-      out.add('${dataRoot().path}/bin/opencode.exe');
-      // npm 全局装过的（zengate 的依赖、用户自己 npm i -g opencode-ai）
-      if (appData.isNotEmpty) {
-        out.add('$appData\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe');
-        out.add('$appData\\npm\\node_modules\\zengate\\node_modules\\opencode-ai\\bin\\opencode.exe');
-      }
+    // 按需下载的落地位（全平台一致）
+    out.add('${dataRoot().path}/bin/opencode');
+    if (!Platform.isWindows) {
+      // Linux/macOS：常见安装位（官方 install 脚本、npm 全局、brew）
+      final home = Platform.environment['HOME'] ?? '';
       if (home.isNotEmpty) {
-        out.add('$home\\.local\\bin\\opencode.exe');
-        out.add('$home\\.bun\\bin\\opencode.exe');
+        out.add('$home/.opencode/bin/opencode');
+        out.add('$home/.local/bin/opencode');
+        out.add('$home/.bun/bin/opencode');
+        out.add('$home/.npm-global/bin/opencode');
       }
-      if (localAppData.isNotEmpty) {
-        out.add('$localAppData\\Programs\\opencode\\opencode.exe');
-      }
-      out.add(r'C:\Program Files\opencode\opencode.exe');
+      out.add('/usr/local/bin/opencode');
+      out.add('/opt/homebrew/bin/opencode');
+      final npmGlobal = Platform.environment['HOME'] != null
+          ? '${Platform.environment['HOME']}/.npm-global/lib/node_modules/opencode-ai/bin/opencode'
+          : '';
+      if (npmGlobal.isNotEmpty) out.add(npmGlobal);
+      return out;
     }
+    final appData = Platform.environment['APPDATA'] ?? '';
+    final localAppData = Platform.environment['LOCALAPPDATA'] ?? '';
+    final home = Platform.environment['USERPROFILE'] ?? '';
+    // 我们按需下载落地的位置
+    out.add('${dataRoot().path}/bin/opencode.exe');
+    // npm 全局装过的（zengate 的依赖、用户自己 npm i -g opencode-ai）。
+    // 路径统一用正斜杠：Windows 的 dart:io 全程接受，免去反斜杠转义。
+    if (appData.isNotEmpty) {
+      out.add('$appData/npm/node_modules/opencode-ai/bin/opencode.exe');
+      out.add(
+          '$appData/npm/node_modules/zengate/node_modules/opencode-ai/bin/opencode.exe');
+    }
+    if (home.isNotEmpty) {
+      out.add('$home/.local/bin/opencode.exe');
+      out.add('$home/.bun/bin/opencode.exe');
+    }
+    if (localAppData.isNotEmpty) {
+      out.add('$localAppData/Programs/opencode/opencode.exe');
+    }
+    out.add('C:/Program Files/opencode/opencode.exe');
     return out;
   }
 
+  /// 用户手动指定的路径（config.opencodeCliPath）：非空时最高优先级，
+  /// 盖过一切自动探测。由 service 层在启动/用户修改时写入。
+  static String? overridePath;
+
   /// 已就绪的 CLI 路径；没有则 null。
+  /// 优先级：用户指定 > 下载落地位/npm 全局等候选 > PATH。
   static String? findExecutable() {
+    final o = overridePath;
+    if (o != null && o.isNotEmpty && File(o).existsSync()) return o;
     for (final p in candidatePaths()) {
       if (p.isNotEmpty && File(p).existsSync()) return p;
     }
