@@ -1290,7 +1290,7 @@ class _UsagePageState extends State<UsagePage> {
               child: Row(
                 children: [
                   const Text(
-                    '网关日志（最新一条）',
+                    '网关日志（本次运行）',
                     style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const Spacer(),
@@ -1334,13 +1334,14 @@ class _UsagePageState extends State<UsagePage> {
                           ),
                         ),
                       )
-                    // 只显示最新一条：失败重试会把「⟳ 第 N 次失败」刷成一大
-                    // 串黄字，看的人只关心现在这一轮发生了什么，历史在「复制」
-                    // 按钮里仍可取全量（200 条环形缓冲）
-                    : ListView(
-                        children: [
-                          Text(
-                            logs.first,
+                    // 全量展示（logs[0] 最新在最上），往下滚动看历史；
+                    // 排障需要完整时间线，只留一条不够用
+                    : ListView.builder(
+                        itemCount: logs.length,
+                        itemBuilder: (context, i) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 1),
+                          child: Text(
+                            logs[i],
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
@@ -1348,7 +1349,7 @@ class _UsagePageState extends State<UsagePage> {
                               fontSize: 11,
                             ),
                           ),
-                        ],
+                        ),
                       ),
               ),
             ),

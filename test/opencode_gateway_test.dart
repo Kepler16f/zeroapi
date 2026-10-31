@@ -129,12 +129,8 @@ void main() {
                          'text': t}
               }
             }));
-        emit('Hel');
-        emit('Hello <$text>');
         if (injectRetry != null) {
-          // CLI 额度耗尽的真实形态：只发 retry 事件、不发 idle（CLI 一直
-          // 重试，message 端点永不返回）。retry 必须在 idle 位置之前——
-          // idle 一到网关侧 /event 订阅就该结束，再发的都收不到。
+          // 真实形态：额度耗尽 → 没有任何内容增量，retry 事件先于首增量
           events.add(jsonEncode({
             'type': 'session.status',
             'properties': {
@@ -147,6 +143,8 @@ void main() {
           await req.response.close();
           return;
         }
+        emit('Hel');
+        emit('Hello <$text>');
         events.add(jsonEncode({
           'type': 'session.status',
           'properties': {
@@ -346,6 +344,21 @@ void main() {
     expect(resp.statusCode, 429, reason: '$body');
     expect(body['error']['code'], 'free_quota_exhausted');
     expect(sw.elapsedMilliseconds / 1000, lessThan(15));
+    injectRetry = null;
+  }, timeout: const Timeout(Duration(seconds: 40)));
+
+  test('流式 + 首增量前额度耗尽 → 干净 429（不提交 200）', () async {
+    injectRetry = 'Free usage exceeded, subscribe to OpenCode Go to keep going';
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'hi'}
+      ],
+      'stream': true
+    });
+    final body = jsonDecode(await utf8.decodeStream(resp));
+    expect(resp.statusCode, 429, reason: '$body');
+    expect(body['error']['code'], 'free_quota_exhausted');
     injectRetry = null;
   }, timeout: const Timeout(Duration(seconds: 40)));
 }

@@ -1465,11 +1465,26 @@ class ProxyServer {
     final model = route.upstreamModel;
     var prompt = 0, completion = 0;
 
-    // 流式分支一旦提交 200，后续出错不能再写 JSON 错误体（会二次写响应）：
-    // 改为在流里补一个 error 帧 + [DONE]，客户端据此看到失败。
+    // 与 _forwardZen 同一原则：**收到上游第一个增量之前不向客户端提交 200**。
+    // CLI 额度耗尽时会在 ~1s 内报错——若此时已提交 200，错误只能走流内
+    // error 帧，客户端（ZCode）解析不了就显示 reason=unknown；未提交时
+    // 则能以干净的 429 JSON 返回，客户端按限流语义自动重试。
     var committed = false;
     try {
       if (clientWantsStream) {
+        final pieces = api.chat(
+            model: model,
+            messages: messages.cast<Map<String, dynamic>>().toList());
+        final it = StreamIterator(pieces);
+        String? first;
+        try {
+          if (await it.moveNext()) first = it.current;
+        } catch (e) {
+          // 首增量前失败：未提交，按未提交路径走干净的 429/502
+          prompt = api.lastUsage.input;
+          completion = api.lastUsage.output;
+          throw e;
+        }
         req.response.headers.contentType =
             ContentType('text', 'event-stream', charset: 'utf-8');
         req.response.headers.set('x-zeroapi-upstream', u.id);
@@ -1488,9 +1503,23 @@ class ProxyServer {
                 }
               ]
             })}\n\n'));
-        await for (final piece in api.chat(
-            model: model,
-            messages: messages.cast<Map<String, dynamic>>().toList())) {
+        if (first != null) {
+          completion += first.length;
+          req.response.add(utf8.encode('data: ${jsonEncode({
+                'id': id,
+                'object': 'chat.completion.chunk',
+                'created': created,
+                'model': model,
+                'choices': [
+                  {
+                    'index': 0,
+                    'delta': {'content': first}
+                  }
+                ]
+              })}\n\n'));
+        }
+        while (await it.moveNext()) {
+          final piece = it.current;
           completion += piece.length;
           req.response.add(utf8.encode('data: ${jsonEncode({
                 'id': id,
