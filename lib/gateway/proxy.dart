@@ -1483,7 +1483,7 @@ class ProxyServer {
           // 首增量前失败：未提交，按未提交路径走干净的 429/502
           prompt = api.lastUsage.input;
           completion = api.lastUsage.output;
-          throw e;
+          rethrow;
         }
         req.response.headers.contentType =
             ContentType('text', 'event-stream', charset: 'utf-8');
