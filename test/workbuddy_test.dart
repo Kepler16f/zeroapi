@@ -7,11 +7,16 @@ import 'package:zeroapi/gateway/workbuddy.dart';
 
 void main() {
   test('缓存模型目录：解析出模型 id 与出口区', () async {
-    final appData = Platform.environment['APPDATA'] ?? '';
-    final catalog = Directory(
-      '$appData${Platform.pathSeparator}zeroapi${Platform.pathSeparator}'
-      'workbuddy${Platform.pathSeparator}catalog',
-    )..createSync(recursive: true);
+    // 用临时目录：此前直接写 %APPDATA%\zeroapi\workbuddy\catalog，
+    // 1) 在非 Windows 上 APPDATA 为空 → 路径退化成 /zeroapi 权限拒绝
+    //    （CI Linux 直接挂）；2) 会往真实用户数据目录写假模型目录，
+    //    污染本机号池的模型列表。
+    final root = Directory.systemTemp.createTempSync('zeroapi-wb-test');
+    addTearDown(() {
+      if (root.existsSync()) root.deleteSync(recursive: true);
+    });
+    final catalog = Directory('${root.path}/catalog')
+      ..createSync(recursive: true);
     File('${catalog.path}/product-config-cn.json').writeAsStringSync(
       jsonEncode({
         'data': {
@@ -32,7 +37,7 @@ void main() {
         },
       }),
     );
-    final cached = await WorkBuddy.cachedCatalog();
+    final cached = await WorkBuddy.cachedCatalog(root: root);
     expect(cached.realms.keys, containsAll(['only-cn', 'gpt-5.5']));
     expect(cached.realms['only-cn'], 'cn');
     expect(cached.realms['gpt-5.5'], 'intl');

@@ -38,9 +38,12 @@ class WorkBuddy {
   /// 填上，引擎就绪后再由真实探测覆盖。
   ///
   /// 返回：模型 id → 出口区（cn/intl），以及两区都有的模型（共有模型）。
+  ///
+  /// [root] 可覆盖号池数据根目录（测试用临时目录，避免往真实用户数据
+  /// 目录写假目录、污染本机号池的模型列表）。
   static Future<({Map<String, String> realms, Set<String> shared})>
-      cachedCatalog() async {
-    final dir = Directory('${dataRoot().path}/catalog');
+      cachedCatalog({Directory? root}) async {
+    final dir = Directory('${(root ?? dataRoot()).path}/catalog');
     final realms = <String, String>{};
     final shared = <String>{};
     for (final realm in const ['cn', 'intl']) {
