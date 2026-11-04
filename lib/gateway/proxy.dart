@@ -1222,8 +1222,8 @@ class ProxyServer {
                     '供应商 ${u.id} HTTP ${uresp.statusCode}')
                 as String;
         final errType = anthropic
-            ? 'upstream_error'
-            : (parsed?['error']?['type'] ?? 'upstream_error') as String;
+            ? _defaultErrType(uresp.statusCode, anthropic: true)
+            : (parsed?['error']?['type'] as String? ?? _defaultErrType(uresp.statusCode));
         return failJson({'message': errMsg, 'type': errType}, uresp.statusCode);
       }
       // 成功即解除「仅 Pro」标记（可能刚加了付费账号）
@@ -2674,6 +2674,33 @@ class ProxyServer {
       return {
         'error': {'message': s},
       };
+    }
+  }
+
+  /// 默认错误类型按状态码给：400 必须是 invalid_request_error（Anthropic 侧
+  /// invalid_request_error），而不是 upstream_error。
+  ///
+  /// 实测教训（2026-11-04）：WorkBuddy 对超长上下文的 400 被标成
+  /// upstream_error 后，ZCode 视为「可重试」并连发 17 次同一请求（每次约
+  /// 4-5s，全被上游拒绝）。400 是请求本身的问题，客户端不该重试，必须用
+  /// 标准类型让它立刻停手并把原因显示给用户。
+  String _defaultErrType(int status, {bool anthropic = false}) {
+    if (anthropic) {
+      return status == 400 ? 'invalid_request_error' : 'api_error';
+    }
+    switch (status) {
+      case 400:
+        return 'invalid_request_error';
+      case 401:
+        return 'authentication_error';
+      case 403:
+        return 'permission_error';
+      case 404:
+        return 'not_found_error';
+      case 429:
+        return 'rate_limit_exceeded';
+      default:
+        return status >= 500 ? 'api_error' : 'upstream_error';
     }
   }
 
