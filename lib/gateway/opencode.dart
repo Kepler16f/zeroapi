@@ -32,9 +32,10 @@ class OpenCode {
   /// hub 默认端口；被占用时顺延（最多试 11 个）。
   static const defaultPort = 4097;
 
-  /// 免费档模型（2026-10-25 实测：9 个中 7 个可用）。
-  /// beam-free 上游按国家拒绝（"not available in your country"）、
-  /// jev-1.13-free 上游自身 500——标注后 UI 置灰，用户不白点。
+  /// 免费档模型（2026-11-04 实测：上游现返回 9 个；10-25 的 7 个之后新增
+  /// crouton-alpha-free、pulse-alpha-free）。这只是静态兜底清单，运行时
+  /// 以 serve 探测为准。beam-free 上游按国家拒绝（"not available in your
+  /// country"）、jev-1.13-free 上游自身 500——标注后 UI 置灰，用户不白点。
   static const freeModels = <String>[
     'deepseek-v4.1-flash-free',
     'glm-5.3-flash-free',
@@ -43,6 +44,8 @@ class OpenCode {
     'mimo-v2.6-flash-free',
     'nemotron-3.5-lightning-free',
     'nemotron-3.5-super-vl-free',
+    'crouton-alpha-free',
+    'pulse-alpha-free',
   ];
 
   /// 已知暂不可用的免费模型 + 原因（UI 展示用）。

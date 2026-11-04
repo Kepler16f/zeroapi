@@ -64,8 +64,8 @@ void main() {
       expect(def.env['OPENCODE_DISABLE_AUTOUPDATE'], '1');
     });
 
-    test('免费档清单：7 个可用、2 个标注原因且互斥', () {
-      expect(OpenCode.freeModels.length, 7);
+    test('免费档清单：9 个可用、2 个标注原因且互斥', () {
+      expect(OpenCode.freeModels.length, 9);
       expect(OpenCode.unavailableFreeModels.length, 2);
       expect(
           OpenCode.freeModels

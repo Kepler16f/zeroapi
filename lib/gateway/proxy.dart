@@ -1212,9 +1212,13 @@ class ProxyServer {
         _log('$publicName ← 供应商 ${u.id} HTTP ${uresp.statusCode}');
         _account(publicName, u.id, 0, 0, true);
         final parsed = err.isNotEmpty ? _safeJson(err) : null;
+        // WorkBuddy 等上游的错误体是顶层 {"code":11115,"msg":"prompt is too
+        // long: 100001 tokens > 100000 maximum"}——不提取 msg 就只剩笼统的
+        // 「供应商 workbuddy HTTP 400」，真实原因（上下文超限）全被吞掉。
         final errMsg =
             (parsed?['error']?['message'] ??
                     parsed?['message'] ??
+                    parsed?['msg'] ??
                     '供应商 ${u.id} HTTP ${uresp.statusCode}')
                 as String;
         final errType = anthropic
