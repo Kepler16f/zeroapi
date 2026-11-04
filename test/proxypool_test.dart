@@ -66,6 +66,35 @@ proxy-groups:
 ''';
 
 void main() {
+  test('定向探活判失败的节点在该用途里被剔除，其它用途不受影响', () {
+    final pool = ProxyPool();
+    pool.importFromText(
+      'http://10.0.0.1:3128#A\nhttp://10.0.0.2:3128#B\n',
+      groupName: '导入',
+    );
+    final zen = ProxyPool.pUpstream('zen');
+    final other = ProxyPool.pUpstream('other');
+    pool.assign(zen, '导入');
+    pool.assign(other, '导入');
+    final nodes = pool.groups.firstWhere((g) => g.name == '导入').nodes;
+    expect(nodes.length, 2);
+
+    // A 节点打不开 zen 的目标站点（opencode.ai）
+    pool.setPurposeTarget(zen, 'https://opencode.ai/');
+    pool.markTargetFailed(nodes.first.id, zen);
+
+    final zenCandidates = poolCandidatesFor(pool, zen);
+    expect(zenCandidates.length, 1);
+    expect(zenCandidates.first.nodeId, nodes[1].id);
+
+    // 其它用途没有目标站点约束，仍能拿到两个节点
+    expect(poolCandidatesFor(pool, other).length, 2);
+
+    // 恢复后重新进入候选
+    pool.clearTargetFailed(nodes.first.id, zen);
+    expect(poolCandidatesFor(pool, zen).length, 2);
+  });
+
   _subscriptionTests();
   _tlsLinkTests();
   _coreConfigTests();

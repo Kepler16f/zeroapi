@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
 import 'hostnet.dart';
 import 'proxypool.dart';
 import 'nodedns.dart';
@@ -17,8 +19,34 @@ import 'nodedns.dart';
 /// 安全边界：listener 只绑回环、`allow-lan: false`，不触碰系统代理；
 /// 配置文件写在 %APPDATA%\zeroapi\proxy-core，不进入用户 config.json。
 class ProxyCore {
-  ProxyCore._();
+  ProxyCore._({Directory? coreDir, Directory? dataDir})
+    : _coreDirOverride = coreDir,
+      _dataDirOverride = dataDir;
+
+  /// Creates an isolated instance for lifecycle tests. The caller owns both
+  /// directories; no application APPDATA paths are read or modified.
+  @visibleForTesting
+  factory ProxyCore.testing({
+    required Directory coreDir,
+    required Directory dataDir,
+  }) => ProxyCore._(coreDir: coreDir, dataDir: dataDir);
+
   static final ProxyCore instance = ProxyCore._();
+  final Directory? _coreDirOverride;
+  final Directory? _dataDirOverride;
+
+  // All public lifecycle operations share one queue. In particular, sync may
+  // not race another sync or a caller that is stopping the core.
+  Future<void> _lifecycle = Future<void>.value();
+
+  Future<T> _serialized<T>(Future<T> Function() action) {
+    final result = _lifecycle.then((_) => action());
+    _lifecycle = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
 
   Process? _proc;
   String _sig = '';
@@ -45,7 +73,11 @@ class ProxyCore {
 
   static bool get available => findCoreDir() != null;
 
-  static Directory _dataDir() {
+  Directory _dataDir() {
+    if (_dataDirOverride case final dir?) {
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      return dir;
+    }
     final base = Platform.isWindows
         ? Platform.environment['APPDATA']!
         : '${Platform.environment['HOME']}/.config';
@@ -56,14 +88,18 @@ class ProxyCore {
 
   /// 按代理池当前内容同步内核：无加密节点 → 停止；节点有变化 → 重启；
   /// 无变化 → 保留现有进程。结束后把 nodeId→端口 写回 [pool.corePorts]。
-  Future<void> sync(ProxyPool pool) async {
+  Future<void> sync(ProxyPool pool) => _serialized(() => _sync(pool));
+
+  Future<void> _sync(ProxyPool pool) async {
+    // IPv6 出口探测是异步的（不阻塞 UI），先刷新再决定是否跳过 IPv6 节点。
+    await HostNetwork.refresh();
     final nodes = [
       for (final n in pool.allNodes)
         if (ProxyPool.needsCore(n)) n,
     ];
-    final coreDir = findCoreDir();
+    final coreDir = _coreDirOverride ?? findCoreDir();
     if (nodes.isEmpty || coreDir == null) {
-      await stop();
+      await _stop();
       _ports.clear();
       pool.corePorts = {};
       return;
@@ -84,14 +120,18 @@ class ProxyCore {
         [n.id, n.type, n.host, n.port, n.password, n.extras, overrides[n.id]],
     ]);
     if (sig == _sig && _proc != null) {
-      pool.corePorts = Map<String, int>.from(_ports);
-      return;
+      if (await _listenersAlive(_ports.values)) {
+        pool.corePorts = Map<String, int>.from(_ports);
+        return;
+      }
+      // The kernel may have exited unexpectedly while its handle was still
+      // present, or a listener may have died independently. Rebuild below.
     }
-    await stop();
+    final previous = Map<String, int>.from(_ports);
+    await _stop();
     final dataDir = _dataDir();
     // 重启内核时优先复用该节点原来的端口：节点域名重解析/IP 轮换导致的
     // 重启不应把下游指令全部改写，端口稳定也能避免瞬时 502。
-    final previous = Map<String, int>.from(_ports);
     final ports = <String, int>{};
     for (final n in nodes) {
       final cached = previous[n.id];
@@ -111,8 +151,11 @@ class ProxyCore {
         : null;
     final cfg = File('${dataDir.path}/config.yaml')
       ..writeAsStringSync(
-        pool.coreConfigYaml(ports,
-            serverOverrides: overrides, bindInterface: bindIface),
+        pool.coreConfigYaml(
+          ports,
+          serverOverrides: overrides,
+          bindInterface: bindIface,
+        ),
       );
     final exe = File('${coreDir.path}/mihomo.exe');
     // 先做配置校验，语法错误立即失败，避免反复拉起坏进程
@@ -144,30 +187,43 @@ class ProxyCore {
       dataDir.path,
       '-f',
       cfg.path,
-    ], mode: ProcessStartMode.detachedWithStdio);
-    proc.stdout.listen(log.add);
-    proc.stderr.listen(log.add);
+    ], mode: ProcessStartMode.normal);
+    proc.stdout.listen(log.add, onError: (_) {});
+    proc.stderr.listen(log.add, onError: (_) {});
     _proc = proc;
     _sig = sig;
+    // The exit callback is identity guarded: a delayed exit from an older
+    // process must never clear a newer process' handles or published ports.
+    unawaited(
+      proc.exitCode.then(
+        (_) async {
+          if (identical(_proc, proc)) {
+            _proc = null;
+            _sig = '';
+            _ports.clear();
+          }
+          await log.close();
+        },
+        onError: (_) async {
+          await log.close();
+        },
+      ),
+    );
     // 等待所有 listener 可连接（最多 6 秒）
     final deadline = DateTime.now().add(const Duration(seconds: 6));
+    var ready = false;
     while (DateTime.now().isBefore(deadline)) {
-      var all = true;
-      for (final p in ports.values) {
-        try {
-          final s = await Socket.connect(
-            '127.0.0.1',
-            p,
-            timeout: const Duration(milliseconds: 250),
-          );
-          s.destroy();
-        } catch (_) {
-          all = false;
-          break;
-        }
+      final all = await _listenersAlive(ports.values);
+      if (all) {
+        ready = true;
+        break;
       }
-      if (all) break;
       await Future.delayed(const Duration(milliseconds: 200));
+    }
+    if (!ready) {
+      await _stop();
+      pool.corePorts = {};
+      return;
     }
     _ports
       ..clear()
@@ -180,8 +236,22 @@ class ProxyCore {
     await log.flush();
   }
 
-  Future<void> stop() async {
+  Future<void> stop() => _serialized(_stop);
+
+  /// Abruptly kills the child, useful to exercise unexpected-exit recovery.
+  @visibleForTesting
+  Future<void> killForTesting() => _serialized(() async {
+    final process = _proc;
+    if (process == null) return;
+    process.kill();
+    try {
+      await process.exitCode.timeout(const Duration(seconds: 5));
+    } catch (_) {}
+  });
+
+  Future<void> _stop() async {
     final p = _proc;
+    final oldPorts = _ports.values.toList();
     _proc = null;
     _sig = '';
     if (p != null) {
@@ -191,7 +261,26 @@ class ProxyCore {
       try {
         Process.killPid(p.pid);
       } catch (_) {}
+      // Process.start (normal mode) provides exitCode. Do not pick replacement
+      // ports while the old kernel can still own its listeners.
+      try {
+        await p.exitCode.timeout(const Duration(seconds: 8));
+      } on TimeoutException {
+        try {
+          Process.killPid(p.pid);
+        } catch (_) {}
+        try {
+          await p.exitCode.timeout(const Duration(seconds: 2));
+        } catch (_) {}
+      } catch (_) {}
+      for (final port in oldPorts) {
+        final deadline = DateTime.now().add(const Duration(seconds: 3));
+        while (DateTime.now().isBefore(deadline) && !await _portFree(port)) {
+          await Future.delayed(const Duration(milliseconds: 50));
+        }
+      }
     }
+    _ports.clear();
   }
 
   static Future<bool> _portFree(int port) async {
@@ -202,6 +291,22 @@ class ProxyCore {
     } catch (_) {
       return false;
     }
+  }
+
+  static Future<bool> _listenersAlive(Iterable<int> ports) async {
+    for (final port in ports) {
+      try {
+        final socket = await Socket.connect(
+          InternetAddress.loopbackIPv4,
+          port,
+          timeout: const Duration(milliseconds: 250),
+        );
+        socket.destroy();
+      } catch (_) {
+        return false;
+      }
+    }
+    return true;
   }
 
   static Future<int?> _freePort() async {

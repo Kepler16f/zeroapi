@@ -91,16 +91,40 @@ class HostNetwork {
       _ipv6Ok = true;
       return true;
     }
-    // 连一个 IPv6-only 的公共 DNS：成功即说明有 IPv6 出口
-    final r = Process.runSync(
-      'powershell',
-      ['-NoProfile', '-Command', 'try {(Invoke-WebRequest -Uri "https://api64.ipify.org" -TimeoutSec 5 -UseBasicParsing).Content} catch {""}'],
-      stdoutEncoding: utf8,
-      stderrEncoding: utf8,
-    );
-    final body = (r.stdout as String).trim();
-    _ipv6Ok = body.contains(':');
+    // 未探测前先乐观放行：真正的探测是异步的（见 [refresh]），避免在探测
+    // 完成前把可用的 IPv6 节点误判为不可用。
+    _ipv6Ok = true;
     return _ipv6Ok!;
+  }
+
+  /// 异步探测 IPv6 出口并缓存结果。
+  ///
+  /// 直连 IPv6-only 的公共 DNS（53 端口）判断是否有 IPv6 出口：不用
+  /// PowerShell 走 HTTP，那会拉起子进程，且在受限网络下长时间挂起
+  /// （此前 IPv6 用例把整个测试套件拖住）。socket 有 2s 超时，失败即视为
+  /// 无 IPv6 出口。
+  static Future<bool> refresh() async {
+    if (!Platform.isWindows) {
+      _ipv6Ok = true;
+      return true;
+    }
+    const servers = ['2606:4700:4700::1111', '2001:4860:4860::8888'];
+    for (final host in servers) {
+      try {
+        final socket = await Socket.connect(
+          host,
+          53,
+          timeout: const Duration(seconds: 2),
+        );
+        socket.destroy();
+        _ipv6Ok = true;
+        return true;
+      } catch (_) {
+        continue;
+      }
+    }
+    _ipv6Ok = false;
+    return false;
   }
   /// 宿主是否开着 TUN/虚拟网卡（用于 UI 提示与自动绑定）。
   static bool hasTunnelAdapter() {

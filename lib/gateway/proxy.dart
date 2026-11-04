@@ -34,10 +34,12 @@ class ModelRoute {
 class _ReqCtx {
   final String keyLabel;
   final Stopwatch sw = Stopwatch()..start();
+  final String requestId = '${DateTime.now().microsecondsSinceEpoch}';
   String mode = ''; // chat | anthropic | responses
   bool stream = false;
   String model = '';
   int cached = 0; // 上游 usage.prompt_tokens_details.cached_tokens
+  int cacheWrite = 0;
   _ReqCtx(this.keyLabel);
 }
 
@@ -227,9 +229,21 @@ class ProxyServer {
   /// 首次检测到 IP 级滥用封锁时回调一次（解封后重置）。UI 据此提示用户
   /// 启用出口代理或一键部署 Worker——Worker 模式默认不启用，只在被封时问。
   void Function(String upstreamId)? onIpBan;
+
   /// zen/CLI 通路命中「免费额度耗尽」时回调：上层换一个出口 IP 并重启
   /// CLI 子进程（CLI 进程级绑定出口，换 IP 必须换进程）。
   void Function(String upstreamId)? onQuotaExhausted;
+
+  /// 出口连不通 → 换出口并等新进程就绪。返回是否成功换到新出口。
+  /// 换成功后调用方可原样重发该请求。
+  Future<bool> Function(String upstreamId)? onRotateEgress;
+  Future<void> Function()? onPrepareOpenCode;
+  void Function()? onOpenCodeFinished;
+
+  /// CLI 通路**成功**返回时回调：只有真 opencode CLI 身份才带免费额度，
+  /// 所以「这个出口今天有额度」只有 CLI 跑通才知道。上层据此把该出口
+  /// 标记为当天额度可用，下次优先复用（避免盲选撞到被别人烧穿的 IP）。
+  void Function(String upstreamId)? onOpenCodeSuccess;
   bool _ipBanSignaled = false;
   DateTime _lastUnknownRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -279,7 +293,16 @@ class ProxyServer {
       final dir = Directory(_usageDirPath);
       if (!dir.existsSync()) dir.createSync(recursive: true);
       File('${dir.path}/usage-$day.jsonl').writeAsStringSync(
-        '${jsonEncode({'ts': now.toIso8601String(), 'model': model, 'upstream': upstream, 'prompt': p, 'completion': c, 'error': err, if (cached > 0) 'cached': cached})}\n',
+        '${jsonEncode({
+          'ts': now.toIso8601String(),
+          'model': model,
+          'upstream': upstream,
+          'prompt': p,
+          'completion': c,
+          'error': err,
+          'cached': cached,
+          if (_ctx != null) ...{'request_id': _ctx!.requestId, 'elapsed_ms': _ctx!.sw.elapsedMilliseconds, 'key_label': _ctx!.keyLabel, 'mode': _ctx!.mode, 'stream': _ctx!.stream, 'cache_write': _ctx!.cacheWrite},
+        })}\n',
         mode: FileMode.append,
       );
     } catch (_) {}
@@ -358,6 +381,9 @@ class ProxyServer {
               (j['prompt'] ?? 0) as int,
               (j['completion'] ?? 0) as int,
               (j['error'] ?? false) as bool,
+              // 历史文件同样要读缓存命中数：否则「所有/本周」视图里
+              // cachedTokens 恒为 0，缓存命中率被算成 0.0%。
+              cached: (j['cached'] as num?)?.toInt() ?? 0,
               trendKey: m.group(1)!.substring(5),
             ); // MM-dd
           } catch (_) {}
@@ -434,6 +460,7 @@ class ProxyServer {
             (j['prompt'] ?? 0) as int,
             (j['completion'] ?? 0) as int,
             (j['error'] ?? false) as bool,
+            cached: (j['cached'] as num?)?.toInt() ?? 0,
             trendKey: DateTime.parse(j['ts'] as String).hour
                 .toString()
                 .padLeft(2, '0'),
@@ -546,6 +573,9 @@ class ProxyServer {
               'provider': r.upstream.def.callPrefix,
               'upstream_model': r.upstreamModel,
               'healthy': r.upstream.health == UpstreamHealth.healthy,
+              'catalog_healthy': r.upstream.health == UpstreamHealth.healthy,
+              if (r.upstream.modelCallErrors[r.upstreamModel] != null)
+                'last_call_error': r.upstream.modelCallErrors[r.upstreamModel],
               if (r.upstream.modelRealms[r.upstreamModel] != null)
                 'realm': r.upstream.modelRealms[r.upstreamModel],
               if (ProGate.instance.isPro(r.upstream.def.id, r.upstreamModel))
@@ -919,14 +949,39 @@ class ProxyServer {
       return;
     }
     if (u.isOpenCode) {
-      await _forwardOpenCode(
-        req,
-        route,
-        publicName,
-        body,
-        clientWantsStream: isStream,
-        anthropic: anthropic,
-      );
+      final key = 'cli:${u.id}';
+      if (!await _gate.acquire(key, 1, const Duration(seconds: 30))) {
+        return _json(req, {
+          'error': {'message': 'CLI 请求队列繁忙，请稍后重试', 'type': 'rate_limit_error'},
+        }, 429);
+      }
+      try {
+        try {
+          await onPrepareOpenCode?.call();
+        } on ZenExitUnavailable catch (e) {
+          // 没有可用出口：立刻如实失败，不要让客户端空等看门狗。
+          _account(publicName, route.upstream.id, 0, 0, true);
+          _log('$publicName ✗ ${route.upstream.id}: $e');
+          return _json(req, {
+            'error': {
+              'message': '$e',
+              'type': 'upstream_error',
+              'code': 'egress_unavailable',
+            },
+          }, 502);
+        }
+        await _forwardOpenCode(
+          req,
+          route,
+          publicName,
+          body,
+          clientWantsStream: isStream,
+          anthropic: anthropic,
+        );
+      } finally {
+        onOpenCodeFinished?.call();
+        _gate.release(key);
+      }
       return;
     }
     final tag = responsesApi
@@ -1408,6 +1463,9 @@ class ProxyServer {
           ureq.headers.set('Authorization', 'Bearer ${def.apiKey}');
         }
         extraHeaders.forEach((k, v) => ureq.headers.set(k, v));
+        if (def.id == 'workbuddy' && _ctx != null) {
+          ureq.headers.set('X-ZeroApi-Request-Id', _ctx!.requestId);
+        }
         ureq.add(payload);
         final uresp = await ureq.close().timeout(firstByteTimeout);
         if (cand?.nodeId != null) {
@@ -1445,9 +1503,14 @@ class ProxyServer {
   ///
   /// 与 _forwardZen 的差别：上游不是 OpenAI 兼容端点，而是原生会话协议；
   /// 没有 token 计数（opencode 不上报 usage），记账记 0。
-  Future<void> _forwardOpenCode(HttpRequest req, ModelRoute route,
-      String publicName, Map<String, dynamic> body,
-      {required bool clientWantsStream, bool anthropic = false}) async {
+  Future<void> _forwardOpenCode(
+    HttpRequest req,
+    ModelRoute route,
+    String publicName,
+    Map<String, dynamic> body, {
+    required bool clientWantsStream,
+    bool anthropic = false,
+  }) async {
     final u = route.upstream;
     void failJson(Map<String, dynamic> err, int status) => anthropic
         ? _json(req, {'type': 'error', 'error': err}, status)
@@ -1462,8 +1525,6 @@ class ProxyServer {
     }
 
     final messages = (body['messages'] as List?) ?? const [];
-    OpenCodeApi.onRetryEvent = (msg) =>
-        _log('$publicName ⟳ CLI 重试上游失败：$msg');
     // 请求一开始就落日志：CLI 挂起期间（上游 hang/重试）此前一片空白，
     // 用户看日志分不清「在跑」还是「死了」
     _log('$publicName → ${u.id}（CLI 通路）');
@@ -1476,17 +1537,57 @@ class ProxyServer {
     // 的 fast-rotation 同款：429 的 IP 立即 dustbin，同一请求换下一个出口
     // 重发，客户端无感；最多换 3 个，全烧穿才如实报 429。
     var committed = false;
-    final api = OpenCodeApi(u.def.baseUrl);
+    var api = OpenCodeApi(u.def.baseUrl)
+      ..onRetry = ((msg) => _log('$publicName ⟳ CLI 重试上游失败：$msg'))
+      ..onActivity = ((msg) => _log('$publicName · $msg'));
+    Timer? keepAlive;
+    var clientDisconnected = false;
+    unawaited(
+      req.response.done.then<void>(
+        (_) {},
+        onError: (Object _) {
+          clientDisconnected = true;
+          api.close();
+        },
+      ),
+    );
+    AnthropicStreamTransformer? converter;
+    void sendChunk(Map<String, dynamic> chunk) {
+      final data = jsonEncode(chunk);
+      final frames = converter == null
+          ? ['data: $data\n\n']
+          : chunk.containsKey('error')
+          ? [
+              'event: error\ndata: ${jsonEncode({'type': 'error', 'error': chunk['error']})}\n\n',
+            ]
+          : converter!.feed(data);
+      for (final frame in frames) {
+        req.response.add(utf8.encode(frame));
+      }
+    }
+
+    void finishStream() {
+      for (final frame in converter?.finish() ?? ['data: [DONE]\n\n']) {
+        req.response.add(utf8.encode(frame));
+      }
+    }
 
     // 与 _forwardZen 同一原则：**收到上游第一个增量之前不向客户端提交 200**。
     // CLI 额度耗尽时会在 ~1s 内报错——若此时已提交 200，错误只能走流内
     // error 帧，客户端（ZCode）解析不了就显示 reason=unknown；未提交时
     // 则能以干净的 429 JSON 返回，客户端按限流语义自动重试。
-    try {
+    //
+    // 换出口重试：额度耗尽/出口连不通都发生在提交之前，此时换节点重启
+    // CLI 后重发；首发加最多两次重试，总计最多三个已测出口。
+    Future<void> attempt() async {
+      converter = anthropic
+          ? AnthropicAdapter.streamTransformer(publicName)
+          : null;
       if (clientWantsStream) {
         final pieces = api.chat(
-            model: model,
-            messages: messages.cast<Map<String, dynamic>>().toList());
+          model: model,
+          messages: messages.cast<Map<String, dynamic>>().toList(),
+        );
         final it = StreamIterator(pieces);
         String? first;
         try {
@@ -1497,80 +1598,101 @@ class ProxyServer {
           completion = api.lastUsage.output;
           rethrow;
         }
-        req.response.headers.contentType =
-            ContentType('text', 'event-stream', charset: 'utf-8');
+        req.response.headers.contentType = ContentType(
+          'text',
+          'event-stream',
+          charset: 'utf-8',
+        );
         req.response.headers.set('x-zeroapi-upstream', u.id);
+        req.response.headers.set('Cache-Control', 'no-cache');
+        req.response.bufferOutput = false;
         req.response.statusCode = 200;
         committed = true;
         // 首帧：role
-        req.response.add(utf8.encode('data: ${jsonEncode({
-              'id': id,
-              'object': 'chat.completion.chunk',
-              'created': created,
-              'model': model,
-              'choices': [
-                {
-                  'index': 0,
-                  'delta': {'role': 'assistant'}
-                }
-              ]
-            })}\n\n'));
+        sendChunk({
+          'id': id,
+          'object': 'chat.completion.chunk',
+          'created': created,
+          'model': model,
+          'choices': [
+            {
+              'index': 0,
+              'delta': {'role': 'assistant'},
+            },
+          ],
+        });
         if (first != null) {
           completion += first.length;
-          req.response.add(utf8.encode('data: ${jsonEncode({
-                'id': id,
-                'object': 'chat.completion.chunk',
-                'created': created,
-                'model': model,
-                'choices': [
-                  {
-                    'index': 0,
-                    'delta': {'content': first}
-                  }
-                ]
-              })}\n\n'));
+          sendChunk({
+            'id': id,
+            'object': 'chat.completion.chunk',
+            'created': created,
+            'model': model,
+            'choices': [
+              {
+                'index': 0,
+                'delta': {'content': first},
+              },
+            ],
+          });
         }
+        // 已收到内容后的思考间隙保活；不把心跳算作上游生成进展。
+        keepAlive = Timer.periodic(const Duration(seconds: 15), (_) {
+          try {
+            req.response.add(
+              utf8.encode(
+                anthropic
+                    ? 'event: ping\ndata: {"type":"ping"}\n\n'
+                    : ': keep-alive\n\n',
+              ),
+            );
+          } catch (_) {
+            clientDisconnected = true;
+            api.close();
+          }
+        });
         while (await it.moveNext()) {
           final piece = it.current;
           completion += piece.length;
-          req.response.add(utf8.encode('data: ${jsonEncode({
-                'id': id,
-                'object': 'chat.completion.chunk',
-                'created': created,
-                'model': model,
-                'choices': [
-                  {
-                    'index': 0,
-                    'delta': {'content': piece}
-                  }
-                ]
-              })}\n\n'));
-          await req.response.flush();
+          sendChunk({
+            'id': id,
+            'object': 'chat.completion.chunk',
+            'created': created,
+            'model': model,
+            'choices': [
+              {
+                'index': 0,
+                'delta': {'content': piece},
+              },
+            ],
+          });
         }
         // 流结束 = 同步响应已回来：换上 serve 给的真实 token 数
+        keepAlive?.cancel();
         prompt = api.lastUsage.input;
         completion = api.lastUsage.output;
-        req.response.add(utf8.encode('data: ${jsonEncode({
-              'id': id,
-              'object': 'chat.completion.chunk',
-              'created': created,
-              'model': model,
-              'choices': [
-                {'index': 0, 'delta': const {}, 'finish_reason': 'stop'}
-              ],
-              'usage': {
-                'prompt_tokens': prompt,
-                'completion_tokens': completion,
-                'total_tokens': prompt + completion
-              }
-            })}\n\n'));
-        req.response.add(utf8.encode('data: [DONE]\n\n'));
+        sendChunk({
+          'id': id,
+          'object': 'chat.completion.chunk',
+          'created': created,
+          'model': model,
+          'choices': [
+            {'index': 0, 'delta': const {}, 'finish_reason': 'stop'},
+          ],
+          'usage': {
+            'prompt_tokens': prompt,
+            'completion_tokens': completion,
+            'total_tokens': prompt + completion,
+          },
+        });
+        finishStream();
         await req.response.close();
       } else {
         final text = StringBuffer();
         await for (final piece in api.chat(
-            model: model,
-            messages: messages.cast<Map<String, dynamic>>().toList())) {
+          model: model,
+          messages: messages.cast<Map<String, dynamic>>().toList(),
+        )) {
           text.write(piece);
           completion += piece.length;
         }
@@ -1586,41 +1708,95 @@ class ProxyServer {
             {
               'index': 0,
               'message': {'role': 'assistant', 'content': text.toString()},
-              'finish_reason': 'stop'
-            }
+              'finish_reason': 'stop',
+            },
           ],
           'usage': {
             'prompt_tokens': prompt,
             'completion_tokens': completion,
-            'total_tokens': prompt + completion
-          }
+            'total_tokens': prompt + completion,
+          },
         };
         req.response.headers.contentType = ContentType.json;
         req.response.headers.set('x-zeroapi-upstream', u.id);
         req.response.statusCode = 200;
-        req.response.write(jsonEncode(anthropic
-            ? AnthropicAdapter.toAnthropicResponse(out)
-            : out));
+        req.response.write(
+          jsonEncode(
+            anthropic ? AnthropicAdapter.toAnthropicResponse(out) : out,
+          ),
+        );
         await req.response.close();
       }
-      // serve 在同步响应里给真实 token 数（字符数只是流式期间的近似值）
-      prompt = api.lastUsage.input;
-      completion = api.lastUsage.output;
-      _account(publicName, u.id, prompt, completion, false);
-      _log('$publicName ✓ ${u.id}${_tail(_ctx, prompt, completion)}');
+    }
+
+    try {
+      for (var round = 0; ; round++) {
+        try {
+          await attempt();
+          if (clientDisconnected) return;
+          // serve 在同步响应里给真实 token 数（字符数只是流式期间的近似值）
+          prompt = api.lastUsage.input;
+          completion = api.lastUsage.output;
+          if (_ctx != null) {
+            _ctx!.cached = api.cachedReadTokens;
+            _ctx!.cacheWrite = api.cachedWriteTokens;
+          }
+          _account(
+            publicName,
+            u.id,
+            prompt,
+            completion,
+            false,
+            cached: api.cachedReadTokens,
+          );
+          u.modelCallErrors.remove(model);
+          _log('$publicName ✓ ${u.id}${_tail(_ctx, prompt, completion)}');
+          onOpenCodeSuccess?.call(u.id);
+          return;
+        } catch (e) {
+          keepAlive?.cancel();
+          if (clientDisconnected) return;
+          final rotatable =
+              e is OpenCodeUpstreamError &&
+              (e.isQuotaExhausted ||
+                  e.isConnectionFailure ||
+                  (e.isStall && completion == 0));
+          if (round < 2 && !committed && !api.generationStarted && rotatable) {
+            final rotated = await onRotateEgress?.call(u.id) ?? false;
+            if (rotated) {
+              final reason = e.isQuotaExhausted
+                  ? '额度耗尽'
+                  : e.isStall
+                  ? '出口挂死'
+                  : '出口不可达';
+              _log('$publicName ⟳ 换出口后重试（$reason，第 ${round + 2}/3 个出口）');
+              api.close();
+              api = OpenCodeApi(u.def.baseUrl)
+                ..onRetry = ((msg) => _log('$publicName ⟳ CLI 重试上游失败：$msg'))
+                ..onActivity = ((msg) => _log('$publicName · $msg'));
+              continue;
+            }
+          }
+          rethrow;
+        }
+      }
     } catch (e) {
       _account(publicName, u.id, 0, 0, true);
       _log('$publicName ✗ ${u.id}: $e');
+      u.modelCallErrors[model] = e.toString();
       if (committed) {
         // 已提交 200：只能补一个 error 帧收尾，不能再写 JSON 错误体
         try {
-          req.response.add(utf8.encode('data: ${jsonEncode({
-                'error': {
-                  'message': e.toString(),
-                  'type': 'upstream_error',
-                }
-              })}\n\n'));
-          req.response.add(utf8.encode('data: [DONE]\n\n'));
+          sendChunk({
+            'error': {
+              'message': e.toString(),
+              'type': anthropic ? 'api_error' : 'upstream_error',
+              if (e is OpenCodeUpstreamError && e.isStall)
+                'code': 'generation_idle_timeout',
+            },
+          });
+          // Anthropic error 是失败终止，不能再合成成功 message_stop。
+          if (!anthropic) req.response.add(utf8.encode('data: [DONE]\n\n'));
           await req.response.close();
         } catch (_) {}
         return;
@@ -1628,17 +1804,35 @@ class ProxyServer {
       // 上游额度耗尽 → 429 rate_limit（客户端会退避重试）；
       // 其余上游错误 → 502。凭证/地域类不映射 4xx，避免客户端误判认证失败。
       if (e is OpenCodeUpstreamError) {
+        if (e.isStall) {
+          return failJson({
+            'message': e.message,
+            'type': anthropic ? 'api_error' : 'upstream_error',
+            'code': 'generation_idle_timeout',
+          }, 504);
+        }
         if (e.isQuotaExhausted) {
           // 额度按「最终到达 opencode.ai 的出口 IP × 天」计：这个出口烧穿了，
           // 换节点（换 IP）才有救。CLI 进程绑定了出口，得重启它才换 IP。
           onQuotaExhausted?.call(u.id);
           return failJson({
-            'message': 'OpenCode 免费额度已用完（上游原文：${e.message}）。'
-                '额度按出口 IP 每天 UTC 零点重置：可稍后再试、换出口，'
-                '或订阅 OpenCode Go。',
+            'message':
+                'OpenCode 免费额度已用完（上游原文：${e.message}）。'
+                '目录可达不代表模型额度可用；请检查当前出口及官方账号额度，'
+                '或稍后重试。',
             'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
             'code': 'free_quota_exhausted',
           }, 429);
+        }
+        if (e.isConnectionFailure) {
+          // 出口连不通：如实报 502，并把「连不通」记到模型上（UI 可见）。
+          return failJson({
+            'message':
+                'OpenCode CLI 连不上上游（${e.message}）。'
+                '出口节点可能不可用或目标站不可达，已尝试换出口。',
+            'type': anthropic ? 'api_error' : 'upstream_error',
+            'code': 'egress_unreachable',
+          }, 502);
         }
         return failJson({
           'message': 'OpenCode 上游错误：${e.message}',
@@ -1650,6 +1844,7 @@ class ProxyServer {
         'type': anthropic ? 'api_error' : 'upstream_error',
       }, 502);
     } finally {
+      keepAlive?.cancel();
       api.close();
     }
   }
@@ -1761,8 +1956,7 @@ class ProxyServer {
         ? null
         // 优先挑一个当前没在该模型上被 429 冷却的出口（同模型并发时把请求
         // 分散到不同 IP，而不是全挤在同一个被限流的 IP 上排队）
-        :
-        _zenPickEgress(_zenGateModel ?? '');
+        : _zenPickEgress(_zenGateModel ?? '');
     final fp = cand?.directive ?? 'DIRECT';
     final sig = '$fp@${def.baseUrl}';
     _zenCurrentNode = cand?.nodeId;
@@ -1846,26 +2040,41 @@ class ProxyServer {
       return list.isEmpty ? const EgressCandidate('') : list.first;
     }
     final now = DateTime.now();
-    EgressCandidate? best;
-    var bestLeft = const Duration(days: 1);
-    for (var i = 0; i < list.length; i++) {
-      final c = list[(_zenProxyIdx + i) % list.length];
-      final id = c.nodeId ?? c.directive;
-      // 直连模式下今天额度烧穿的节点不再选（UTC 零点翻篇）
-      if (c.nodeId != null &&
-          activePool != null &&
-          activePool!.isQuotaSpent(c.nodeId!)) {
-        continue;
+    // 额度按「客户端身份 × 出口 IP」计，只有真 CLI 身份带免费额度；被真 CLI
+    // 验证过当天有额度的出口优先（探测只能证明能出网，证明不了有额度）。
+    final quotaOk = activePool == null
+        ? <String>{}
+        : list
+              .map((c) => c.nodeId)
+              .whereType<String>()
+              .where((id) => activePool!.isQuotaOk(id))
+              .toSet();
+    // 第一轮只找「额度已验证可用且没在冷却」的出口；找不到再看普通出口。
+    for (var pass = 0; pass < 2; pass++) {
+      EgressCandidate? best;
+      var bestLeft = const Duration(days: 1);
+      for (var i = 0; i < list.length; i++) {
+        final c = list[(_zenProxyIdx + i) % list.length];
+        final id = c.nodeId ?? c.directive;
+        // 直连模式下今天额度烧穿的节点不再选（UTC 零点翻篇）
+        if (c.nodeId != null &&
+            activePool != null &&
+            activePool!.isQuotaSpent(c.nodeId!)) {
+          continue;
+        }
+        final isOk = c.nodeId != null && quotaOk.contains(c.nodeId);
+        if (pass == 0 && !isOk) continue;
+        final until = _zenIpCooling[_zenCoolKey(id, model)];
+        if (until == null || !until.isAfter(now)) return c;
+        final left = until.difference(now);
+        if (left < bestLeft) {
+          bestLeft = left;
+          best = c;
+        }
       }
-      final until = _zenIpCooling[_zenCoolKey(id, model)];
-      if (until == null || !until.isAfter(now)) return c;
-      final left = until.difference(now);
-      if (left < bestLeft) {
-        bestLeft = left;
-        best = c;
-      }
+      if (best != null) return best;
     }
-    return best ?? list[_zenProxyIdx % list.length];
+    return list[_zenProxyIdx % list.length];
   }
 
   /// 额度/地理失败后挑下一个出口：先推进游标再选（跳过今天拉黑/冷却的节点）。
@@ -2125,8 +2334,10 @@ class ProxyServer {
             _zenIpCool(node, route.upstreamModel, wait);
           }
           final next = _zenPickEgress(route.upstreamModel);
-          final switched = next.directive.isNotEmpty &&
-              next.directive != _zenEgress[_zenProxyIdx % _zenEgress.length].directive;
+          final switched =
+              next.directive.isNotEmpty &&
+              next.directive !=
+                  _zenEgress[_zenProxyIdx % _zenEgress.length].directive;
           if (switched) {
             _zenUseEgress(next);
             _account(publicName, u.id, 0, 0, true);

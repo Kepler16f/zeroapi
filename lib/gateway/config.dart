@@ -166,6 +166,10 @@ class UpstreamDef {
     }
   }
 
+  /// CLI control traffic is local, but its child process still needs an egress.
+  bool get supportsUpstreamEgress =>
+      !isLoopbackBaseUrl || (id == 'zen' && type == 'managed');
+
   Future<List<EgressCandidate>> egress(SocksRelayHub hub) async {
     // 本地服务强制直连：忽略池绑定与手写地址（见 isLoopbackBaseUrl）
     if (isLoopbackBaseUrl) return const [];
@@ -502,10 +506,26 @@ class GatewayConfig {
         u.command = py;
         changed = true;
       }
+      // 引擎入口：优先用带请求追踪的 launcher（给 usage 行补 request_id，
+      // 网关侧同名 ID 可关联去重）；找不到则直接跑上游 wb_proxy.py。
+      final launcher = findWorkBuddyLauncher();
+      final script = launcher ?? '${vendor.path}/wb_proxy.py';
       if (u.args.isNotEmpty &&
-          u.args.first.toLowerCase().endsWith('wb_proxy.py') &&
-          u.args.first != '${vendor.path}/wb_proxy.py') {
-        u.args = ['${vendor.path}/wb_proxy.py', ...u.args.sublist(1)];
+          (u.args.first.toLowerCase().endsWith('wb_proxy.py') ||
+              u.args.first.toLowerCase().endsWith('workbuddy_launcher.py')) &&
+          u.args.first != script) {
+        u.args = [script, ...u.args.sublist(1)];
+        changed = true;
+      }
+      // launcher 需要知道上游脚本位置：资源目录与 vendor 目录不是同一棵树。
+      if (launcher != null) {
+        final hub = '${vendor.path}/wb_proxy.py';
+        if (u.env['ZEROAPI_WORKBUDDY_HUB'] != hub) {
+          // env 可能是 const map（默认构造），不可直接写键。
+          u.env = {...u.env, 'ZEROAPI_WORKBUDDY_HUB': hub};
+          changed = true;
+        }
+      } else if (u.env.remove('ZEROAPI_WORKBUDDY_HUB') != null) {
         changed = true;
       }
     }
@@ -568,6 +588,30 @@ class GatewayConfig {
     final cwd = Directory.current;
     final candidate = Directory('${cwd.path}/vendor/workbuddy2api-hub');
     return _looksLikeWorkBuddyVendor(candidate) ? candidate : null;
+  }
+
+  /// 定位受管引擎 launcher（WorkBuddy 请求追踪用）。随包时位于 Flutter 资源
+  /// 目录（data/flutter_assets/assets/engines），开发树里是 assets/engines。
+  /// 找不到返回 null：调用方退回直接启动 wb_proxy.py，功能不受影响，只是
+  /// 网关与号池的 usage 记录无法按 request_id 关联。
+  static String? findWorkBuddyLauncher() {
+    const rel = 'assets/engines/workbuddy_launcher.py';
+    final exeDir = File(Platform.resolvedExecutable).parent;
+    var dir = exeDir;
+    for (var i = 0; i < 7; i++) {
+      for (final p in [
+        '${dir.path}/data/flutter_assets/$rel',
+        '${dir.path}/$rel',
+      ]) {
+        if (File(p).existsSync()) return p;
+      }
+      final parent = dir.parent;
+      if (parent.path == dir.path) break;
+      dir = parent;
+    }
+    final cwd = Directory.current;
+    final local = '${cwd.path}/$rel';
+    return File(local).existsSync() ? local : null;
   }
 
   static bool _looksLikeWorkBuddyVendor(Directory d) =>

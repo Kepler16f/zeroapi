@@ -9,6 +9,7 @@ import 'config.dart';
 import 'hubactions.dart';
 import 'modelsdev.dart';
 import 'opencode.dart';
+import 'opencode_api.dart';
 import 'ocruntime.dart';
 import 'proxy.dart';
 import 'proxycore.dart';
@@ -20,7 +21,14 @@ import 'workbuddy.dart';
 
 /// 聚合所有组件的应用级服务，向 UI 广播状态变化
 class GatewayService extends ChangeNotifier {
-  GatewayConfig config = GatewayConfig.load();
+  GatewayService() : config = GatewayConfig.load(), _initializeProviders = true;
+
+  /// 网关监听顺序测试只使用内存配置，不接触真实号池、配置或代理内核。
+  @visibleForTesting
+  GatewayService.listenerTest(this.config) : _initializeProviders = false;
+
+  GatewayConfig config;
+  final bool _initializeProviders;
   final ModelRegistry registry = ModelRegistry();
   ProxyServer? server;
   bool running = false;
@@ -38,75 +46,34 @@ class GatewayService extends ChangeNotifier {
   /// IP 级滥用封锁首次检测回调（UI 订阅：提示用户启用出口代理/部署 Worker；
   /// 该模式默认不开启，只在被封时征询）
   void Function(String upstreamId)? onIpBanDetected;
+
   /// zen/CLI 命中额度耗尽 → 换出口 IP 并重启 CLI 子进程
   void Function(String upstreamId)? onQuotaExhausted;
 
-  Future<void> start() async {
+  Future<void>? _starting;
+  Future<void>? _restarting;
+  Future<void> start() =>
+      _starting ??= _start().whenComplete(() => _starting = null);
+
+  /// 启动代次：重启时递增，后台初始化发现代次过期就放弃，避免上一轮的
+  /// 异步任务把上一轮的运行时写进当前状态。
+  int _generation = 0;
+
+  /// 已释放：后台初始化可能在 dispose 之后才回调，届时不能再通知监听者。
+  bool _disposed = false;
+
+  /// 安全通知：dispose 之后静默跳过（后台任务仍会收尾，但不再触碰 UI）。
+  void _notify() {
+    if (_disposed) return;
+    notifyListeners();
+  }
+
+  Future<void> _start() async {
     if (running) return;
     startError = null;
-    ModelsDev.instance.onUpdated = () {
-      for (final u in _runtimes) {
-        if (u.def.enabled) {
-          unawaited(
-            u
-                .probe()
-                .then((_) => registry.rebuild(_runtimes))
-                .then((_) => notifyListeners()),
-          );
-        }
-      }
-    };
-    unawaited(ModelsDev.instance.start());
-    // 首次启动自动接入 WorkBuddy 号池（仅在随包运行时存在时；只做一次）
-    // 用户手动指定的 CLI 路径优先于自动探测
-    OpenCodeRuntime.overridePath =
-        config.opencodeCliPath.isEmpty ? null : config.opencodeCliPath;
-    await WorkBuddy.seedIfNeeded(config);
-    // 旧的 zen 直连条目自 2026-10-24 起全量 429（上游改按 TLS 指纹识别），
-    // 迁移成 CLI 通路（id/模型前缀不变，客户端配置无需改）
-    await OpenCodeMigration.migrate(config);
-    // 内置代理轮换池：加载持久化数据、挂上 SOCKS5 本地中转并预热，然后把
-    // activePool 全局交给出口链路（UpstreamDef.directives 会读它）。restart
-    // 走同一池实例，不重复加载/加监听。
-    if (proxies == null) {
-      final pool = ProxyPool.load();
-      pool.relayHub = SocksRelayHub.instance;
-      await pool.prepareRelays(); // 预热 socks5 本地中转
-      // 清理本地供应商的历史出口绑定：回环请求套代理只会 502（egress()
-      // 已强制 loopback 直连，这里把脏数据抹掉，代理页也不再显示该行）
-      var cleaned = false;
-      for (final u in config.upstreams) {
-        if (u.isLoopbackBaseUrl &&
-            pool.assignments.remove(ProxyPool.pUpstream(u.id)) != null) {
-          cleaned = true;
-        }
-      }
-      if (cleaned) pool.save();
-      pool.addListener(_onPoolChanged);
-      activePool = proxies = pool;
-    }
-    // 加密协议节点（ss/vmess/vless/trojan/hysteria2/tuic）交给随包 mihomo：
-    // 每个节点一个 127.0.0.1 HTTP listener，端口写回 pool.corePorts。
-    await ProxyCore.instance.sync(proxies!);
-    _runtimes.clear();
-    for (final def in config.upstreams) {
-      // zen CLI 通路：出口走池（自动探测优先；家宽直连仅兜底——免费额度
-      // 按出口 IP × 天计，家宽单 IP 撑不住长上下文对话）
-      if (def.id == OpenCode.id && def.type == 'managed') {
-        final url = _pickZenCliEgress(def.id);
-        if (url != null) _setZenCliEgressEnv(def, url);
-      }
-      // 供应商预热就绪时立即重建路由表（不等 60s 周期刷新），
-      // 否则冷启动后模型要干等下一轮刷新才出现
-      final rt = UpstreamRuntime(def)..onStatusChanged = refreshRoutesNow;
-      _runtimes.add(rt);
-      rt.startPeriodicProbe();
-      // managed 立即拉起/探活：此前只靠 30s 的周期定时器，冷启动后
-      // 内置供应商（zen CLI/号池）要干等 30s 才出现，期间请求全 404
-      if (def.enabled && def.type == 'managed') {
-        unawaited(rt.ensure());
-      }
-    }
+    final generation = ++_generation;
+    // 网关先起：代理池、内核同步（实测 17s）与供应商预热都很慢，放到后台
+    // 做，窗口与网关端口立即可用，模型随后陆续出现。
     server =
         ProxyServer(
             config.host,
@@ -122,45 +89,172 @@ class GatewayService extends ChangeNotifier {
           ..onIpBan = (id) {
             onIpBanDetected?.call(id);
           }
-          ..onQuotaExhausted = (id) {
-            _rotateZenEgress(id);
-          };
+          ..onQuotaExhausted = _markZenQuotaExhausted
+          ..onPrepareOpenCode = _prepareZenRequest
+          ..onOpenCodeFinished = _finishZenRequest
+          ..onOpenCodeSuccess = _markZenQuotaOk
+          ..onRotateEgress = (id) =>
+              _serializeEgress(() => _rotateZenEgressAndWait(id));
     try {
       await server!.start();
-      server!.workbuddyPreferredRealm = config.workbuddyPreferredRealm;
       running = true;
-      unawaited(_refreshRoutes());
-      // 节点可达性巡检：启动即扫一轮，之后每 60s 一轮；成功清零失败计数
-      // 解禁冷却（坏节点不用手动逐个刷新，修好一分钟内自动回轮换）。
-      final pool = proxies;
-      if (pool != null) {
-        unawaited(pool.autoProbeOnce());
-        pool.startAutoProbe();
-      }
-      _refreshTimer ??= Timer.periodic(
-        const Duration(seconds: 60),
-        (_) => unawaited(_refreshRoutes()),
-      );
-      // 节点域名走 DoH；机场经常改解析，5 分钟重解析一次，IP 变了
-      // sync 会自动重启内核并换端口（sig 里含解析结果）。
-      _coreRefreshTimer ??= Timer.periodic(const Duration(minutes: 5), (_) {
-        final pool = proxies;
-        if (pool == null) return;
-        unawaited(ProxyCore.instance.sync(pool).then((_) => notifyListeners()));
-      });
-      // 订阅自动刷新：每 30 分钟巡检一次（到期刷新 + 失败优先刷新；
-      // 池变化/探测完成也会即时触发检查）
-      _subRefreshTimer ??= Timer.periodic(const Duration(minutes: 30), (_) {
-        final pool = proxies;
-        if (pool != null) _maybeAutoRefreshGroups(pool);
-      });
+      _notify();
     } catch (e) {
       startError = '$e';
+      _notify();
+      return;
     }
-    notifyListeners();
+    if (_initializeProviders) unawaited(_bootstrap(generation));
   }
 
-  Future<void> restartServer() async {
+  /// 后台初始化：模型目录、号池接入、代理池与内核、供应商运行时、定时器。
+  Future<void> _bootstrap(int generation) async {
+    try {
+      await _bootstrapInner(generation);
+    } catch (e) {
+      if (generation != _generation || _disposed) return;
+      startError = '$e';
+      _notify();
+    }
+  }
+
+  Future<void> _bootstrapInner(int generation) async {
+    ModelsDev.instance.onUpdated = () {
+      for (final u in _runtimes) {
+        if (u.def.enabled) {
+          unawaited(
+            u
+                .probe()
+                .then((_) => registry.rebuild(_runtimes))
+                .then((_) => _notify()),
+          );
+        }
+      }
+    };
+    unawaited(ModelsDev.instance.start());
+    if (generation != _generation) return;
+    // 首次启动自动接入 WorkBuddy 号池（仅在随包运行时存在时；只做一次）
+    // 用户手动指定的 CLI 路径优先于自动探测
+    OpenCodeRuntime.overridePath = config.opencodeCliPath.isEmpty
+        ? null
+        : config.opencodeCliPath;
+    await WorkBuddy.seedIfNeeded(config);
+    // 旧的 zen 直连条目自 2026-10-24 起全量 429（上游改按 TLS 指纹识别），
+    // 迁移成 CLI 通路（id/模型前缀不变，客户端配置无需改）
+    await OpenCodeMigration.migrate(config);
+    // 内置代理轮换池：加载持久化数据、挂上 SOCKS5 本地中转并预热，然后把
+    // activePool 全局交给出口链路（UpstreamDef.directives 会读它）。restart
+    // 走同一池实例，不重复加载/加监听。
+    if (proxies == null) {
+      final pool = ProxyPool.load();
+      pool.relayHub = SocksRelayHub.instance;
+      await pool.prepareRelays(); // 预热 socks5 本地中转
+      // 清理本地供应商的历史出口绑定：回环请求套代理只会 502（egress()
+      // 已强制 loopback 直连，这里把脏数据抹掉，代理页也不再显示该行）
+      var cleaned = false;
+      for (final u in config.upstreams) {
+        if (!u.supportsUpstreamEgress &&
+            pool.assignments.remove(ProxyPool.pUpstream(u.id)) != null) {
+          cleaned = true;
+        }
+      }
+      if (cleaned) pool.save();
+      pool.addListener(_onPoolChanged);
+      activePool = proxies = pool;
+    }
+    // Zen CLI 的真实目标是 opencode.ai：默认探活目标（Cloudflare 204）
+    // 只能证明「节点能出网」，不能证明「节点能访问上游 API」。按用途登记
+    // 真实目标后，不通上游的节点不会进入 Zen 的轮换候选。
+    proxies?.setPurposeTarget(
+      ProxyPool.pUpstream(OpenCode.id),
+      'https://opencode.ai/',
+    );
+    // 加密协议节点（ss/vmess/vless/trojan/hysteria2/tuic）交给随包 mihomo：
+    // 每个节点一个 127.0.0.1 HTTP listener，端口写回 pool.corePorts。
+    await ProxyCore.instance.sync(proxies!);
+    if (_disposed || generation != _generation) return;
+    for (final runtime in _runtimes) {
+      runtime.onStatusChanged = null;
+      final child = runtime.child;
+      runtime.stop();
+      if (child != null) {
+        await child.exitCode.timeout(
+          const Duration(seconds: 5),
+          onTimeout: () => -1,
+        );
+      }
+    }
+    _runtimes.clear();
+    for (final def in config.upstreams) {
+      // zen CLI 通路：出口走池（自动探测优先；家宽直连仅兜底——免费额度
+      // 按出口 IP × 天计，家宽单 IP 撑不住长上下文对话）
+      if (def.id == OpenCode.id && def.type == 'managed') {
+        final url = _pickZenCliEgress(def.id);
+        if (url != null) _setZenCliEgressEnv(def, url);
+      }
+      // 供应商预热就绪时立即重建路由表（不等 60s 周期刷新），
+      // 否则冷启动后模型要干等下一轮刷新才出现
+      final rt = UpstreamRuntime(def)..onStatusChanged = refreshRoutesNow;
+      _runtimes.add(rt);
+      // 号池：先用本地缓存的模型目录把清单填上，引擎就绪后由真实探测覆盖。
+      // 否则引擎拉远端目录期间模型页是空的（实测可达数十秒）。
+      if (def.id == WorkBuddy.id) {
+        final cached = await WorkBuddy.cachedCatalog();
+        if (cached.realms.isNotEmpty && rt.models.isEmpty) {
+          rt.models = cached.realms.keys.toList();
+          rt.modelRealms.addAll({
+            for (final e in cached.realms.entries)
+              if (!cached.shared.contains(e.key)) e.key: e.value,
+          });
+          rt.sharedModels.addAll(cached.shared);
+          registry.rebuild(_runtimes);
+          _notify();
+        }
+      }
+      // 出口同步可能触发 CLI 重启与探活（数秒），不能挡住后面的初始化。
+      if (rt.isOpenCode) unawaited(_syncZenCliEgress());
+      rt.startPeriodicProbe();
+      // managed 立即拉起/探活：此前只靠 30s 的周期定时器，冷启动后
+      // 内置供应商（zen CLI/号池）要干等 30s 才出现，期间请求全 404
+      if (def.enabled && def.type == 'managed') {
+        unawaited(rt.ensure());
+      }
+    }
+    if (generation != _generation) return;
+    server!.workbuddyPreferredRealm = config.workbuddyPreferredRealm;
+    unawaited(_refreshRoutes());
+    // 节点可达性巡检：启动即扫一轮，之后每 60s 一轮；成功清零失败计数
+    // 解禁冷却（坏节点不用手动逐个刷新，修好一分钟内自动回轮换）。
+    final pool = proxies;
+    if (pool != null) {
+      unawaited(pool.autoProbeOnce());
+      pool.startAutoProbe();
+    }
+    _refreshTimer ??= Timer.periodic(
+      const Duration(seconds: 60),
+      (_) => unawaited(_refreshRoutes()),
+    );
+    // 节点域名走 DoH；机场经常改解析，5 分钟重解析一次，IP 变了
+    // sync 会自动重启内核并换端口（sig 里含解析结果）。
+    _coreRefreshTimer ??= Timer.periodic(const Duration(minutes: 5), (_) {
+      final pool = proxies;
+      if (pool == null) return;
+      unawaited(_syncCoreAndEgress(pool));
+    });
+    // 订阅自动刷新：每 30 分钟巡检一次（到期刷新 + 失败优先刷新；
+    // 池变化/探测完成也会即时触发检查）
+    _subRefreshTimer ??= Timer.periodic(const Duration(minutes: 30), (_) {
+      final pool = proxies;
+      if (pool != null) _maybeAutoRefreshGroups(pool);
+    });
+    _notify();
+  }
+
+  Future<void> restartServer() =>
+      _restarting ??= _restartServer().whenComplete(() => _restarting = null);
+
+  Future<void> _restartServer() async {
+    await _starting;
     await server?.stop();
     running = false;
     await start();
@@ -243,74 +337,294 @@ class GatewayService extends ChangeNotifier {
     if (m == null) return null;
     return 'http://${m.group(1)}';
   }
-  /// zen/CLI 通路命中额度耗尽：换一个出口节点并重启 CLI 子进程。
-  ///
-  /// CLI 进程通过 HTTP_PROXY 绑定出口，换 IP 必须换进程——所以这里改
-  /// def.env 再杀子进程，由 managed 生命周期按退避重新拉起。
-  /// zen CLI 通路的出口游标：每次轮换推进一格，保证换到不同节点
-  /// （旧实现 candidates.first 永远同一个节点，5 次重试全打同一出口）。
-  final Map<String, int> _zenCliEgressCursor = {};
 
-  /// 从池里挑一个 zen CLI 出口（跳过当天额度已烧穿的节点）。
-  /// 返回 HTTP 代理 URL（本地 mihomo listener / socks 中转）；无可用返回 null。
-  String? _pickZenCliEgress(String upstreamId, {bool advance = false}) {
+  /// 一轮完整测速后的候选，以及当前请求已经尝试的节点。
+  final Map<String, List<PoolCandidate>> _zenMeasuredCandidates = {};
+  final Set<String> _zenAttemptedNodes = {};
+  bool _zenRequestPreparing = false;
+  int _zenRequestsActive = 0;
+  bool _zenSyncPending = false;
+  ProxyPool? _pendingCorePool;
+
+  void _finishZenRequest() {
+    if (_zenRequestsActive > 0) _zenRequestsActive--;
+    if (_disposed || _zenRequestsActive > 0) return;
+    final pool = _pendingCorePool;
+    _pendingCorePool = null;
+    if (pool != null) {
+      unawaited(_syncCoreAndEgress(pool));
+    } else if (_zenSyncPending) {
+      unawaited(_syncZenCliEgress());
+    }
+  }
+
+  Future<void> _syncCoreAndEgress(ProxyPool pool) async {
+    if (_zenRequestsActive > 0 || _zenRequestPreparing) {
+      _pendingCorePool = pool;
+      return;
+    }
+    await ProxyCore.instance.sync(pool);
+    if (_disposed || !identical(proxies, pool)) return;
+    await _syncZenCliEgress();
+    _notify();
+  }
+
+  Future<void> _prepareZenRequest() async {
+    _zenAttemptedNodes.clear();
+    _zenRequestPreparing = true;
+    try {
+      await _serializeEgress(_prepareZenRequestNow);
+    } finally {
+      _zenRequestPreparing = false;
+    }
+  }
+
+  Future<void> _prepareZenRequestNow() async {
+    final pool = proxies;
+    if (pool == null || _disposed) return;
+    final rt = _runtimes.where((r) => r.isOpenCode).firstOrNull;
+    if (rt == null) return;
+    final purpose = ProxyPool.pUpstream(rt.id);
+    if (upstreamUsesPool(rt.id)) {
+      // 先同步 listener，再等待全组检测；绝不从旧列表盲取三个。
+      await ProxyCore.instance.sync(pool);
+      if (_disposed || !identical(proxies, pool)) return;
+      server?.log('Zen 正在全量测速绑定分组，等待检测完成后选择出口');
+      final candidates = await pool.measuredCandidatesFor(purpose);
+      _zenMeasuredCandidates[rt.id] = candidates;
+      if (candidates.isEmpty) {
+        throw const ZenExitUnavailable(
+          'Zen 全量测速完成：绑定分组没有通过目标站检测的出口（超时/失败均已剔除）',
+        );
+      }
+      server?.log('Zen 全量测速完成：${candidates.length} 个出口通过，按延迟优先，最多尝试 3 个不同出口');
+      final selected = candidates.first;
+      if (selected.nodeId != null) _zenAttemptedNodes.add(selected.nodeId!);
+      final url = _zenCandidateUrl(selected);
+      if (_setZenCliEgressEnv(rt.def, url)) {
+        await rt.restartChild();
+      }
+      await rt.ensure();
+    }
+    final uri = Uri.tryParse(rt.def.env['HTTPS_PROXY'] ?? '');
+    var alive = uri == null || uri.host.isEmpty;
+    if (!alive) {
+      try {
+        final socket = await Socket.connect(
+          uri.host,
+          uri.port,
+          timeout: const Duration(seconds: 2),
+        );
+        socket.destroy();
+        alive = true;
+      } catch (_) {}
+    }
+    if (!alive ||
+        (upstreamUsesPool(rt.id) && (uri == null || uri.host.isEmpty))) {
+      await ProxyCore.instance.sync(pool);
+      await _syncZenCliEgressNow(preparing: true);
+    } else {
+      await _syncZenCliEgressNow(preparing: true);
+    }
+    for (var i = 0; i < 30 && !_disposed; i++) {
+      if (rt.health == UpstreamHealth.healthy) {
+        _zenRequestsActive++;
+        return;
+      }
+      await rt.ensure();
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    throw const ZenExitUnavailable('Zen CLI 未能就绪，请检查运行时日志');
+  }
+
+  String _zenCandidateUrl(PoolCandidate candidate) =>
+      'http://${candidate.directive.replaceFirst('PROXY ', '')}';
+
+  /// 只从完成全量检测的快照取候选。池配置变更时先等下一轮检测。
+  ///
+  /// 额度按「客户端身份 × 出口 IP」计：只有真 opencode CLI 的 TLS 身份带
+  /// 免费额度，通用探针只能证明「能出网」，证明不了「这个 IP 上有额度」。
+  /// 被真 CLI 验证过当天有额度的出口优先选。
+  String? _pickZenCliEgress(String upstreamId) {
     final pool = proxies;
     if (pool == null) return null;
     final purpose = ProxyPool.pUpstream(upstreamId);
-    final cands = poolCandidatesFor(pool, purpose)
-        .where((c) => c.nodeId == null || !pool.isQuotaSpent(c.nodeId!))
-        .toList();
-    if (cands.isEmpty) {
-      // 全烧穿：清掉当天的标记重头轮换（额度按 UTC 零点翻篇）
-      for (final c in poolCandidatesFor(pool, purpose)) {
-        if (c.nodeId != null) pool.clearQuotaSpent(c.nodeId!);
+    final valid = poolCandidatesFor(pool, purpose);
+    final usable = <PoolCandidate>[];
+    for (final candidate
+        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
+      if (candidate.nodeId != null && pool.isQuotaSpent(candidate.nodeId!)) {
+        continue;
       }
-      return null;
+      if (!valid.any(
+        (c) =>
+            c.nodeId == candidate.nodeId && c.directive == candidate.directive,
+      )) {
+        continue;
+      }
+      usable.add(candidate);
     }
-    final i = (_zenCliEgressCursor[upstreamId] ?? 0) % cands.length;
-    if (advance) {
-      _zenCliEgressCursor[upstreamId] = (_zenCliEgressCursor[upstreamId] ?? 0) + 1;
-    }
-    final m = RegExp(r'PROXY\s+(\S+)').firstMatch(cands[i].directive);
-    return m == null ? null : 'http://${m.group(1)}';
+    final ok = usable
+        .where((c) => c.nodeId != null && pool.isQuotaOk(c.nodeId!))
+        .firstOrNull;
+    final picked = ok ?? usable.firstOrNull;
+    return picked == null ? null : _zenCandidateUrl(picked);
   }
 
   /// 把出口写进 zen CLI 的 env（HTTP_PROXY 等）。返回是否发生变化。
   bool _setZenCliEgressEnv(UpstreamDef def, String url) {
     final changed = (def.env['HTTPS_PROXY'] ?? '') != url;
-    def.env['HTTP_PROXY'] = url;
-    def.env['HTTPS_PROXY'] = url;
-    def.env['http_proxy'] = url;
-    def.env['https_proxy'] = url;
+    def.env = {
+      ...def.env,
+      'HTTP_PROXY': url,
+      'HTTPS_PROXY': url,
+      'http_proxy': url,
+      'https_proxy': url,
+      'ALL_PROXY': '',
+      'all_proxy': '',
+      'NO_PROXY': 'localhost,127.0.0.1,::1',
+      'no_proxy': 'localhost,127.0.0.1,::1',
+    };
     return changed;
   }
 
-  /// 额度耗尽 → 标记当前节点烧穿，轮换到下一个出口并重启 serve。
-  void _rotateZenEgress(String upstreamId) {
-    final rt = _runtimes.where((r) => r.def.id == upstreamId).firstOrNull;
-    if (rt == null) return;
-    final pool = proxies;
-    if (pool == null) return;
-    // 标记旧节点额度烧穿（按 corePorts 反查节点），避免轮换又选回它
-    final old = rt.def.env['HTTPS_PROXY'] ?? '';
-    final oldPort = RegExp(r':(\d+)$').firstMatch(old);
-    if (oldPort != null) {
-      final oldPortNum = int.parse(oldPort.group(1)!);
-      String? oldNodeId;
-      pool.corePorts.forEach((nodeId, port) {
-        if (port == oldPortNum) oldNodeId = nodeId;
-      });
-      if (oldNodeId != null) pool.markQuotaSpent(oldNodeId!);
-    }
-    final url = _pickZenCliEgress(upstreamId, advance: true);
-    if (url == null || url == old) return;
-    _setZenCliEgressEnv(rt.def, url);
-    server?.log('⟳ zen CLI 换出口 → $url（旧出口额度烧穿）');
-    // 重启子进程：新的 env 才生效。用 restartChild（只换进程）而不是
-    // stop()——后者会置 _stopping，之后 ensure() 不会重新拉起。
-    rt.restartChild();
-    unawaited(Future.delayed(const Duration(milliseconds: 500), rt.ensure));
+  Future<void> _egressQueue = Future<void>.value();
+  Future<T> _serializeEgress<T>(Future<T> Function() action) {
+    final result = _egressQueue.then((_) => action());
+    _egressQueue = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
   }
+
+  Future<void> _syncZenCliEgress() => _serializeEgress(_syncZenCliEgressNow);
+
+  Future<void> _syncZenCliEgressNow({bool preparing = false}) async {
+    if (_zenRequestsActive > 0 || (_zenRequestPreparing && !preparing)) {
+      _zenSyncPending = true;
+      return;
+    }
+    _zenSyncPending = false;
+    for (final rt in _runtimes.where((r) => r.isOpenCode && r.def.enabled)) {
+      String? url;
+      if (upstreamUsesPool(rt.id)) {
+        final old = rt.def.env['HTTPS_PROXY'] ?? '';
+        final candidates = poolCandidatesFor(
+          proxies,
+          ProxyPool.pUpstream(rt.id),
+        ).where((c) => c.nodeId == null || !proxies!.isQuotaSpent(c.nodeId!));
+        final stillAvailable = candidates.any(
+          (c) => 'http://${c.directive.replaceFirst('PROXY ', '')}' == old,
+        );
+        url = stillAvailable ? old : _pickZenCliEgress(rt.id);
+        if (url == null) {
+          server?.log('Zen 绑定分组暂无可用出口，请检查节点连通性');
+          continue;
+        }
+      } else {
+        final raw = rt.def.proxyPool.firstOrNull;
+        if (raw != null && raw.startsWith('socks5://')) {
+          final relay = await SocksRelayHub.instance.ensure(raw);
+          final directive = relay?.directive;
+          final match = directive == null
+              ? null
+              : RegExp(r'PROXY\s+(\S+)').firstMatch(directive);
+          if (match == null) continue;
+          url = 'http://${match.group(1)}';
+        } else {
+          url = raw ?? '';
+        }
+      }
+      if (_setZenCliEgressEnv(rt.def, url)) {
+        server?.log('Zen 出口配置已更新，正在重启 CLI');
+        await rt.restartChild();
+        await rt.ensure();
+      }
+    }
+  }
+
+  /// CLI 通路成功 → 把「当前这个出口今天有额度」记到池里。
+  ///
+  /// 免费额度按「客户端身份 × 出口 IP」计，只有真 opencode CLI 的 TLS 身份
+  /// 才带额度；通用探针只能证明「能出网」，证明不了「这个 IP 上有额度」。
+  /// 所以 CLI 真跑通一次，才把该出口标记为当天可用，下次测速排序时优先。
+  void _markZenQuotaOk(String upstreamId) {
+    final rt = _runtimes.where((r) => r.id == upstreamId).firstOrNull;
+    final pool = proxies;
+    if (rt == null || pool == null) return;
+    final old = rt.def.env['HTTPS_PROXY'] ?? '';
+    if (old.isEmpty) return;
+    for (final candidate
+        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
+      if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
+        pool.markQuotaOk(candidate.nodeId!);
+        return;
+      }
+    }
+  }
+
+  void _markZenQuotaExhausted(String upstreamId) {
+    final rt = _runtimes.where((r) => r.id == upstreamId).firstOrNull;
+    final pool = proxies;
+    if (rt == null || pool == null) return;
+    final old = rt.def.env['HTTPS_PROXY'] ?? '';
+    for (final candidate
+        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
+      if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
+        pool.markQuotaSpent(candidate.nodeId!);
+      }
+    }
+    // 最终错误不另行启动第四个出口；下次请求重新按检测结果选择。
+    onQuotaExhausted?.call(upstreamId);
+  }
+
+  /// 换出口并等新 CLI 进程就绪，供网关在同一次请求里原样重发。
+  ///
+  /// CLI 进程的出口在启动时由 HTTP_PROXY 绑定，换 IP 必须换进程；新进程
+  /// 还要等 serve 就绪（几秒），期间请求会被上游拒绝，因此调用方要用
+  /// 「未提交响应」路径重试。
+  Future<bool> _rotateZenEgressAndWait(String upstreamId) async {
+    final rt = _runtimes.where((r) => r.def.id == upstreamId).firstOrNull;
+    if (rt == null) return false;
+    final pool = proxies;
+    if (pool == null) return false;
+    final old = rt.def.env['HTTPS_PROXY'] ?? '';
+    if (!upstreamUsesPool(upstreamId) || _zenAttemptedNodes.length >= 3) {
+      return false;
+    }
+    final purpose = ProxyPool.pUpstream(upstreamId);
+    for (final candidate
+        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
+      if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
+        pool.markTargetFailed(candidate.nodeId!, purpose);
+      }
+    }
+    final candidates = await pool.measuredCandidatesFor(purpose);
+    _zenMeasuredCandidates[upstreamId] = candidates;
+    final next = candidates
+        .where(
+          (c) =>
+              c.nodeId != null &&
+              !_zenAttemptedNodes.contains(c.nodeId) &&
+              _zenCandidateUrl(c) != old,
+        )
+        .firstOrNull;
+    if (next == null) return false;
+    _zenAttemptedNodes.add(next.nodeId!);
+    final url = _zenCandidateUrl(next);
+    _setZenCliEgressEnv(rt.def, url);
+    server?.log('⟳ zen CLI 换出口 → $url（等待新进程就绪）');
+    await rt.restartChild();
+    await rt.ensure();
+    for (var i = 0; i < 40; i++) {
+      if (rt.health == UpstreamHealth.healthy) return true;
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (rt.health != UpstreamHealth.healthy) await rt.probe();
+    }
+    return rt.health == UpstreamHealth.healthy;
+  }
+
   /// 接入 OpenCode CLI 供应商（TLS 指纹通路）。
   /// 成功返回 null；找不到运行时返回给 UI 展示的原因（UI 据此引导下载）。
   Future<String?> addOpenCode() async {
@@ -342,8 +656,9 @@ class GatewayService extends ChangeNotifier {
 
   /// 按需下载 opencode CLI 运行时（tarball → %APPDATA%\zeroapi\opencode\bin），
   /// 完成后自动接入供应商。返回 null=成功；否则为失败原因。
-  Future<String?> downloadOpenCodeRuntime(
-      {void Function(int received, int total)? onProgress}) async {
+  Future<String?> downloadOpenCodeRuntime({
+    void Function(int received, int total)? onProgress,
+  }) async {
     try {
       await OpenCodeRuntime.downloadAndInstall(onProgress: onProgress);
     } catch (e) {
@@ -522,12 +837,7 @@ class GatewayService extends ChangeNotifier {
       // 订阅自动刷新检查挂在这里：健康探测（probe 会 notify）失败一大片时
       // 也能触发，不必等 30 分钟的周期定时器
       _maybeAutoRefreshGroups(pool);
-      unawaited(
-        ProxyCore.instance.sync(pool).then((_) {
-          // 端口就绪后重建路由，让新节点立刻可被选中
-          notifyListeners();
-        }),
-      );
+      unawaited(_syncCoreAndEgress(pool));
     });
   }
 
@@ -619,7 +929,7 @@ class GatewayService extends ChangeNotifier {
       unwrapSubscriptionBody(body),
     );
     pool.setGroupSource(groupName, url);
-    await ProxyCore.instance.sync(pool);
+    await _syncCoreAndEgress(pool);
     return '订阅已刷新：新增 $added、移除 $removed，现 ${pool.groups.firstWhere((x) => x.name == groupName).nodes.length} 个节点';
   }
 
@@ -687,6 +997,7 @@ class GatewayService extends ChangeNotifier {
           ..proxy = config.upstreams[i].proxy;
       }
     }
+    unawaited(_syncZenCliEgress());
     notifyListeners();
   }
 
@@ -695,7 +1006,7 @@ class GatewayService extends ChangeNotifier {
   /// 哪个供应商走内置代理池由「代理」页的用途分配决定。
   void setGlobalUpstreamProxy({required bool enabled, String proxy = ''}) {
     for (final u in config.upstreams) {
-      if (u.isLoopbackBaseUrl) continue;
+      if (!u.supportsUpstreamEgress) continue;
       u
         ..proxyEnabled = enabled
         ..proxy = proxy;
@@ -703,17 +1014,18 @@ class GatewayService extends ChangeNotifier {
     config.save();
     // 运行中的 runtime 可能持有旧 config 实例的 def，同步到实际实例
     for (final rt in _runtimes) {
-      if (rt.def.isLoopbackBaseUrl) continue;
+      if (!rt.def.supportsUpstreamEgress) continue;
       rt.def
         ..proxyEnabled = enabled
         ..proxy = proxy;
     }
+    unawaited(_syncZenCliEgress());
     notifyListeners();
   }
 
   /// 是否有供应商开着出口代理（设置页开关的展示状态）
   bool get globalProxyEnabled =>
-      config.upstreams.any((u) => !u.isLoopbackBaseUrl && u.proxyEnabled);
+      config.upstreams.any((u) => u.supportsUpstreamEgress && u.proxyEnabled);
 
   /// 当前供应商出口是否走内置代理池：代理池里 `upstream:<id>` 有绑定分组
   /// 且该用途启用。绑定分组在「代理」页的用途分配里设置，这里只读。
@@ -1041,6 +1353,8 @@ class GatewayService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _generation++; // 让在途的后台初始化立刻作废
     ModelsDev.instance.stop();
     _refreshTimer?.cancel();
     for (final u in _runtimes) {

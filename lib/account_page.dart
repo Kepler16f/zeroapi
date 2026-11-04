@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 
 import 'gateway/accountdata.dart';
 import 'gateway/config.dart';
+import 'gateway/provider_management.dart';
 import 'gateway/service.dart';
 import 'checkin_page.dart';
 import 'hub_dashboard.dart';
+import 'native_account_management.dart';
 
 // ---------------- 纯函数：格式化与文案（account_page_test 直接测这几条） ----------------
 
@@ -147,6 +149,53 @@ class _AccountPageState extends State<AccountPage> {
       MaterialPageRoute(builder: (_) => CheckinPage(service: widget.service)),
     );
     if (mounted) await _load();
+  }
+
+  /// 打开原生账号管理（添加账号 / 删除账号 / 导入 / 静态 Key / OAuth 登录）。
+  Future<void> _openAccountManagement() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NativeAccountManagementPage(service: widget.service),
+      ),
+    );
+    if (mounted) await _load();
+  }
+
+  /// 直接从账号列表删除账号（号池接口，删除后账号文件落盘移除）。
+  Future<void> _deleteAccount(WbAccountView a) async {
+    final label = wbDisplayLabel(nickname: a.nickname, uid: a.uid);
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除账号？'),
+        content: Text('将从号池删除 $label。此操作不可撤销。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    try {
+      final api = WorkBuddyManagement(widget.service);
+      await api.deleteAccount(a.uid);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已删除账号 $label')),
+      );
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('删除失败：$e')),
+      );
+    }
   }
 
   @override
@@ -449,6 +498,12 @@ class _AccountPageState extends State<AccountPage> {
                     '${o.accounts.length} 个',
                     style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                   ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: _openAccountManagement,
+                    icon: const Icon(Icons.person_add_alt, size: 16),
+                    label: const Text('添加账号'),
+                  ),
                 ],
               ),
             ),
@@ -546,6 +601,16 @@ class _AccountPageState extends State<AccountPage> {
                   '${wbCreditsText(a.creditsSize)} 总量',
                   style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                 ),
+              const SizedBox(height: 4),
+              IconButton(
+                tooltip: '删除账号',
+                onPressed: () => _deleteAccount(a),
+                icon: Icon(
+                  Icons.delete_outline,
+                  size: 18,
+                  color: dim ? Colors.grey : cs.error,
+                ),
+              ),
             ],
           ),
         ],

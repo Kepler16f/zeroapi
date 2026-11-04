@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 
 import 'gateway/service.dart';
 import 'gateway/workbuddy.dart';
+import 'gateway/provider_management.dart';
+import 'native_account_management.dart';
+import 'native_scheduler_settings.dart';
 
 /// WorkBuddy 号池原生看板。
 ///
@@ -58,6 +61,23 @@ class _HubDashboardPageState extends State<HubDashboardPage> {
     });
   }
 
+  Future<void> _schedulerAction(String path) async {
+    try {
+      final action = path.split('/').last;
+      final result = await WorkBuddyManagement(widget.service)
+          .schedulerAction(action);
+      if (result['ok'] == false) throw StateError('${result['msg'] ?? '操作失败'}');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('${result['msg'] ?? '操作完成'}')));
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('调度操作失败：$e')));
+    }
+  }
+
   static num _num(dynamic v) => v is num ? v : 0;
   static String _str(dynamic v) => v is String ? v : (v?.toString() ?? '');
 
@@ -74,6 +94,19 @@ class _HubDashboardPageState extends State<HubDashboardPage> {
       appBar: AppBar(
         title: const Text('WorkBuddy 看板'),
         actions: [
+          IconButton(
+            tooltip: '账号管理',
+            icon: const Icon(Icons.manage_accounts),
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) =>
+                      NativeAccountManagementPage(service: widget.service),
+                ),
+              );
+              if (mounted) await _load();
+            },
+          ),
           IconButton(
             tooltip: '刷新',
             icon: const Icon(Icons.refresh),
@@ -93,7 +126,7 @@ class _HubDashboardPageState extends State<HubDashboardPage> {
               }
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(value: 'browser', child: Text('用浏览器打开完整面板（本机免密）')),
+              PopupMenuItem(value: 'browser', child: Text('高级排障：用浏览器打开完整面板')),
             ],
           ),
         ],
@@ -185,6 +218,28 @@ class _HubDashboardPageState extends State<HubDashboardPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Wrap(
+              spacing: 8,
+              children: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          NativeSchedulerSettingsPage(service: widget.service),
+                    ),
+                  ),
+                  child: const Text('调度设置'),
+                ),
+                TextButton(
+                  onPressed: () => _schedulerAction('/scheduler/toggle'),
+                  child: const Text('切换调度'),
+                ),
+                TextButton(
+                  onPressed: () => _schedulerAction('/scheduler/trigger'),
+                  child: const Text('立即巡检'),
+                ),
+              ],
+            ),
             Wrap(
               spacing: 8,
               runSpacing: 8,

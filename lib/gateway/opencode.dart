@@ -79,6 +79,7 @@ class OpenCode {
       'OPENCODE_DISABLE_CLAUDE_CODE': '1',
       'OPENCODE_DISABLE_EXTERNAL_SKILLS': '1',
       'OPENCODE_DISABLE_DEFAULT_PLUGINS': '1',
+      'OPENCODE_CONFIG_CONTENT': '{"permission":{"*":"deny"}}',
       'OPENCODE_DISABLE_EMBEDDED_WEB_UI': '1',
       'PYTHONUTF8': '1',
       // CLI 自己出网到 opencode.ai。走代理池里的节点时把该节点的 HTTP
@@ -92,6 +93,8 @@ class OpenCode {
       'http_proxy': proxyUrl ?? '',
       'https_proxy': proxyUrl ?? '',
       'all_proxy': '',
+      'NO_PROXY': 'localhost,127.0.0.1,::1',
+      'no_proxy': 'localhost,127.0.0.1,::1',
     };
     final isolated = '${root.path}/home';
     if (Platform.isWindows) {

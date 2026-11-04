@@ -349,6 +349,7 @@ class WbUsageRow {
 
   /// 客户端别名；无则 null
   final String? requestedModel;
+  final String? requestId;
 
   /// 账号 uid
   final String account;
@@ -388,6 +389,7 @@ class WbUsageRow {
     required this.ok,
     required this.usageMissing,
     this.requestedModel,
+    this.requestId,
     this.credit,
     this.costCny,
   });
@@ -412,6 +414,7 @@ class WbUsageStats {
 
   /// 有多少条带 credit，用来判断估算的可信度
   int creditKnown = 0;
+  final List<WbUsageRow> rows = [];
   final Map<String, int> byModel = {};
   final Map<String, int> byAccount = {};
   final Map<String, int> byRealm = {};
@@ -425,6 +428,7 @@ class WbUsageStats {
 
   /// 累加一行
   void add(WbUsageRow r) {
+    rows.add(r);
     requests++;
     if (!r.ok) errors++;
     promptTokens += r.prompt;
@@ -530,11 +534,26 @@ class WbData {
     int? sinceDays,
     int? limit,
     WbPricing? pricing,
+    bool allHistory = false,
   }) async {
     final stats = WbUsageStats();
     final f = File(_join(usageDir, 'usage.jsonl'));
     if (!f.existsSync()) return stats;
     final maxLines = limit ?? _defaultUsageLimit;
+    if (allHistory) {
+      final cutoff = _sinceCutoff(sinceDays);
+      await for (final line
+          in f
+              .openRead()
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())) {
+        final row = _parseUsageRow(line, pricing);
+        if (row != null && (cutoff == null || !row.ts.isBefore(cutoff))) {
+          stats.add(row);
+        }
+      }
+      return stats;
+    }
     final tail = await _tailLines(f, maxLines);
     // 先去掉空行再截尾，否则末尾那个换行符会占掉一个名额、丢掉一条真行
     final lines = tail.where((l) => l.trim().isNotEmpty).toList();
@@ -749,6 +768,7 @@ class WbData {
       ts: ts,
       model: model,
       requestedModel: _optStr(m, 'requested_model'),
+      requestId: _optStr(m, 'request_id'),
       account: _s(m, 'account'),
       realm: _s(m, 'realm'),
       prompt: prompt,

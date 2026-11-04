@@ -20,16 +20,39 @@ void main() {
   bool serveClosed = false;
   String? injectError; // 非空则 message 端点返回该错误
   bool hangMessage = false;
-  String? injectRetry; // 非空则推 session.status=retry 事件（CLI 额度耗尽的真实形态）
+  bool partialHang = false;
+  var abortCount = 0;
+  var messageCount = 0;
+  late Completer<void> aborted;
+  String? injectRetry; // 非空则推 session.status=retry 事件（CLI 软失败形态）
+  // 额度 retry 有两种后续（2026-11-04 实测）：CLI 退避后自愈成功（真 CLI
+  // 17~71s 后 OK），或重试预算耗尽后终态 error（info.error）。
+  bool retryRecovers = false; // true=retry 后继续正常输出→期望 200；false=重试耗尽→429
   late StreamController<String> events;
   final client = HttpClient();
 
   setUp(() async {
+    injectError = null;
+    injectRetry = null;
+    retryRecovers = false;
+    hangMessage = false;
+    aborted = Completer<void>();
+    partialHang = false;
+    abortCount = 0;
+    messageCount = 0;
     events = StreamController<String>.broadcast();
     usageDir = await Directory.systemTemp.createTemp('zeroapi-oc-test-');
     serve = await HttpServer.bind('127.0.0.1', 0);
     serve.listen((req) async {
       final path = req.uri.path;
+      if (path.endsWith('/abort')) {
+        abortCount++;
+        if (!aborted.isCompleted) aborted.complete();
+        req.response.headers.contentType = ContentType.json;
+        req.response.write('true');
+        await req.response.close();
+        return;
+      }
       if (path == '/global/health') {
         req.response
           ..headers.contentType = ContentType.json
@@ -40,20 +63,22 @@ void main() {
       if (path == '/config/providers') {
         req.response
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode({
-            'providers': [
-              {
-                'id': 'opencode',
-                'models': {
-                  'deepseek-v4.1-flash-free': {},
-                  'big-pickle': {},
-                  'beam-free': {},
-                  'jev-1.13-free': {},
-                  'claude-opus-5': {},
-                }
-              }
-            ]
-          }));
+          ..write(
+            jsonEncode({
+              'providers': [
+                {
+                  'id': 'opencode',
+                  'models': {
+                    'deepseek-v4.1-flash-free': {},
+                    'big-pickle': {},
+                    'beam-free': {},
+                    'jev-1.13-free': {},
+                    'claude-opus-5': {},
+                  },
+                },
+              ],
+            }),
+          );
         await req.response.close();
         return;
       }
@@ -66,13 +91,19 @@ void main() {
         return;
       }
       if (path == '/event') {
+        req.response.bufferOutput = false;
         req.response
-          ..headers.contentType =
-              ContentType('text', 'event-stream', charset: 'utf-8')
+          ..headers.contentType = ContentType(
+            'text',
+            'event-stream',
+            charset: 'utf-8',
+          )
           ..headers.set('cache-control', 'no-cache');
         // 真 serve 一连上就推 server.connected；mock 同构，否则网关
         // 等 /event 响应头、mock 等消息事件，两边死锁
-        req.response.write('data: {"type":"server.connected","properties":{}}\n\n');
+        req.response.write(
+          'data: {"type":"server.connected","properties":{}}\n\n',
+        );
         // SSE 处理器在流结束前不能 return：dart:io 会把「handler 返回」
         // 当作请求完成并关闭响应，后续写入抛 Bad state
         final done = Completer<void>();
@@ -84,56 +115,78 @@ void main() {
           try {
             req.response.add(utf8.encode('data: $e\n\n'));
           } catch (_) {}
-          if (jsonDecode(e)['type'] == 'session.status' &&
-              !done.isCompleted) {
+          if (jsonDecode(e)['type'] == 'session.status' && !done.isCompleted) {
             done.complete();
           }
         });
-        await done.future.timeout(const Duration(seconds: 5),
-            onTimeout: () {});
+        await done.future.timeout(const Duration(seconds: 5), onTimeout: () {});
         await sub.cancel();
         await req.response.close();
         return;
       }
       final msgMatch = RegExp(r'^/session/([^/]+)/message$').firstMatch(path);
       if (msgMatch != null && req.method == 'POST') {
-        final body = jsonDecode(await utf8.decodeStream(req))
-            as Map<String, dynamic>;
+        messageCount++;
+        final body =
+            jsonDecode(await utf8.decodeStream(req)) as Map<String, dynamic>;
         final sid = msgMatch.group(1);
         final text = (body['parts'] as List)[0]['text'] as String;
         // 真实 serve 的事件序：先回显「用户消息」（role=user + 它的 text
         // part），再推 assistant 消息的增量。回显必须被网关过滤掉。
-        events.add(jsonEncode({
-          'type': 'message.updated',
-          'properties': {
-            'sessionID': sid,
-            'info': {'id': 'msg_user', 'role': 'user'}
-          }
-        }));
-        events.add(jsonEncode({
-          'type': 'message.part.updated',
-          'properties': {
-            'sessionID': sid,
-            'part': {'type': 'text', 'id': 'prt_echo', 'messageID': 'msg_user',
-                     'text': text}
-          }
-        }));
-        events.add(jsonEncode({
-          'type': 'message.updated',
-          'properties': {
-            'sessionID': sid,
-            'info': {'id': 'msg_asst', 'role': 'assistant'}
-          }
-        }));
+        events.add(
+          jsonEncode({
+            'type': 'message.updated',
+            'properties': {
+              'sessionID': sid,
+              'info': {'id': 'msg_user', 'role': 'user'},
+            },
+          }),
+        );
+        events.add(
+          jsonEncode({
+            'type': 'message.part.updated',
+            'properties': {
+              'sessionID': sid,
+              'part': {
+                'type': 'text',
+                'id': 'prt_echo',
+                'messageID': 'msg_user',
+                'text': text,
+              },
+            },
+          }),
+        );
+        events.add(
+          jsonEncode({
+            'type': 'message.updated',
+            'properties': {
+              'sessionID': sid,
+              'info': {'id': 'msg_asst', 'role': 'assistant'},
+            },
+          }),
+        );
         // assistant 的两段增量 + idle，再返回同步结果
-        void emit(String t) => events.add(jsonEncode({
-              'type': 'message.part.updated',
-              'properties': {
-                'sessionID': sid,
-                'part': {'type': 'text', 'id': 'prt_1', 'messageID': 'msg_asst',
-                         'text': t}
-              }
-            }));
+        void emit(String t) => events.add(
+          jsonEncode({
+            'type': 'message.part.updated',
+            'properties': {
+              'sessionID': sid,
+              'part': {
+                'type': 'text',
+                'id': 'prt_1',
+                'messageID': 'msg_asst',
+                'text': t,
+              },
+            },
+          }),
+        );
+        if (partialHang) {
+          emit('partial answer');
+          await req.response.flush();
+          await aborted.future;
+          await req.response.close();
+          return;
+        }
         if (hangMessage) {
           // 上游 hang 形态：message 端点永不返回，也不发任何本会话事件
           await Future.delayed(const Duration(seconds: 30));
@@ -142,56 +195,86 @@ void main() {
           return;
         }
         if (injectRetry != null) {
-          // 真实形态：额度耗尽 → 没有任何内容增量，retry 事件先于首增量
-          events.add(jsonEncode({
-            'type': 'session.status',
-            'properties': {
-              'sessionID': sid,
-              'status': {'type': 'retry', 'attempt': 1, 'message': injectRetry}
-            }
-          }));
-          await Future.delayed(const Duration(seconds: 30));
-          req.response.statusCode = 504;
-          await req.response.close();
-          return;
+          // 真实形态：CLI 软失败先报 retry（无内容增量）。两种后续（11-04 实测）：
+          // retryRecovers=CLI 退避后自愈 → 落入下方正常输出路径；
+          // 否则=重试预算耗尽 → message 同步响应带 info.error（终态）。
+          events.add(
+            jsonEncode({
+              'type': 'session.status',
+              'properties': {
+                'sessionID': sid,
+                'status': {
+                  'type': 'retry',
+                  'attempt': 1,
+                  'message': injectRetry,
+                },
+              },
+            }),
+          );
+          if (!retryRecovers) {
+            await Future.delayed(const Duration(milliseconds: 400));
+            req.response
+              ..headers.contentType = ContentType.json
+              ..write(
+                jsonEncode({
+                  'info': {
+                    'finish': 'error',
+                    'error': {
+                      'name': 'APIError',
+                      'data': {'message': injectRetry, 'statusCode': 429},
+                    },
+                  },
+                  'parts': [],
+                }),
+              );
+            await req.response.close();
+            return;
+          }
+          await Future.delayed(const Duration(milliseconds: 300));
         }
         emit('Hel');
         emit('Hello <$text>');
-        events.add(jsonEncode({
-          'type': 'session.status',
-          'properties': {
-            'sessionID': sid,
-            'status': {'type': 'idle'}
-          }
-        }));
-        if (injectError != null) {
-          // 上游失败：先推 session.error，再返回带 error 的同步结果
-          events.add(jsonEncode({
-            'type': 'session.error',
+        events.add(
+          jsonEncode({
+            'type': 'session.status',
             'properties': {
               'sessionID': sid,
-              'error': {
-                'name': 'APIError',
-                'data': {'message': injectError, 'statusCode': 429}
-              }
-            }
-          }));
+              'status': {'type': 'idle'},
+            },
+          }),
+        );
+        if (injectError != null) {
+          // 上游失败：先推 session.error，再返回带 error 的同步结果
+          events.add(
+            jsonEncode({
+              'type': 'session.error',
+              'properties': {
+                'sessionID': sid,
+                'error': {
+                  'name': 'APIError',
+                  'data': {'message': injectError, 'statusCode': 429},
+                },
+              },
+            }),
+          );
         }
         req.response
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode({
-            'info': {
-              'finish': 'stop',
-              if (injectError != null)
-                'error': {
-                  'name': 'APIError',
-                  'data': {'message': injectError, 'statusCode': 429}
-                }
-            },
-            'parts': [
-              {'type': 'text', 'text': 'Hello <$text>'}
-            ]
-          }));
+          ..write(
+            jsonEncode({
+              'info': {
+                'finish': 'stop',
+                if (injectError != null)
+                  'error': {
+                    'name': 'APIError',
+                    'data': {'message': injectError, 'statusCode': 429},
+                  },
+              },
+              'parts': [
+                {'type': 'text', 'text': 'Hello <$text>'},
+              ],
+            }),
+          );
         await req.response.close();
         return;
       }
@@ -200,18 +283,24 @@ void main() {
     });
 
     final def = UpstreamDef(
-        id: 'zen',
-        type: 'managed',
-        label: 'OpenCode Zen Free',
-        modelPrefix: 'zen',
-        baseUrl: 'http://127.0.0.1:${serve.port}',
-        command: '', // probe 成功即不 spawn
-        healthUrl: 'http://127.0.0.1:${serve.port}/global/health');
+      id: 'zen',
+      type: 'managed',
+      label: 'OpenCode Zen Free',
+      modelPrefix: 'zen',
+      baseUrl: 'http://127.0.0.1:${serve.port}',
+      command: '', // probe 成功即不 spawn
+      healthUrl: 'http://127.0.0.1:${serve.port}/global/health',
+    );
     runtime = UpstreamRuntime(def);
     await runtime.probe();
     registry = ModelRegistry()..rebuild([runtime]);
-    proxy = ProxyServer('127.0.0.1', 0, 'sk-gw', registry,
-        usageDir: usageDir.path);
+    proxy = ProxyServer(
+      '127.0.0.1',
+      0,
+      'sk-gw',
+      registry,
+      usageDir: usageDir.path,
+    );
     await proxy.start();
   });
 
@@ -226,7 +315,9 @@ void main() {
 
   Future<HttpClientResponse> gw(String path, Object body) async {
     final req = await client.openUrl(
-        'POST', Uri.parse('http://127.0.0.1:${proxy.boundPort}$path'));
+      'POST',
+      Uri.parse('http://127.0.0.1:${proxy.boundPort}$path'),
+    );
     req.headers.set('Authorization', 'Bearer sk-gw');
     req.headers.contentType = ContentType.json;
     req.add(utf8.encode(jsonEncode(body)));
@@ -245,9 +336,9 @@ void main() {
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'ping'}
+        {'role': 'user', 'content': 'ping'},
       ],
-      'stream': false
+      'stream': false,
     });
     final raw = await utf8.decodeStream(resp);
     expect(resp.statusCode, 200, reason: raw);
@@ -261,14 +352,13 @@ void main() {
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
+        {'role': 'user', 'content': 'hi'},
       ],
-      'stream': true
+      'stream': true,
     });
     expect(resp.statusCode, 200);
     final raw = await utf8.decodeStream(resp);
-    final lines =
-        raw.split('\n').where((l) => l.startsWith('data: ')).toList();
+    final lines = raw.split('\n').where((l) => l.startsWith('data: ')).toList();
     expect(lines.length, greaterThanOrEqualTo(3));
     final deltas = lines
         .where((l) => l != 'data: [DONE]')
@@ -285,15 +375,33 @@ void main() {
     final resp = await gw('/v1/messages', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'anthropic-hi'}
+        {'role': 'user', 'content': 'anthropic-hi'},
       ],
-      'max_tokens': 16
+      'max_tokens': 16,
     });
     expect(resp.statusCode, 200);
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(body['type'], 'message');
     final text = ((body['content'] as List).first['text'] ?? '') as String;
     expect(text, contains('anthropic-hi'));
+  });
+
+  test('Anthropic 流式 CLI 返回原生事件而非 OpenAI chunk', () async {
+    final response = await gw('/v1/messages', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'hello'},
+      ],
+      'max_tokens': 16,
+      'stream': true,
+    });
+    final text = await utf8.decodeStream(response);
+    expect(response.statusCode, 200);
+    expect(text, contains('event: message_start'));
+    expect(text, contains('event: content_block_delta'));
+    expect(text, contains('event: message_stop'));
+    expect(text, isNot(contains('chat.completion.chunk')));
+    expect(text, isNot(contains('[DONE]')));
   });
 
   test('serve 未就绪时快速 503，不 spawn 失败刷屏', () async {
@@ -304,11 +412,150 @@ void main() {
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
-      ]
+        {'role': 'user', 'content': 'hi'},
+      ],
     });
     expect(resp.statusCode, 503);
     runtime.health = UpstreamHealth.healthy;
+  });
+
+  test('额度耗尽 → 换出口后同一请求重试并成功', () async {
+    injectError = 'Free usage exceeded, subscribe to Go';
+    var rotated = 0;
+    proxy.onRotateEgress = (id) async {
+      rotated++;
+      // 换到新出口后上游恢复正常（真实场景是换 IP 后额度可用）。
+      injectError = null;
+      return true;
+    };
+    addTearDown(() => proxy.onRotateEgress = null);
+
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+      'stream': false,
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 200, reason: raw);
+    expect(rotated, 1, reason: '应触发一次出口轮换');
+    final body = jsonDecode(raw);
+    expect(body['choices'][0]['message']['content'], contains('ping'));
+  });
+
+  test('出口连不通 → 换出口后同请求恢复，失败不污染额度回调', () async {
+    injectError = 'Cannot connect to API: Unable to connect';
+    var rotated = 0;
+    var quotaCalls = 0;
+    proxy.onRotateEgress = (id) async {
+      rotated++;
+      injectError = null;
+      return true;
+    };
+    proxy.onQuotaExhausted = (_) => quotaCalls++;
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/deepseek-v4.1-flash-free',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 200, reason: raw);
+    expect(rotated, 1);
+    expect(quotaCalls, 0);
+  });
+
+  test('出口连不通 → 换出口失败时如实报 502', () async {
+    injectError = 'Cannot connect to API: Unable to connect';
+    proxy.onRotateEgress = (id) async => false;
+    addTearDown(() => proxy.onRotateEgress = null);
+
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+      'stream': false,
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 502, reason: raw);
+    expect(raw, contains('egress_unreachable'));
+  });
+
+  test('前两个出口连接失败，第三个成功且不再轮换', () async {
+    injectRetry = 'Cannot connect to API: Unable to connect';
+    var rotations = 0;
+    proxy.onRotateEgress = (_) async {
+      rotations++;
+      if (rotations == 2) injectRetry = null;
+      return true;
+    };
+    final response = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'third works'},
+      ],
+    });
+    final raw = await utf8.decodeStream(response);
+    expect(response.statusCode, 200, reason: raw);
+    expect(rotations, 2);
+    expect(messageCount, 3);
+    injectRetry = null;
+  });
+
+  test('三个出口均失败：返回错误，绝不发起第四次调用', () async {
+    injectRetry = 'Cannot connect to API: Unable to connect';
+    var rotations = 0;
+    proxy.onRotateEgress = (_) async {
+      rotations++;
+      return true;
+    };
+    final response = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'fail'},
+      ],
+    });
+    final raw = await utf8.decodeStream(response);
+    expect(response.statusCode, 502, reason: raw);
+    expect(rotations, 2);
+    expect(messageCount, 3);
+    injectRetry = null;
+  });
+
+  test('CLI 请求结束后释放出口保护（成功和失败）', () async {
+    var prepared = 0;
+    var finished = 0;
+    proxy.onPrepareOpenCode = () async {
+      prepared++;
+    };
+    final signals = [Completer<void>(), Completer<void>()];
+    proxy.onOpenCodeFinished = () {
+      signals[finished].complete();
+      finished++;
+    };
+    final response = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+    });
+    await response.drain<void>();
+    await signals[0].future.timeout(const Duration(seconds: 3));
+    expect(prepared, 1);
+    expect(finished, 1);
+    injectError = 'Cannot connect to API';
+    final failed = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+    });
+    await failed.drain<void>();
+    await signals[1].future.timeout(const Duration(seconds: 3));
+    expect(prepared, 2);
+    expect(finished, 2);
   });
 
   test('上游额度耗尽 → 429 rate_limit，不再挂到超时', () async {
@@ -317,8 +564,8 @@ void main() {
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
-      ]
+        {'role': 'user', 'content': 'hi'},
+      ],
     });
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(resp.statusCode, 429);
@@ -334,8 +581,8 @@ void main() {
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
-      ]
+        {'role': 'user', 'content': 'hi'},
+      ],
     });
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(resp.statusCode, 502);
@@ -343,30 +590,47 @@ void main() {
     injectError = null;
   }, timeout: const Timeout(Duration(seconds: 40)));
 
-  test('CLI 额度耗尽（status=retry 事件）→ 快速 429，不等 CLI 重试结束', () async {
+  test('额度 retry 不掐死：CLI 退避后自愈 → 200（11-04 误杀回归）', () async {
+    // 关键回归：真 CLI 收到 retry 后常在 17~71s 自愈成功（同出口）。旧实现见
+    // retry 就掐死本轮并换出口，导致一批本来会成功的请求全被误杀。
     injectRetry = 'Free usage exceeded, subscribe to OpenCode Go to keep going';
-    final sw = Stopwatch()..start();
+    retryRecovers = true; // retry 事件后 CLI 继续正常输出
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
-      ]
+        {'role': 'user', 'content': 'hi'},
+      ],
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 200, reason: raw);
+    expect(jsonDecode(raw)['choices'][0]['message']['content'], contains('Hello'));
+    injectRetry = null;
+    retryRecovers = false;
+  }, timeout: const Timeout(Duration(seconds: 40)));
+
+  test('额度 retry 后终态 error（重试预算耗尽）→ 429', () async {
+    // retry 本身不中止；只有同步响应带回 info.error（CLI 重试放弃）才落 429。
+    injectRetry = 'Free usage exceeded, subscribe to OpenCode Go to keep going';
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'hi'},
+      ],
     });
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(resp.statusCode, 429, reason: '$body');
     expect(body['error']['code'], 'free_quota_exhausted');
-    expect(sw.elapsedMilliseconds / 1000, lessThan(15));
     injectRetry = null;
   }, timeout: const Timeout(Duration(seconds: 40)));
 
-  test('流式 + 首增量前额度耗尽 → 干净 429（不提交 200）', () async {
+  test('流式 + 额度 retry 后终态 error → 干净 429（未提交不写流内错误帧）', () async {
     injectRetry = 'Free usage exceeded, subscribe to OpenCode Go to keep going';
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
+        {'role': 'user', 'content': 'hi'},
       ],
-      'stream': true
+      'stream': true,
     });
     final body = jsonDecode(await utf8.decodeStream(resp));
     expect(resp.statusCode, 429, reason: '$body');
@@ -381,9 +645,9 @@ void main() {
       'model': 'zen/big-pickle',
       'messages': [
         {'role': 'system', 'content': '你是 ZCode 编码助手（胡天泽的中文提示词）'},
-        {'role': 'user', 'content': '你好，请回复 OK'}
+        {'role': 'user', 'content': '你好，请回复 OK'},
       ],
-      'stream': false
+      'stream': false,
     });
     final raw = await utf8.decodeStream(resp);
     expect(resp.statusCode, 200, reason: raw);
@@ -398,21 +662,71 @@ void main() {
       events.add(jsonEncode({'type': 'server.heartbeat', 'properties': {}}));
     });
     addTearDown(ticker.cancel);
+    final previous = OpenCodeApi.stallTimeout;
     OpenCodeApi.stallTimeout = const Duration(seconds: 2);
-    addTearDown(() => OpenCodeApi.stallTimeout = const Duration(seconds: 120));
+    addTearDown(() => OpenCodeApi.stallTimeout = previous);
     final sw = Stopwatch()..start();
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/big-pickle',
       'messages': [
-        {'role': 'user', 'content': 'hi'}
+        {'role': 'user', 'content': 'hi'},
       ],
-      'stream': false
+      'stream': false,
     });
     final body = jsonDecode(await utf8.decodeStream(resp));
-    expect(resp.statusCode, 502, reason: '$body');
+    expect(resp.statusCode, 504, reason: '$body');
     expect(body['error']['message'], contains('无任何响应'));
     // 心跳若在续命，这里会是 30s+
     expect(sw.elapsedMilliseconds / 1000, lessThan(10));
     hangMessage = false;
   }, timeout: const Timeout(Duration(seconds: 40)));
+
+  for (final anthropic in [false, true]) {
+    test('部分输出后真停滞：${anthropic ? 'Anthropic' : 'OpenAI'} 错误收尾并释放队列', () async {
+      partialHang = true;
+      final previous = OpenCodeApi.generationIdleTimeout;
+      OpenCodeApi.generationIdleTimeout = const Duration(milliseconds: 500);
+      addTearDown(() => OpenCodeApi.generationIdleTimeout = previous);
+      var rotations = 0;
+      proxy.onRotateEgress = (_) async {
+        rotations++;
+        return true;
+      };
+      final response = await gw(
+        anthropic ? '/v1/messages' : '/v1/chat/completions',
+        {
+          'model': 'zen/big-pickle',
+          'max_tokens': 100,
+          'stream': true,
+          'messages': [
+            {'role': 'user', 'content': 'hi'},
+          ],
+        },
+      );
+      final raw = await utf8
+          .decodeStream(response)
+          .timeout(const Duration(seconds: 8));
+      expect(raw, contains('partial answer'));
+      expect(raw, contains('generation_idle_timeout'));
+      expect(abortCount, 1);
+      expect(messageCount, 1);
+      expect(rotations, 0);
+      if (anthropic) {
+        expect(raw, contains('event: error'));
+        expect(raw, isNot(contains('event: message_stop')));
+      } else {
+        expect(raw, contains('[DONE]'));
+        expect(raw, isNot(contains('"finish_reason":"stop"')));
+      }
+      partialHang = false;
+      final next = await gw('/v1/chat/completions', {
+        'model': 'zen/big-pickle',
+        'messages': [
+          {'role': 'user', 'content': 'next'},
+        ],
+      });
+      expect(next.statusCode, 200);
+      expect(await utf8.decodeStream(next), contains('next'));
+    });
+  }
 }

@@ -21,9 +21,17 @@ void main() {
       expect(def, isNotNull, reason: '本机未找到 opencode CLI');
       // --port 0：serve 自选端口并打印到 stdout。不用 pickPort——两个
       // e2e 文件并行时「先 bind 再放开」的端口会被对方抢占
-      final proc = await Process.start(
-          def!.command!, ['serve', '--hostname', '127.0.0.1', '--port', '0'],
-          environment: def.env);
+      final Process proc;
+      try {
+        proc = await Process.start(
+            def!.command!, ['serve', '--hostname', '127.0.0.1', '--port', '0'],
+            environment: def.env);
+      } on ProcessException catch (e) {
+        // 找到了 CLI 但当前平台跑不了（如非本机架构的二进制）：与本机回归
+        // 无关，按「需要 CLI + 网络」的约定跳过。
+        markTestSkipped('CLI 无法启动：$e');
+        return;
+      }
       addTearDown(() {
         try {
           proc.kill();

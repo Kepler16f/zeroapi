@@ -14,6 +14,10 @@ import '../gateway/opencode.dart';
 import '../gateway/ocruntime.dart';
 import '../gateway/progate.dart';
 import '../gateway/proxy.dart';
+import '../gateway/openrouter_pricing.dart';
+import '../gateway/model_identity.dart';
+import '../gateway/response_records.dart';
+import '../gateway/cost_estimate.dart';
 import '../gateway/proxypool.dart';
 import '../gateway/service.dart';
 import '../gateway/upstream.dart';
@@ -52,8 +56,8 @@ class UpstreamsPage extends StatelessWidget {
                   ),
                 if (!ups.any((u) => WorkBuddy.isWorkBuddy(u.def)))
                   _workbuddyEntryCard(context, service),
-                  if (!ups.any((u) => OpenCode.isOpenCode(u.def)))
-                    _OpenCodeEntryCard(service: service),
+                if (!ups.any((u) => OpenCode.isOpenCode(u.def)))
+                  _OpenCodeEntryCard(service: service),
                 ...ups.map((u) => _UpstreamCard(service: service, rt: u)),
                 const SizedBox(height: 80),
               ],
@@ -331,8 +335,7 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
     final err = await widget.service.addOpenCode();
     if (!mounted) return;
     if (err != null) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(err)));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
     }
   }
 
@@ -344,22 +347,22 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
       _total = 0;
     });
     final err = await widget.service.downloadOpenCodeRuntime(
-        onProgress: (received, total) {
-      if (!mounted) return;
-      setState(() {
-        _received = received;
-        _total = total;
-        _progress = total > 0 ? received / total : null;
-      });
-    });
+      onProgress: (received, total) {
+        if (!mounted) return;
+        setState(() {
+          _received = received;
+          _total = total;
+          _progress = total > 0 ? received / total : null;
+        });
+      },
+    );
     if (!mounted) return;
     setState(() {
       _downloading = false;
       _progress = null;
     });
     if (err != null) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(err)));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
     }
   }
 
@@ -370,14 +373,16 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
       child: ListTile(
         leading: const Icon(Icons.terminal_outlined),
         title: const Text('接入 OpenCode Zen（CLI 通路）'),
-        subtitle: Text(_ready
-            // 说明它为什么存在：上游按 TLS 指纹识别，只有真 CLI 能过免费层门禁
-            ? '检测到本机 opencode CLI（${OpenCodeRuntime.findExecutable()}）。'
-                'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁，'
-                '接入后可用 ${OpenCode.freeModels.length} 个免费模型。'
-            : 'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁。'
-                r'本机未检测到 opencode CLI，可自动从 npm 下载对应平台的官方包'
-                r'（约 177MB，存到 %APPDATA%\zeroapi\opencode）。'),
+        subtitle: Text(
+          _ready
+              // 说明它为什么存在：上游按 TLS 指纹识别，只有真 CLI 能过免费层门禁
+              ? '检测到本机 opencode CLI（${OpenCodeRuntime.findExecutable()}）。'
+                    'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁，'
+                    '接入后可用 ${OpenCode.freeModels.length} 个免费模型。'
+              : 'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁。'
+                    r'本机未检测到 opencode CLI，可自动从 npm 下载对应平台的官方包'
+                    r'（约 177MB，存到 %APPDATA%\zeroapi\opencode）。',
+        ),
         trailing: _downloading
             ? SizedBox(
                 width: 120,
@@ -387,13 +392,16 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
                     LinearProgressIndicator(value: _progress),
                     const SizedBox(height: 4),
                     Text(
-                        _total > 0
-                            ? '${(_progress ?? 0 * 100).toStringAsFixed(0)}% '
+                      _total > 0
+                          ? '${(_progress ?? 0 * 100).toStringAsFixed(0)}% '
                                 '(${(_received / 1048576).toStringAsFixed(1)}/'
                                 '${(_total / 1048576).toStringAsFixed(1)}MB)'
-                            : '${(_received / 1048576).toStringAsFixed(1)}MB',
-                        style: TextStyle(
-                            fontSize: 10, color: cs.onSurfaceVariant)),
+                          : '${(_received / 1048576).toStringAsFixed(1)}MB',
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
                   ],
                 ),
               )
@@ -421,7 +429,7 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
   Future<void> _pickCliPath() async {
     final file = await openFile(
       acceptedTypeGroups: const [
-        XTypeGroup(label: 'opencode', extensions: ['exe'])
+        XTypeGroup(label: 'opencode', extensions: ['exe']),
       ],
     );
     if (file == null) return;
@@ -441,8 +449,8 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
     // 已接入：热替换 serve 命令并重启，新路径立即生效
     final err = await widget.service.updateOpenCodeCommand(path);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(err ?? '已改用 $path，CLI 正在重启')));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(err ?? '已改用 $path，CLI 正在重启')));
   }
 }
 
@@ -636,7 +644,7 @@ String logicalModelName(String upstreamModel) {
 bool _isFreeVariantName(String name) =>
     name.trim().toLowerCase().endsWith('-free');
 
-String _logicalKey(String name) => logicalModelName(name).toLowerCase();
+String _logicalKey(String name) => ModelIdentity.normalize(name);
 
 class ModelsPage extends StatefulWidget {
   final GatewayService service;
@@ -736,9 +744,11 @@ class _ModelsPageState extends State<ModelsPage> {
           b.upstreamModel.toLowerCase(),
         );
       });
-    final anyHealthy = routes.any(
-      (r) => r.upstream.health == UpstreamHealth.healthy,
-    );
+    final healthy = routes.any((r) =>
+        r.upstream.health == UpstreamHealth.healthy &&
+        !r.upstream.modelCallErrors.containsKey(r.upstreamModel));
+    final anyError = routes.any((r) =>
+        r.upstream.modelCallErrors.containsKey(r.upstreamModel));
     return Column(
       children: [
         ExpansionTile(
@@ -746,7 +756,7 @@ class _ModelsPageState extends State<ModelsPage> {
           leading: Icon(
             Icons.circle,
             size: 10,
-            color: anyHealthy ? Colors.green : Colors.grey,
+            color: healthy ? Colors.green : anyError ? Colors.orange : Colors.blueGrey,
           ),
           title: Row(
             children: [
@@ -767,7 +777,8 @@ class _ModelsPageState extends State<ModelsPage> {
             ],
           ),
           subtitle: Text(
-            '展开查看来源、能力、倍率与 Pro 限制',
+            healthy ? '供应商已连接；展开查看能力与最近调用状态'
+                : anyError ? '最近调用失败；展开查看错误详情' : '供应商正在连接或预热',
             style: TextStyle(
               fontSize: 12,
               color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -787,6 +798,7 @@ class _ModelsPageState extends State<ModelsPage> {
     final info = r.upstream.modelInfo[r.upstreamModel];
     final pretty = info?.displayName;
     final call = '${r.upstream.def.callPrefix}/${r.upstreamModel}';
+    final lastError = r.upstream.modelCallErrors[r.upstreamModel];
     final meta = <String>[
       '来源：${r.upstream.def.displayName}',
       if (pretty != null && pretty.isNotEmpty && pretty != r.upstreamModel)
@@ -808,6 +820,14 @@ class _ModelsPageState extends State<ModelsPage> {
               Expanded(child: _capChips(r)),
             ],
           ),
+          if (lastError != null)
+            Text(
+              '最近调用错误：$lastError',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.error,
+                fontSize: 11,
+              ),
+            ),
           const SizedBox(height: 1),
           Text(
             meta,
@@ -913,9 +933,10 @@ class _ModelsPageState extends State<ModelsPage> {
       leading: Icon(
         Icons.circle,
         size: 10,
-        color: r.upstream.health == UpstreamHealth.healthy
-            ? Colors.green
-            : Colors.grey,
+        color: r.upstream.modelCallErrors.containsKey(r.upstreamModel)
+            ? Colors.orange
+            : r.upstream.health == UpstreamHealth.healthy
+                ? Colors.green : Colors.blueGrey,
       ),
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1137,12 +1158,13 @@ class _UsagePageState extends State<UsagePage> {
   /// 图表形态：柱状/饼图/折线（折线仅跨天视图可用）
   String _chart = 'bar';
 
-  /// 是否区分 `-free` 变体：默认关闭，所有视图合并到同一逻辑模型名
-  UsageStats _stats = UsageStats();
-
-  /// WorkBuddy 号池本地用量（与当前时间范围同口径）。null=未取到/失败，按 0 计
-  WbUsageStats? _wb;
+  /// 号池本地价表（OpenRouter 价的本地化版本，含美元兑人民币汇率）
+  WbPricing _hubPricing = const WbPricing(usdCny: 0, models: {});
+  int _visibleRecords = 200;
+  bool _loading = false;
+  bool _pricingLoaded = false;
   int _loadedCount = -1;
+  List<ResponseRecord> _records = [];
 
   static const _views = <String, int?>{'今日': 1, '本周': 7, '本月': 30, '所有': null};
 
@@ -1154,59 +1176,95 @@ class _UsagePageState extends State<UsagePage> {
 
   Future<void> _load() async {
     final server = widget.service.server;
-    if (server == null) return;
+    if (server == null || _loading) return;
+    _loading = true;
     final days = _days;
-    // 网关聚合与号池聚合并发取，互不阻塞
-    final gwFuture = server.usageRange(days: days);
-    WbUsageStats? wb;
+    final countAtStart = server.usageToday.requests;
     try {
-      wb = await widget.service.loadWorkBuddyUsage(sinceDays: days);
-    } catch (_) {
-      wb = null; // 号池取数失败不阻塞用量页，按 0 合并
+      // 网关聚合与号池聚合并发取，互不阻塞。网关聚合只用于触发磁盘刷新，
+      // 统计口径以合并去重后的响应记录为准（见 [_merged]）。
+      final gwFuture = server.usageRange(days: days);
+      WbUsageStats? wb;
+      try {
+        final pricing = await WbData.readPricing(
+          widget.service.workbuddyPricingPath,
+        );
+        _hubPricing = pricing;
+        wb = await WbData.readUsage(
+          widget.service.workbuddyUsageDir,
+          sinceDays: days,
+          pricing: pricing,
+          allHistory: true,
+        );
+      } catch (_) {
+        wb = null; // 号池取数失败不阻塞用量页，按 0 合并
+      }
+      await gwFuture;
+      final dir =
+          server.usageDir ??
+          (Platform.isWindows
+              ? "${Platform.environment['APPDATA']}/zeroapi/logs"
+              : "${Platform.environment['HOME']}/.config/zeroapi/logs");
+      if (!_pricingLoaded) {
+        await OpenRouterPricing.instance.ensureFresh();
+        _pricingLoaded = true;
+      }
+      final gateway = await ResponseRecordRepository.readGateway(
+        dir,
+        days: days,
+      );
+      final records = ResponseRecordRepository.mergeSources(
+        gateway,
+        (wb?.rows ?? []).map(ResponseRecord.fromWorkBuddy).toList(),
+      );
+      if (!mounted) return;
+      if (days != _days) return; // 期间切了视图，由切换触发的下一次刷新覆盖
+      setState(() {
+        _records = records;
+        _loadedCount = countAtStart;
+      });
+    } finally {
+      _loading = false;
+      if (mounted && days != _days) _load();
     }
-    final s = await gwFuture;
-    if (!mounted) return;
-    if (days != _days) return; // 期间切了视图，由切换触发的下一次刷新覆盖
-    setState(() {
-      _stats = s;
-      _wb = wb;
-      _loadedCount = server.usageToday.requests;
-    });
   }
 
-  /// 网关 + 号池合并口径：请求/失败/词元总量、按模型次数与词元、
-  /// 按天词元全部相加。号池记录只有全局词元总量，按各模型请求次数
-  /// 比例摊到模型维度（仅供分模型图展示，总量严格一致）；按天词元
-  /// 用号池真实值（'YYYY-MM-dd' → 'MM-dd'，与网关跨天桶对齐）。
-  /// 号池数据缺失（null/异常）时按 0 处理，返回网关原值。
+  String _estimatedCost() {
+    final s = _costSummary();
+    if (s.priced == 0) return s.unpriced > 0 ? '未知（${s.unpriced} 条）' : '—';
+    final text = '¥${s.cny.toStringAsFixed(2)}';
+    return s.unpriced > 0 ? '$text（${s.unpriced} 条无价目）' : text;
+  }
+
+  /// 成本汇总：网关与号池记录合并去重后统一估算（人民币）。
+  CostSummary _costSummary() => CostEstimator(
+        hubPricing: _hubPricing,
+        openRouter: OpenRouterPricing.instance,
+      ).summarize(_records);
+
+  /// 统一统计：网关与号池的响应记录按 request_id 去重后合并计算。
+  ///
+  /// 号池的历史行没有网关那套小时/日期分桶，这里按当前视图补：今日按小时、
+  /// 跨天按日期，与网关侧口径一致。
   UsageStats _merged() {
-    final gw = _stats;
-    final wb = _wb;
-    if (wb == null || wb.requests == 0) return gw;
-    final out = UsageStats()..merge(gw);
-    out.requests += wb.requests;
-    out.errors += wb.errors;
-    final prompt = wb.promptTokens.round();
-    final completion = wb.completionTokens.round();
-    out.promptTokens += prompt;
-    out.completionTokens += completion;
-    out.cachedTokens += wb.cachedTokens.round();
-    final tokensTotal = prompt + completion;
-    wb.byModel.forEach((m, c) {
-      out.byModel.update(m, (v) => v + c, ifAbsent: () => c);
-      final t = (tokensTotal * c / wb.requests).round();
-      out.byModelTokens.update(m, (v) => v + t, ifAbsent: () => t);
-    });
-    wb.tokensByDay.forEach((day, t) {
-      final key = day.length >= 10 ? day.substring(5) : day;
-      out.byDayTokens.update(key, (v) => v + t, ifAbsent: () => t);
-    });
+    final out = UsageStats();
+    final hourly = _days == 1;
+    for (final r in _records) {
+      final t = r.time.toLocal();
+      final trendKey = hourly
+          ? t.hour.toString().padLeft(2, '0')
+          : '${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
+      out.add(
+        logicalModelName(r.model),
+        r.input ?? 0,
+        r.output ?? 0,
+        r.success == false,
+        trendKey: trendKey,
+        cached: r.cached ?? 0,
+      );
+    }
     return out;
   }
-
-  /// 合并成本（人民币元）：网关侧无成本概念计 0，全部来自号池记录
-  /// （credit 优先、缺失按号池价表折算，口径在 wbdata 内实现）。
-  double get _mergedCostCny => _wb?.costCnySum ?? 0;
 
   @override
   Widget build(BuildContext context) {
@@ -1223,7 +1281,8 @@ class _UsagePageState extends State<UsagePage> {
         // -free 与同名标准变体始终合并统计（与号池计费口径一致）
         final displayStats = mergeFreeUsageVariants(u);
         final cs = Theme.of(context).colorScheme;
-        final logs = server.logs.reversed.take(100).toList();
+        // 网关与号池记录合并后一起显示，不再按来源分列表。
+        final visible = _records;
         final crossDay = _days != 1;
         final chartTypes = <String, String>{
           'bar': '柱状',
@@ -1251,17 +1310,50 @@ class _UsagePageState extends State<UsagePage> {
                   cs.tertiaryContainer,
                 ),
                 _StatCard(
-                  '成本',
-                  '¥${_mergedCostCny.toStringAsFixed(2)}',
+                  '估算成本 CNY（非账单）',
+                  _estimatedCost(),
+                  cs.surfaceContainerHighest,
+                ),
+                _StatCard(
+                  '缓存读取命中率',
+                  u.promptTokens > 0
+                      ? '${(u.cachedTokens / u.promptTokens * 100).toStringAsFixed(1)}%'
+                      : '—',
                   cs.surfaceContainerHighest,
                 ),
               ],
             ),
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: Text(
-                '含 WorkBuddy 号池本地记录（按号池价表折算成本）',
-                style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
+              child: Builder(
+                builder: (context) {
+                  final cost = _costSummary();
+                  final catalog = OpenRouterPricing.instance.fetchedAt;
+                  return Text(
+                    '网关与 WorkBuddy 记录已按 request_id 去重后合并统计。'
+                    '成本以人民币计：号池按实际扣费/本地价表，'
+                    '其余按 OpenRouter 公开价目 × ${cost.usdCny.toStringAsFixed(2)} 折算；'
+                    '免费档 ${cost.free} 条按 0 计，${cost.unpriced} 条无价目未计入。'
+                    '${catalog == null ? '价格目录尚未获取' : '价格目录更新于 ${catalog.toLocal().toString().split('.').first}'}。'
+                    '估算仅供参考，非实际账单。',
+                    style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
+                  );
+                },
+              ),
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () async {
+                  final ok = await OpenRouterPricing.instance.refresh();
+                  if (!context.mounted) return;
+                  setState(() {});
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(ok ? '价格目录已更新' : '价格目录更新失败，继续使用缓存')),
+                  );
+                },
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('更新价格目录'),
               ),
             ),
             const SizedBox(height: 16),
@@ -1325,74 +1417,40 @@ class _UsagePageState extends State<UsagePage> {
                   ),
                 ),
               ),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Row(
-                children: [
-                  const Text(
-                    '网关日志（本次运行）',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const Spacer(),
-                  TextButton.icon(
-                    onPressed: () {
-                      Clipboard.setData(
-                        ClipboardData(text: logs.reversed.join('\n')),
-                      );
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('日志已复制到剪贴板'),
-                          duration: Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    },
-                    icon: const Icon(Icons.copy_all, size: 16),
-                    label: const Text('复制'),
-                  ),
-                ],
-              ),
+            const Text('响应记录', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              '网关与 WorkBuddy 的记录已合并显示：相同 request_id 只保留一条'
+              '（成本取号池的实际扣费）；无共同 ID 的历史记录各自保留。',
             ),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              // 固定高度窗口内滚动：logs 现有取法已倒序（logs[0] 最新），
-              // 故用 reversed:false——最新一条落在窗口最上方，进入即见最新，
-              // 鼠标/触控板在窗口内向下拖动查看历史，不再撑开整页
-              child: SizedBox(
-                height: 220,
-                child: logs.isEmpty
-                    ? Center(
-                        child: Text(
-                          '（暂无日志）',
-                          style: TextStyle(
-                            color: cs.onSurfaceVariant,
-                            fontSize: 12,
-                          ),
+            const SizedBox(height: 8),
+            if (visible.isEmpty)
+              const Text('暂无响应记录')
+            else
+              ...visible
+                  .take(_visibleRecords)
+                  .map(
+                    (r) => Card(
+                      child: ListTile(
+                        dense: true,
+                        title: Text(
+                          '${logicalModelName(r.model)} · ${r.provider} · ${r.success == null
+                              ? '未知'
+                              : r.success!
+                              ? '成功'
+                              : '失败'}',
                         ),
-                      )
-                    // 全量展示（logs[0] 最新在最上），往下滚动看历史；
-                    // 排障需要完整时间线，只留一条不够用
-                    : ListView.builder(
-                        itemCount: logs.length,
-                        itemBuilder: (context, i) => Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 1),
-                          child: Text(
-                            logs[i],
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 11,
-                            ),
-                          ),
+                        subtitle: Text(
+                          '${r.time.toLocal().toString().split('.').first} · ${r.source}${r.requestId == null ? '' : ' · ID ${r.requestId}'}${r.keyLabel == null ? '' : ' · ${r.keyLabel}'}${r.mode == null ? '' : ' · ${r.mode}'}${r.stream == true ? ' · 流式' : ''} · 耗时 ${r.elapsedMs == null ? '—' : '${r.elapsedMs} ms'}\n输入 ${r.input ?? '—'} · 输出 ${r.output ?? '—'} · 缓存读取 ${r.cached ?? '—'} · 缓存写入 ${r.cacheWrite ?? '—'}',
                         ),
+                        isThreeLine: true,
                       ),
+                    ),
+                  ),
+            if (visible.length > _visibleRecords)
+              TextButton(
+                onPressed: () => setState(() => _visibleRecords += 200),
+                child: const Text('加载更多记录'),
               ),
-            ),
           ],
         );
       },
@@ -1986,7 +2044,7 @@ class _SettingsPageState extends State<SettingsPage> {
     super.initState();
     // 回填现有地址（忽略本机回环供应商——它们不走手写代理）
     for (final u in widget.service.config.upstreams) {
-      if (u.isLoopbackBaseUrl) continue;
+      if (!u.supportsUpstreamEgress) continue;
       if (u.proxy.trim().isNotEmpty) {
         _proxyAddr.text = u.proxy;
         break;
@@ -2419,6 +2477,58 @@ class _SettingsPageState extends State<SettingsPage> {
               '内置 OpenCode Zen Free 由本应用原生直连，其他内置型由应用拉起守护。'
               '模型命名：供应商id/模型名；跨供应商不重名时可直接用裸名。',
               style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
+            ),
+            const SizedBox(height: 24),
+            const Text('网关日志（本次运行）', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(
+              '仅本次运行的网关日志，重启后清空；用量与响应记录在「用量」页。',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => Clipboard.setData(
+                  ClipboardData(text: s.server?.logs.join('\n') ?? ''),
+                ),
+                icon: const Icon(Icons.copy_all, size: 16),
+                label: const Text('复制全部日志'),
+              ),
+            ),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: SizedBox(
+                  height: 220,
+                  child: (s.server?.logs.reversed.take(100) ?? <String>[]).isEmpty
+                      ? Center(
+                          child: Text(
+                            '（暂无日志）',
+                            style: TextStyle(
+                              color: cs.onSurfaceVariant,
+                              fontSize: 12,
+                            ),
+                          ),
+                        )
+                      : ListView(
+                          children: (s.server?.logs.reversed.take(100) ?? <String>[])
+                              .map(
+                                (line) => Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 1),
+                                  child: SelectableText(
+                                    line,
+                                    style: const TextStyle(
+                                      fontFamily: 'monospace',
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                        ),
+                ),
+              ),
             ),
           ],
         );
@@ -3177,8 +3287,13 @@ class _ProxyPoolPageState extends State<ProxyPoolPage> {
     for (final u in _s.config.upstreams) {
       // 本地服务（如 WorkBuddy hub）没有"供应商出口"可言：网关到它走回环，
       // 它的出网由自己的 realm 用途控制；绑定出口代理只会把回环请求截走。
-      if (u.isLoopbackBaseUrl) continue;
-      out.add((ProxyPool.pUpstream(u.id), '供应商出口 · ${u.displayName}'));
+      if (!u.supportsUpstreamEgress) continue;
+      out.add((
+        ProxyPool.pUpstream(u.id),
+        u.id == OpenCode.id && u.type == 'managed'
+            ? 'CLI 出网 · ${u.displayName}（本地控制通路直连）'
+            : '供应商出口 · ${u.displayName}',
+      ));
     }
     out.add((ProxyPool.pRealm(ProxyPool.realmCn), 'WorkBuddy 国内出口'));
     out.add((ProxyPool.pRealm(ProxyPool.realmIntl), 'WorkBuddy 国际出口'));

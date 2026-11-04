@@ -38,6 +38,7 @@ class UpstreamRuntime {
   /// 只有一个账号时同模型的并行请求排队而不是一起撞上游 429。
   Map<String, int> readyAccounts = {};
   String? lastError;
+  final Map<String, String> modelCallErrors = {};
   Process? child;
 
   /// 带管理面的内置供应商（目前是 WorkBuddy）：管理面 /health 的账号池状态
@@ -60,6 +61,8 @@ class UpstreamRuntime {
   bool _stopping = false;
   int _backoffMs = 1000;
   Timer? _probeTimer;
+  bool _spawning = false;
+  Future<void>? _ensuring;
 
   UpstreamRuntime(this.def);
 
@@ -336,8 +339,10 @@ class UpstreamRuntime {
   }
 
   /// managed：不健康 → 若是外部实例（如用户手动起的）则不拉起；否则启动子进程
-  Future<void> ensure() async {
-    if (!def.enabled) return;
+  Future<void> ensure() => _ensuring ??= _ensure().whenComplete(() => _ensuring = null);
+
+  Future<void> _ensure() async {
+    if (!def.enabled || _stopping) return;
     if (await probe()) return;
     if (!isManaged || child != null || _stopping) return;
     if (_externalGraceActive()) return;
@@ -354,7 +359,7 @@ class UpstreamRuntime {
       lastError = '端口 ${uri.port} 有服务但探测失败（外部实例或密钥不对）';
       return;
     } catch (_) {}
-    _spawn();
+    if (!_stopping) _spawn();
   }
 
   /// 外部实例宽限期内
@@ -371,6 +376,7 @@ class UpstreamRuntime {
   DateTime? _externalSeenAt;
 
   void _spawn() {
+    if (_spawning || _stopping || child != null) return;
     final cmd = def.command;
     if (cmd == null || cmd.isEmpty) {
       lastError = '内置供应商未配置 command（本机未检测到可执行入口）';
@@ -381,6 +387,7 @@ class UpstreamRuntime {
     health = UpstreamHealth.checking;
     lastError = null;
     _warming = true;
+    _spawning = true;
     try {
       final logFile = _logSink();
       logFile?.writeln(
@@ -394,6 +401,11 @@ class UpstreamRuntime {
         def.args,
         environment: def.env.isEmpty ? null : def.env,
       ).then((p) {
+        _spawning = false;
+        if (_stopping) {
+          p.kill();
+          return;
+        }
         child = p;
         lastSpawnAt = DateTime.now();
         onStatusChanged?.call();
@@ -407,6 +419,7 @@ class UpstreamRuntime {
               '[${DateTime.now().toIso8601String()}] exit code=$code',
             );
             sink?.flush();
+            if (!identical(child, p)) return;
             child = null;
             health = UpstreamHealth.unknown;
             onStatusChanged?.call();
@@ -419,8 +432,15 @@ class UpstreamRuntime {
             });
           }),
         );
+      }).catchError((Object e) {
+        _spawning = false;
+        _warming = false;
+        health = UpstreamHealth.down;
+        lastError = '拉起失败: $e';
+        onStatusChanged?.call();
       });
     } catch (e) {
+      _spawning = false;
       lastError = '拉起失败: $e';
     }
   }
@@ -480,14 +500,16 @@ class UpstreamRuntime {
   /// 只重启子进程（不改 _stopping）：用于「换了环境变量要重新拉起」的场景
   /// （如 zen CLI 换了出口代理）。stop() 是彻底关闭，_stopping 置位后
   /// ensure() 不再拉起，不能用于重启。
-  void restartChild() {
+  Future<void> restartChild() async {
     final c = child;
-    if (c != null) {
-      if (!c.kill()) Process.killPid(c.pid);
-    }
     child = null;
     health = UpstreamHealth.checking;
     lastError = null;
+    if (c != null) {
+      if (!c.kill()) Process.killPid(c.pid);
+      await c.exitCode.timeout(const Duration(seconds: 5), onTimeout: () => -1);
+    }
+    _externalSeenAt = null;
   }
 
   void stop() {

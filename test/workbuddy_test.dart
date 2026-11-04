@@ -6,6 +6,41 @@ import 'package:zeroapi/gateway/config.dart';
 import 'package:zeroapi/gateway/workbuddy.dart';
 
 void main() {
+  test('缓存模型目录：解析出模型 id 与出口区', () async {
+    final appData = Platform.environment['APPDATA'] ?? '';
+    final catalog = Directory(
+      '$appData${Platform.pathSeparator}zeroapi${Platform.pathSeparator}'
+      'workbuddy${Platform.pathSeparator}catalog',
+    )..createSync(recursive: true);
+    File('${catalog.path}/product-config-cn.json').writeAsStringSync(
+      jsonEncode({
+        'data': {
+          'models': [
+            {'id': 'hy3'},
+            {'id': 'only-cn'},
+          ],
+        },
+      }),
+    );
+    File('${catalog.path}/product-config-intl.json').writeAsStringSync(
+      jsonEncode({
+        'data': {
+          'models': [
+            {'id': 'hy3'},
+            {'id': 'gpt-5.5'},
+          ],
+        },
+      }),
+    );
+    final cached = await WorkBuddy.cachedCatalog();
+    expect(cached.realms.keys, containsAll(['only-cn', 'gpt-5.5']));
+    expect(cached.realms['only-cn'], 'cn');
+    expect(cached.realms['gpt-5.5'], 'intl');
+    expect(cached.shared, contains('hy3'), reason: '两区都有的模型是共有模型');
+    expect(cached.realms.containsKey('hy3'), isFalse,
+        reason: '共有模型不记单一区');
+  });
+
   group('WorkBuddy.panelUrl', () {
     UpstreamDef def(String baseUrl, [String id = WorkBuddy.id]) =>
         UpstreamDef(id: id, type: 'managed', label: 'wb', baseUrl: baseUrl);

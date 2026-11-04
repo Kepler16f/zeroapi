@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'config.dart';
@@ -28,6 +29,50 @@ class WorkBuddy {
     final dir = Directory('$base/zeroapi/workbuddy');
     if (!dir.existsSync()) dir.createSync(recursive: true);
     return dir;
+  }
+
+  /// 读取号池已缓存的模型目录（`catalog/product-config-{realm}.json`）。
+  ///
+  /// 号池引擎从零启动时要拉取远端目录才能回答 `/models`，实测这一段可达
+  /// 数十秒；期间模型页是空的。目录本身已经缓存在本地，先用它把模型清单
+  /// 填上，引擎就绪后再由真实探测覆盖。
+  ///
+  /// 返回：模型 id → 出口区（cn/intl），以及两区都有的模型（共有模型）。
+  static Future<({Map<String, String> realms, Set<String> shared})>
+      cachedCatalog() async {
+    final dir = Directory('${dataRoot().path}/catalog');
+    final realms = <String, String>{};
+    final shared = <String>{};
+    for (final realm in const ['cn', 'intl']) {
+      final file = File('${dir.path}/product-config-$realm.json');
+      if (!file.existsSync()) continue;
+      List<String> ids;
+      try {
+        final json = jsonDecode(await file.readAsString());
+        if (json is! Map) continue;
+        final data = json['data'];
+        if (data is! Map) continue;
+        final models = data['models'];
+        if (models is! List) continue;
+        ids = [
+          for (final m in models)
+            if (m is Map && m['id'] is String) m['id'] as String,
+        ];
+      } catch (_) {
+        continue;
+      }
+      for (final id in ids) {
+        final prev = realms[id];
+        if (prev != null && prev != realm) {
+          shared.add(id);
+          // 共有模型不归单一区：从区映射里移除，只留在 shared 集合中。
+          realms.remove(id);
+        } else {
+          realms[id] = realm;
+        }
+      }
+    }
+    return (realms: realms, shared: shared);
   }
 
   /// 管理面板地址：baseUrl 去掉 `/v1` 后的 origin。
@@ -104,6 +149,11 @@ class WorkBuddy {
     // hub 的 auth_required() 在无启动器密钥且面板未配置密钥时为 False，
     // 网关也不发 Authorization（见 proxy.dart 的 apiKey.isNotEmpty 判定）；
     // 面板回落默认密码 admin，「复制面板密码」仍拿到正确值。
+    // 引擎入口优先用带请求追踪的 launcher：它给号池 usage 行补上网关侧的
+    // request_id，同一请求在两边可关联/去重。找不到 launcher 时退回上游
+    // wb_proxy.py，功能不变，只是失去跨源关联。
+    final launcher = GatewayConfig.findWorkBuddyLauncher();
+    final script = launcher ?? '${vendor.path}/wb_proxy.py';
     final def = UpstreamDef(
       id: id,
       type: 'managed',
@@ -112,7 +162,7 @@ class WorkBuddy {
       apiKey: '',
       command: '{{wbdir}}/python/pythonw.exe',
       args: [
-        '{{wbdir}}/wb_proxy.py',
+        script,
         '--host',
         '127.0.0.1',
         '--port',
@@ -126,6 +176,7 @@ class WorkBuddy {
         'WB_PROXY_CATALOG_DIR': catalog.path,
         'PYTHONUTF8': '1',
         'PYTHONDONTWRITEBYTECODE': '1',
+        if (launcher != null) 'ZEROAPI_WORKBUDDY_HUB': '${vendor.path}/wb_proxy.py',
       },
       healthUrl: 'http://127.0.0.1:$port/health',
       // 对外调用名统一为 WorkBuddy/<模型名>（如 WorkBuddy/deepseek-v4-pro）

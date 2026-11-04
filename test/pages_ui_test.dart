@@ -130,6 +130,9 @@ void main() {
       await tester.pumpAndSettle();
 
       // 供应商那一层折叠已消失
+      final statusDots = tester.widgetList<Icon>(find.byIcon(Icons.circle));
+      expect(statusDots.where((icon) => icon.color == Colors.green), isNotEmpty,
+          reason: '已连接供应商的模型状态必须显示绿色');
       expect(find.text('id: workbuddy'), findsNothing);
       expect(find.textContaining('个来源'), findsNothing);
       expect(find.textContaining('个调用名'), findsWidgets);

@@ -189,6 +189,16 @@ class NodeHealth {
   /// 额度按出口 IP × 天计、UTC 零点重置，标记后当天不再选它，跨天自动翻篇。
   String? quotaDay;
 
+  /// 该节点当天（UTC 日期）被**真 opencode CLI 身份**验证过额度可用。
+  ///
+  /// 额度是按「客户端身份 × 出口 IP」计的：只有真 CLI 的 TLS 身份才有免费
+  /// 额度，复刻指纹的客户端在任何出口都是 0（2026-11-04 实测：同一 IP 上
+  /// Python 身份 429、真 CLI 200）。而真 CLI 身份在**同一个出口 IP** 上
+  /// 仍可能被别人烧穿（实测 8 个节点里 3 个可用、5 个烧穿）。所以：
+  /// 「能出网」（定向探活）≠「CLI 身份在这里有额度」，只有真 CLI 跑一次
+  /// 才知道。成功的节点记在这里，优先复用，别每次盲选。
+  String? quotaOkDay;
+
   NodeHealth();
 
   Map<String, dynamic> toJson() => {
@@ -196,6 +206,7 @@ class NodeHealth {
     'failCount': failCount,
     if (lastChecked != null) 'lastChecked': lastChecked!.toIso8601String(),
     if (quotaDay != null) 'quotaDay': quotaDay,
+    if (quotaOkDay != null) 'quotaOkDay': quotaOkDay,
   };
 
   factory NodeHealth.fromJson(Map<String, dynamic> j) {
@@ -205,6 +216,8 @@ class NodeHealth {
     h.lastChecked = DateTime.tryParse(_s(j['lastChecked']));
     final qd = _s(j['quotaDay']);
     h.quotaDay = qd.isEmpty ? null : qd;
+    final okd = _s(j['quotaOkDay']);
+    h.quotaOkDay = okd.isEmpty ? null : okd;
     return h;
   }
 }
@@ -232,6 +245,203 @@ class ProxyPool extends ChangeNotifier {
 
   /// nodeId → 健康度。
   final Map<String, NodeHealth> health;
+
+  /// 用途 → 该用途真正要访问的目标站点（探测用）。
+  ///
+  /// 默认探测目标（cp.cloudflare.com 的 204）只能说明「节点能出网」，说明不了
+  /// 「节点能访问上游 API」：实测同一批节点里，能过 204 的仍可能连不上
+  /// opencode.ai（TLS 被掐或被目标站拒绝），Zen 这时表现为 CLI 报
+  /// "Cannot connect to API"。给用途登记目标后，节点会按目标站点单独判活，
+  /// 不通则在该用途里被跳过。运行态状态，不序列化（每轮巡检重算）。
+  final Map<String, String> purposeTargets = {};
+
+  /// nodeId → 该节点在哪些用途上打不开目标站点。
+  final Map<String, Set<String>> targetFailures = {};
+
+  final Map<
+    String,
+    ({String signature, DateTime at, List<PoolCandidate> candidates})
+  >
+  _purposeScans = {};
+  final Map<String, Future<void>> _purposeScansRunning = {};
+  static Duration targetProbeTimeout = const Duration(seconds: 8);
+
+  /// 全量检测绑定组，再返回本轮确实通过的节点，按目标站延迟升序排列。
+  /// 未测、超时、失败不能作为兜底；不同请求共享在途检测和 60 秒快照。
+  Future<List<PoolCandidate>> measuredCandidatesFor(
+    String purpose, {
+    bool force = false,
+  }) async {
+    while (true) {
+      if (!isEnabled(purpose)) return const [];
+      final group = _groupNamed(groupFor(purpose) ?? '');
+      final target = purposeTargets[purpose];
+      if (group == null || target == null) return const [];
+      final sig = jsonEncode([
+        target,
+        group.name,
+        for (final n in group.nodes) [n.toJson(), directiveOf(n)],
+      ]);
+      final running = _purposeScansRunning[purpose];
+      if (running != null) {
+        await running;
+        force = false;
+        continue;
+      }
+      final cached = _purposeScans[purpose];
+      if (!force &&
+          cached != null &&
+          cached.signature == sig &&
+          DateTime.now().difference(cached.at) < const Duration(seconds: 60)) {
+        final now = DateTime.now();
+        final nodes = {for (final n in group.nodes) n.id: n};
+        final candidates = cached.candidates.where((c) {
+          final n = nodes[c.nodeId];
+          return n != null &&
+              directiveOf(n) == c.directive &&
+              !_inCooldown(n, now) &&
+              !isQuotaSpent(n.id) &&
+              targetUsable(n.id, purpose);
+        }).toList();
+        final pinned = candidates
+            .where((c) => c.nodeId == group.pinnedNodeId)
+            .firstOrNull;
+        return pinned == null ? _preferQuotaOk(candidates) : [pinned];
+      }
+      final future = _measurePurpose(
+        purpose,
+        target,
+        sig,
+        group.nodes.toList(),
+      );
+      _purposeScansRunning[purpose] = future;
+      try {
+        await future;
+      } finally {
+        _purposeScansRunning.remove(purpose);
+      }
+      force = false;
+    }
+  }
+
+  /// 把「当天被真 CLI 身份验证过额度可用」的出口排到前面，其余保持原序。
+  ///
+  /// 测速快照有 60 秒缓存，而额度可用性是随时变化的（CLI 跑通才知道），
+  /// 所以每次取候选时按当前额度状态再排一次，而不是只在测速那一刻排序。
+  List<PoolCandidate> _preferQuotaOk(List<PoolCandidate> candidates) {
+    if (candidates.length < 2) return candidates;
+    final ok = <PoolCandidate>[];
+    final rest = <PoolCandidate>[];
+    for (final c in candidates) {
+      final id = c.nodeId;
+      if (id != null && isQuotaOk(id)) {
+        ok.add(c);
+      } else {
+        rest.add(c);
+      }
+    }
+    return ok.isEmpty ? candidates : [...ok, ...rest];
+  }
+
+  Future<void> _measurePurpose(
+    String purpose,
+    String target,
+    String signature,
+    List<ProxyNode> nodes,
+  ) async {
+    final seen = <String>{};
+    final targets = nodes.where((n) => seen.add(n.id)).toList();
+    final measured = <({PoolCandidate candidate, int ms})>[];
+    for (var i = 0; i < targets.length; i += 8) {
+      final batch = targets.skip(i).take(8).toList();
+      final results = await Future.wait([
+        for (final n in batch) _probeMeasuredTarget(n, target),
+      ]);
+      for (var j = 0; j < batch.length; j++) {
+        final n = batch[j];
+        final (ok, ms) = results[j];
+        final directive = directiveOf(n);
+        if (ok && directive != null) {
+          clearTargetFailed(n.id, purpose);
+          final h = health.putIfAbsent(n.id, () => NodeHealth());
+          h.failCount = 0;
+          h.lastChecked = DateTime.now();
+          measured.add((candidate: PoolCandidate(directive, n.id), ms: ms));
+        } else {
+          markTargetFailed(n.id, purpose);
+        }
+      }
+    }
+    // 排序：先按「当天被真 CLI 身份验证过额度可用」，再按延迟。
+    //
+    // 额度按「客户端身份 × 出口 IP」计：只有真 opencode CLI 的 TLS 身份有免费
+    // 额度，复刻指纹的客户端在任何出口都是 0；而真 CLI 身份在同一个出口 IP
+    // 上仍可能被别人烧穿（2026-11-04 实测 8 个节点 3 个可用）。所以
+    // 「定向探活通过」只能证明能出网，证明不了这里有额度——只有真 CLI 跑过
+    // 才知道。验证通过的节点当天优先复用，避免每次盲选撞到烧穿的 IP。
+    measured.sort((a, b) {
+      final okA = isQuotaOk(a.candidate.nodeId!);
+      final okB = isQuotaOk(b.candidate.nodeId!);
+      if (okA != okB) return okA ? -1 : 1;
+      return a.ms != b.ms
+          ? a.ms.compareTo(b.ms)
+          : a.candidate.nodeId!.compareTo(b.candidate.nodeId!);
+    });
+    _purposeScans[purpose] = (
+      signature: signature,
+      at: DateTime.now(),
+      candidates: [for (final m in measured) m.candidate],
+    );
+  }
+
+  Future<(bool, int)> _probeMeasuredTarget(
+    ProxyNode node,
+    String target,
+  ) async {
+    final directive = directiveOf(node);
+    if (directive == null) return (false, -1);
+    final client = HttpClient()
+      ..connectionTimeout = targetProbeTimeout
+      ..findProxy = (_) => directive;
+    final sw = Stopwatch()..start();
+    try {
+      return await (() async {
+        final req = await client.getUrl(Uri.parse(target));
+        final response = await req.close();
+        await response.drain<void>();
+        return (
+          response.statusCode >= 200 && response.statusCode < 400,
+          sw.elapsedMilliseconds,
+        );
+      })().timeout(targetProbeTimeout);
+    } catch (_) {
+      return (false, -1);
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// 为某个用途登记真实目标站点（用于定向探活）。
+  void setPurposeTarget(String purpose, String url) {
+    if (purposeTargets[purpose] != url) {
+      purposeTargets[purpose] = url;
+      targetFailures.clear(); // 目标变了，旧的失败结论作废
+    }
+  }
+
+  /// 节点在指定用途上是否可用（未被定向探活判失败）。
+  bool targetUsable(String nodeId, String purpose) =>
+      !(targetFailures[nodeId] ?? const {}).contains(purpose);
+
+  /// 标记节点在指定用途上打不开目标站点。
+  void markTargetFailed(String nodeId, String purpose) {
+    (targetFailures[nodeId] ??= <String>{}).add(purpose);
+  }
+
+  /// 清除节点的定向失败标记（节点恢复或换目标后调用）。
+  void clearTargetFailed(String nodeId, String purpose) {
+    targetFailures[nodeId]?.remove(purpose);
+  }
 
   /// 最近一次 [importFromText] 中解析失败的行（不让整批失败）。
   final List<String> parseErrors;
@@ -1186,10 +1396,20 @@ class ProxyPool extends ChangeNotifier {
     final h = health.putIfAbsent(nodeId, () => NodeHealth());
     if (h.quotaDay == quotaToday()) return;
     h.quotaDay = quotaToday();
+    h.quotaOkDay = null; // 烧穿了，之前记的「可用」作废
     notifyListeners();
   }
 
-  /// 清除某节点今天的额度标记（池里全部拉黑后重头轮换用）。
+  /// 记录节点当天被真 opencode CLI 身份验证过额度可用（换出口时优先选它）。
+  void markQuotaOk(String nodeId) {
+    final h = health.putIfAbsent(nodeId, () => NodeHealth());
+    if (h.quotaOkDay == quotaToday()) return;
+    h.quotaOkDay = quotaToday();
+    h.quotaDay = null; // 验证可用则不再算烧穿
+    notifyListeners();
+  }
+
+  /// 清除节点今天的额度标记（池里全部拉黑后重头轮换用）。
   void clearQuotaSpent(String nodeId) {
     final h = health[nodeId];
     if (h == null || h.quotaDay == null) return;
@@ -1198,8 +1418,10 @@ class ProxyPool extends ChangeNotifier {
   }
 
   /// 节点今天（UTC）是否已被判定额度耗尽。
-  bool isQuotaSpent(String nodeId) =>
-      health[nodeId]?.quotaDay == quotaToday();
+  bool isQuotaSpent(String nodeId) => health[nodeId]?.quotaDay == quotaToday();
+
+  /// 节点今天（UTC）是否被真 CLI 身份验证过额度可用。
+  bool isQuotaOk(String nodeId) => health[nodeId]?.quotaOkDay == quotaToday();
 
   // ---- 自动巡检 ----
 
@@ -1256,11 +1478,14 @@ class ProxyPool extends ChangeNotifier {
           if (ok) {
             hh.failCount = 0;
             hh.latencyMs = ms;
+          } else {
+            hh.latencyMs = -1;
           }
           // 巡检失败只记时间戳，不累加 failCount：瞬时抖动不该把正在服务
           // 的节点踢出轮换；真坏了的节点由请求路径 noteEgress 计数
         }
       }
+      await _probePurposeTargets(targets);
       // 巡检刷新了延迟/解禁冷却：广播让 UI 的可达性圆点即时更新；
       // 生产环境里 _onPoolChanged 监听器会顺带落盘，这里不显式 save()
       // （避免测试没有注入 savePath 时误写真实 proxies.json）。
@@ -1272,6 +1497,16 @@ class ProxyPool extends ChangeNotifier {
     }
   }
 
+  /// 按用途登记的真实目标站点定向探活。
+  ///
+  /// 默认目标只证明「节点能出网」；Zen 这类用途真正要访问 opencode.ai，
+  /// 节点能过 204 却打不开该站时，按用途判失败并从该用途的候选里剔除。
+  Future<void> _probePurposeTargets(List<ProxyNode> targets) async {
+    for (final purpose in purposeTargets.keys.toList()) {
+      await measuredCandidatesFor(purpose, force: true);
+    }
+  }
+
   /// 可达性探测目标：默认走 Cloudflare 的 generate_204（轻量、无副作用、
   /// 任何出口都能判活）。测试注入本地假上游以离线验证；运行态不序列化。
   static String probeTarget = 'http://cp.cloudflare.com/generate_204';
@@ -1280,19 +1515,20 @@ class ProxyPool extends ChangeNotifier {
     final directive = directiveOf(n);
     if (directive == null) return (false, -1);
     final sw = Stopwatch()..start();
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 6)
+      ..findProxy = (_) => directive;
     try {
-      final client = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 6)
-        ..findProxy = (_) => directive;
-      final req = await client.getUrl(Uri.parse(probeTarget));
-      final resp = await req.close().timeout(const Duration(seconds: 8));
-      await resp.drain<void>();
-      sw.stop();
-      client.close(force: true);
-      return (resp.statusCode == 204, sw.elapsedMilliseconds);
+      return await (() async {
+        final req = await client.getUrl(Uri.parse(probeTarget));
+        final resp = await req.close();
+        await resp.drain<void>();
+        return (resp.statusCode == 204, sw.elapsedMilliseconds);
+      })().timeout(const Duration(seconds: 8));
     } catch (_) {
-      sw.stop();
       return (false, -1);
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -1640,6 +1876,8 @@ List<PoolCandidate> poolCandidatesFor(ProxyPool? pool, String purpose) {
   for (final n in group.nodes) {
     if (pool.directiveOf(n) == null) continue;
     if (pool._inCooldown(n, now)) continue;
+    // 定向探活判失败的节点在该用途里跳过（打不开上游 API 的出口不能用来跑该用途）。
+    if (!pool.targetUsable(n.id, purpose)) continue;
     cand.add(n);
   }
   if (cand.isEmpty) return const [];
