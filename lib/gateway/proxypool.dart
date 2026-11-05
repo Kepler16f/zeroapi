@@ -315,6 +315,40 @@ class ProxyPool extends ChangeNotifier {
             .firstOrNull;
         return pinned == null ? _preferQuotaOk(candidates) : [pinned];
       }
+      // 快照过期（或强制重测）：**先用旧快照顶上去，后台重测**。
+      //
+      // 原实现在请求关键路径上同步等全池扫描：87 个节点、每批 8 个、每节点
+      // 8 秒超时 → 最坏 11 批 × 8s ≈ 88 秒（用户实测「一个你好两分钟」）。
+      // 快照过期并不代表候选失效（节点参数没变、目标站没变），所以旧快照
+      // 足够好；重测放后台，下次请求就是新的。
+      if (!force &&
+          cached != null &&
+          cached.signature == sig &&
+          cached.candidates.isNotEmpty) {
+        final now = DateTime.now();
+        final nodes = {for (final n in group.nodes) n.id: n};
+        final stale = cached.candidates.where((c) {
+          final n = nodes[c.nodeId];
+          return n != null &&
+              directiveOf(n) == c.directive &&
+              !_inCooldown(n, now) &&
+              !isQuotaSpent(n.id) &&
+              !inQuotaCooldown(n.id) &&
+              targetUsable(n.id, purpose);
+        }).toList();
+        if (stale.isNotEmpty) {
+          // 后台重测（不 await）：失败也只是下次再用旧快照
+          unawaited(
+            _measurePurpose(purpose, target, sig, group.nodes.toList()).catchError(
+              (Object _) => const <({PoolCandidate candidate, int ms})>[],
+            ),
+          );
+          final pinned = stale
+              .where((c) => c.nodeId == group.pinnedNodeId)
+              .firstOrNull;
+          return pinned == null ? _preferQuotaOk(stale) : [pinned];
+        }
+      }
       final future = _measurePurpose(
         purpose,
         target,
@@ -330,7 +364,6 @@ class ProxyPool extends ChangeNotifier {
       force = false;
     }
   }
-
   /// 把「当天被真 CLI 身份验证过额度可用」的出口排到前面，其余保持原序。
   ///
   /// 测速快照有 60 秒缓存，而额度可用性是随时变化的（CLI 跑通才知道），
@@ -359,8 +392,12 @@ class ProxyPool extends ChangeNotifier {
     final seen = <String>{};
     final targets = nodes.where((n) => seen.add(n.id)).toList();
     final measured = <({PoolCandidate candidate, int ms})>[];
-    for (var i = 0; i < targets.length; i += 8) {
-      final batch = targets.skip(i).take(8).toList();
+    // 每批并发数：8 太保守——87 个节点、每批 8 个、每节点 8 秒超时，
+    // 最坏 11 批 × 8s ≈ 88s，**全发生在用户请求的关键路径上**（用户实测
+    // 「一个你好要两分钟」）。提到 32 → 最坏 3 批 × 8s ≈ 24s。
+    const batchSize = 32;
+    for (var i = 0; i < targets.length; i += batchSize) {
+      final batch = targets.skip(i).take(batchSize).toList();
       final results = await Future.wait([
         for (final n in batch) _probeMeasuredTarget(n, target),
       ]);

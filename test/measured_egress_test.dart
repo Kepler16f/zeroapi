@@ -48,7 +48,10 @@ void main() {
     calls = 0;
     pool = ProxyPool();
     previousTimeout = ProxyPool.targetProbeTimeout;
-    ProxyPool.targetProbeTimeout = const Duration(milliseconds: 800);
+    // 探针超时放宽到 2s：慢节点要能在超时前被测到（下面延迟 1.2s），
+    // 且与快节点留出足够差距——全量并发时 CPU 被占，快节点也可能测出
+    // 几百毫秒，差距太小会让排序断言偶发翻转。
+    ProxyPool.targetProbeTimeout = const Duration(seconds: 2);
     pool.setPurposeTarget(purpose, 'http://zen.example.test/');
     pool.assignments[purpose] = '飞鸟云';
   });
@@ -63,10 +66,9 @@ void main() {
 
   test('scan whole group before selection, exclude timeouts/403 and sort successes', () async {
     final bad = await node('403', status: 403);
-    // 慢节点延迟 600ms：必须小于探针超时（800ms，否则会被剔除），但与
-    // 快节点差距足够大——原来 250ms 在全量并发（CPU 被占）时快节点可能
-    // 测出 >250ms，排序翻转 → 偶发失败。
-    final slow = await node('slow', delay: const Duration(milliseconds: 600));
+    // 慢节点延迟 1.2s（小于 2s 探针超时）：与快节点差距足够大，全量并发
+    // 下排序断言不会偶发翻转。
+    final slow = await node('slow', delay: const Duration(milliseconds: 1200));
     final fast = await node('fast');
     final hung = await node('body hang', hangBody: true);
     final other = await node('Webshare');
@@ -75,9 +77,7 @@ void main() {
     pool.health[hung.id] = NodeHealth()..latencyMs = 1;
     final watch = Stopwatch()..start();
     final measured = await pool.measuredCandidatesFor(purpose);
-    // 断言用「慢节点被探到」为准：探测是分批并发的，慢节点那批的实际耗时
-    // 从它开始被探算起，比整轮墙钟更贴近被测行为（墙钟会随并发负载漂移）。
-    expect(watch.elapsedMilliseconds, greaterThanOrEqualTo(700));
+    expect(watch.elapsedMilliseconds, greaterThanOrEqualTo(1200));
     expect(measured.map((c) => c.nodeId), [fast.id, slow.id]);
     expect(
       calls,

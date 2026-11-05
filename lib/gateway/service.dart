@@ -346,6 +346,12 @@ class GatewayService extends ChangeNotifier {
   /// 一轮完整测速后的候选，以及当前请求已经尝试的节点。
   final Map<String, List<PoolCandidate>> _zenMeasuredCandidates = {};
   final Set<String> _zenAttemptedNodes = {};
+
+  /// **当前 CLI 正在用的出口节点 id**（直接记录，不再从 env 里的代理 URL
+  /// 反查候选列表）。反查会漏：轮换后候选列表被新快照覆盖，旧节点可能已不在
+  /// 列表里 → 成功/失败的出口都记不上 → 每次都重新盲选（用户实测延迟
+  /// 高达几分钟的根因之一）。
+  final Map<String, String> _zenCurrentNodeId = {};
   bool _zenRequestPreparing = false;
   int _zenRequestsActive = 0;
   bool _zenSyncPending = false;
@@ -391,45 +397,86 @@ class GatewayService extends ChangeNotifier {
     if (rt == null) return;
     final purpose = ProxyPool.pUpstream(rt.id);
     if (upstreamUsesPool(rt.id)) {
-      // 先同步 listener，再等待全组检测；绝不从旧列表盲取三个。
+      // 已有「当天被真 CLI 验证过额度可用」的出口时，**不必**为了选路而
+      // 全量测速 + 同步内核：那两步每次要几百毫秒到数秒，且在没有额度变化
+      // 时结果不变（额度按出口 IP × 天计，当天不变）。
+      final knownOk = _zenKnownOkNode(rt.id);
+      if (knownOk != null && rt.health == UpstreamHealth.healthy) {
+        // CLI 进程的出口在启动时由 HTTP_PROXY 绑定 → 换出口必须重启进程。
+        // 复用已验证的出口时，若 env 已经指向它就不用重启（重启一次要数秒，
+        // 是「一个你好两分钟」的主要来源之一）。
+        final url = _zenNodeProxyUrl(knownOk);
+        if (url != null && _setZenCliEgressEnv(rt.def, url)) {
+          await rt.restartChild();
+          await rt.ensure();
+        }
+        _zenCurrentNodeId[rt.id] = knownOk;
+        server?.log('Zen 复用已验证额度可用的出口 $knownOk');
+        if (rt.health == UpstreamHealth.healthy) {
+          _zenRequestsActive++;
+          return;
+        }
+      }      // 先同步 listener，再等待全组检测；绝不从旧列表盲取三个。
+      final sw = Stopwatch()..start();
       await ProxyCore.instance.sync(pool);
+      server?.log('Zen 出口内核同步耗时 ${sw.elapsedMilliseconds}ms');
       if (_disposed || !identical(proxies, pool)) return;
       server?.log('Zen 正在全量测速绑定分组，等待检测完成后选择出口');
+      sw.reset();
       final candidates = await pool.measuredCandidatesFor(purpose);
+      server?.log('Zen 全量测速耗时 ${sw.elapsedMilliseconds}ms，候选 ${candidates.length} 个');
       _zenMeasuredCandidates[rt.id] = candidates;
       if (candidates.isEmpty) {
         throw const ZenExitUnavailable(
           'Zen 全量测速完成：绑定分组没有通过目标站检测的出口（超时/失败均已剔除）',
         );
       }
-      server?.log('Zen 全量测速完成：${candidates.length} 个出口通过，按延迟优先，最多尝试 3 个不同出口');
-      final selected = candidates.first;
-      if (selected.nodeId != null) _zenAttemptedNodes.add(selected.nodeId!);
+      server?.log('Zen 全量测速完成：${candidates.length} 个出口通过');
+      // **优先用当天已被真 CLI 验证过额度可用的出口**：额度按出口 IP 隔离，
+      // 通用探针只能证明「能出网」，证明不了「这个 IP 上有额度」（实测同一
+      // 时刻 30379/30380 有额度、30375/30376 没有）。盲选（按延迟）会撞上
+      // 没额度的出口 → 每个请求都要轮换 3~6 次出口，每次换都要重启 CLI
+      // （数秒）→ 用户实测「一个你好要两分钟」。记住有额度的出口后，后续
+      // 请求直接命中，秒回。
+      final verified = candidates
+          .where((c) => c.nodeId != null && pool.isQuotaOk(c.nodeId!))
+          .toList();
+      final selected = verified.isNotEmpty ? verified.first : candidates.first;
+      if (selected.nodeId != null) {
+        _zenAttemptedNodes.add(selected.nodeId!);
+        _zenCurrentNodeId[rt.id] = selected.nodeId!;
+      }
       final url = _zenCandidateUrl(selected);
       if (_setZenCliEgressEnv(rt.def, url)) {
         await rt.restartChild();
       }
       await rt.ensure();
     }
-    final uri = Uri.tryParse(rt.def.env['HTTPS_PROXY'] ?? '');
-    var alive = uri == null || uri.host.isEmpty;
-    if (!alive) {
-      try {
-        final socket = await Socket.connect(
-          uri.host,
-          uri.port,
-          timeout: const Duration(seconds: 2),
-        );
-        socket.destroy();
-        alive = true;
-      } catch (_) {}
-    }
-    if (!alive ||
-        (upstreamUsesPool(rt.id) && (uri == null || uri.host.isEmpty))) {
-      await ProxyCore.instance.sync(pool);
-      await _syncZenCliEgressNow(preparing: true);
-    } else {
-      await _syncZenCliEgressNow(preparing: true);
+    // 出口是否可用：CLI 进程活着就说明代理口是通的（进程启动时已经连上过）。
+    // 旧实现每个请求都去 socket 探一次代理口（2s 超时）+ 再跑一遍出口同步
+    // （可能又重启 CLI）——请求越多等得越久（用户实测「一个你好两分钟」）。
+    // 现在只在 CLI 不健康时才做连通性检查与出口修复。
+    if (rt.health != UpstreamHealth.healthy) {
+      final uri = Uri.tryParse(rt.def.env['HTTPS_PROXY'] ?? '');
+      var alive = uri == null || uri.host.isEmpty;
+      if (!alive) {
+        try {
+          final socket = await Socket.connect(
+            uri.host,
+            uri.port,
+            timeout: const Duration(seconds: 2),
+          );
+          socket.destroy();
+          alive = true;
+        } catch (_) {}
+      }
+      if (!alive ||
+          (upstreamUsesPool(rt.id) && (uri == null || uri.host.isEmpty))) {
+        await ProxyCore.instance.sync(pool);
+        await _syncZenCliEgressNow(preparing: true);
+      } else {
+        await _syncZenCliEgressNow(preparing: true);
+      }
     }
     for (var i = 0; i < 30 && !_disposed; i++) {
       if (rt.health == UpstreamHealth.healthy) {
@@ -444,6 +491,40 @@ class GatewayService extends ChangeNotifier {
 
   String _zenCandidateUrl(PoolCandidate candidate) =>
       'http://${candidate.directive.replaceFirst('PROXY ', '')}';
+
+  /// 按节点 id 取它的本地代理 URL（127.0.0.1:port 形式）。
+  /// 走 poolCandidatesFor（纯内存，不做网络探测）。
+  String? _zenNodeProxyUrl(String nodeId) {
+    final pool = proxies;
+    if (pool == null) return null;
+    for (final c
+        in poolCandidatesFor(pool, ProxyPool.pUpstream(OpenCode.id))) {
+      if (c.nodeId == nodeId) return _zenCandidateUrl(c);
+    }
+    return null;
+  }
+
+  /// 当前供应商「当天已被真 CLI 验证过额度可用」的出口节点 id。
+  ///
+  /// 额度按「客户端身份 × 出口 IP × 天」计，当天不变；所以一旦某个出口
+  /// 跑通过，后续请求直接复用它，不必每次全量测速 + 盲选（用户实测延迟
+  /// 高达几分钟的根因）。
+  ///
+  /// 节点 id 从**池的实时候选**里取（poolCandidatesFor 不做网络探测，
+  /// 纯内存），所以即使还没测速也能定位到那个节点的代理地址。
+  String? _zenKnownOkNode(String upstreamId) {
+    final pool = proxies;
+    if (pool == null) return null;
+    final nodeId = _zenCurrentNodeId[upstreamId];
+    if (nodeId != null && pool.isQuotaOk(nodeId)) return nodeId;
+    // 内存里没有（应用刚启动）→ 从池里找当天被标记过额度可用的节点
+    final candidates =
+        poolCandidatesFor(pool, ProxyPool.pUpstream(upstreamId));
+    for (final c in candidates) {
+      if (c.nodeId != null && pool.isQuotaOk(c.nodeId!)) return c.nodeId;
+    }
+    return null;
+  }
 
   /// 只从完成全量检测的快照取候选。池配置变更时先等下一轮检测。
   ///
@@ -555,18 +636,16 @@ class GatewayService extends ChangeNotifier {
   /// 才带额度；通用探针只能证明「能出网」，证明不了「这个 IP 上有额度」。
   /// 所以 CLI 真跑通一次，才把该出口标记为当天可用，下次测速排序时优先。
   void _markZenQuotaOk(String upstreamId) {
-    final rt = _runtimes.where((r) => r.id == upstreamId).firstOrNull;
     final pool = proxies;
-    if (rt == null || pool == null) return;
-    final old = rt.def.env['HTTPS_PROXY'] ?? '';
-    if (old.isEmpty) return;
-    for (final candidate
-        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
-      if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
-        pool.markQuotaOk(candidate.nodeId!);
-        return;
-      }
+    if (pool == null) return;
+    // 用记录的 node id 直接标记（不从 env 反查候选列表——反查会漏）。
+    final nodeId = _zenCurrentNodeId[upstreamId];
+    if (nodeId == null) {
+      server?.log('Zen 额度标记跳过：没有记录当前出口节点');
+      return;
     }
+    pool.markQuotaOk(nodeId);
+    server?.log('Zen 已标记出口 $nodeId 当天额度可用');
   }
 
   void _markZenQuotaExhausted(String upstreamId, int? retryAfterSeconds) {
@@ -613,25 +692,24 @@ class GatewayService extends ChangeNotifier {
     if (rt == null) return false;
     final pool = proxies;
     if (pool == null) return false;
-    final old = rt.def.env['HTTPS_PROXY'] ?? '';
     if (!upstreamUsesPool(upstreamId) || _zenAttemptedNodes.length >= 6) {
       return false;
     }
     final purpose = ProxyPool.pUpstream(upstreamId);
-    for (final candidate
-        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
-      if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
-        // 本次是额度耗尽 → 记额度标记（当天不再选它）。
-        // 有确切恢复时刻（v2 的 retryAfterMs）就按时刻冷却，到点自动恢复；
-        // 没有就整日拉黑（v1 只有文案）。
-        if (retryAfterSeconds != null && retryAfterSeconds > 0) {
-          pool.markQuotaCooldown(
-            candidate.nodeId!,
-            DateTime.now().add(Duration(seconds: retryAfterSeconds)),
-          );
-        } else {
-          pool.markQuotaSpent(candidate.nodeId!);
-        }
+    // 刚失败的那个出口：直接用记录的 node id（不从 env 反查候选列表——
+    // 反查会漏，漏了就记不上，下次又盲选同样的死出口）。
+    final failedNode = _zenCurrentNodeId[upstreamId];
+    if (failedNode != null) {
+      // 本次是额度耗尽 → 记额度标记（当天不再选它）。
+      // 有确切恢复时刻（v2 的 retryAfterMs）就按时刻冷却，到点自动恢复；
+      // 没有就整日拉黑（v1 只有文案）。
+      if (retryAfterSeconds != null && retryAfterSeconds > 0) {
+        pool.markQuotaCooldown(
+          failedNode,
+          DateTime.now().add(Duration(seconds: retryAfterSeconds)),
+        );
+      } else {
+        pool.markQuotaSpent(failedNode);
       }
     }
     final candidates = await pool.measuredCandidatesFor(purpose);
@@ -641,7 +719,7 @@ class GatewayService extends ChangeNotifier {
           (c) =>
               c.nodeId != null &&
               !_zenAttemptedNodes.contains(c.nodeId) &&
-              _zenCandidateUrl(c) != old,
+              c.nodeId != failedNode,
         )
         .toList();
     if (usable.isEmpty) return false;
@@ -653,6 +731,7 @@ class GatewayService extends ChangeNotifier {
       orElse: () => usable.first,
     );
     _zenAttemptedNodes.add(next.nodeId!);
+    _zenCurrentNodeId[upstreamId] = next.nodeId!;
     final url = _zenCandidateUrl(next);
     _setZenCliEgressEnv(rt.def, url);
     server?.log('⟳ zen CLI 换出口 → $url（等待新进程就绪）');

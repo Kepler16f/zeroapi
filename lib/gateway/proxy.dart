@@ -222,6 +222,11 @@ class ProxyServer {
     ..maxConnectionsPerHost = 64;
   final _logLines = <String>[]; // 环形日志，UI 展示
   static const _maxLog = 200;
+
+  /// 网关日志同时落盘（%APPDATA%\zeroapi\logs\gateway.log）：UI 面板里的
+  /// 环形日志只有 200 行、且进程退出就没了——排查「为什么慢」这类问题需要
+  /// 能回看完整时间线（各阶段耗时、出口轮换、额度判定）。
+  final IOSink? _logFile;
   String _usageDay = DateTime.now().toIso8601String().substring(0, 10);
 
   /// 未知模型时的自救：由 GatewayService 注入"重探全部上游 + 重建路由"。
@@ -406,8 +411,10 @@ class ProxyServer {
   }
 
   void _log(String s) {
-    _logLines.add('[${DateTime.now().toIso8601String().substring(11, 19)}] $s');
+    final line = '[${DateTime.now().toIso8601String().substring(11, 19)}] $s';
+    _logLines.add(line);
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
+    _logFile?.writeln(line);
   }
 
   ProxyServer(
@@ -420,7 +427,23 @@ class ProxyServer {
     List<GatewayKey>? keys,
     this.usageDir,
     this.onKeyUsed,
-  }) : keys = keys ?? [GatewayKey('默认', apiKey)];
+  }) : keys = keys ?? [GatewayKey('默认', apiKey)],
+       _logFile = _openLogFile(usageDir);
+
+  /// 打开网关日志文件（追加写）。失败就静默降级为「只有 UI 环形日志」。
+  static IOSink? _openLogFile(String? usageDir) {
+    try {
+      final dir = usageDir ??
+          (Platform.isWindows
+              ? '${Platform.environment['APPDATA']}/zeroapi/logs'
+              : '${Platform.environment['HOME']}/.config/zeroapi/logs');
+      final d = Directory(dir);
+      if (!d.existsSync()) d.createSync(recursive: true);
+      return File('$dir/gateway.log').openWrite(mode: FileMode.append);
+    } catch (_) {
+      return null;
+    }
+  }
 
   /// 用量 jsonl 目录覆盖（测试注入隔离目录；生产走 %APPDATA%/zeroapi/logs）
   final String? usageDir;
@@ -490,6 +513,12 @@ class ProxyServer {
     _zenUp?.close(force: true);
     _zenUp = null;
     _zenProxySig = '';
+    try {
+      await _logFile?.flush();
+      await _logFile?.close();
+    } catch (_) {
+      // 日志落盘失败不影响停止流程
+    }
   }
 
   Future<void> _handle(HttpRequest req) async {

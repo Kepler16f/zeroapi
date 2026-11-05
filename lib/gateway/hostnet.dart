@@ -103,10 +103,26 @@ class HostNetwork {
   /// PowerShell 走 HTTP，那会拉起子进程，且在受限网络下长时间挂起
   /// （此前 IPv6 用例把整个测试套件拖住）。socket 有 2s 超时，失败即视为
   /// 无 IPv6 出口。
-  static Future<bool> refresh() async {
+  ///
+  /// **结果缓存 5 分钟**：这个探测只回答「本机有没有 IPv6 出口」，与请求
+  /// 无关；原先每次请求前都跑一遍，两个不可达 DNS 各等 2s → 每个请求白等
+  /// 最多 4 秒（实测 zen 首个请求 43s 里有 4s 在这里）。
+  static bool? _ipv6Cached;
+  static DateTime _ipv6At = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 缓存有效期：出口有无很少变，5 分钟足够。
+  static const ipv6CacheTtl = Duration(minutes: 5);
+
+  static Future<bool> refresh({bool force = false}) async {
     if (!Platform.isWindows) {
       _ipv6Ok = true;
       return true;
+    }
+    final now = DateTime.now();
+    if (!force &&
+        _ipv6Cached != null &&
+        now.difference(_ipv6At) < ipv6CacheTtl) {
+      return _ipv6Cached!;
     }
     const servers = ['2606:4700:4700::1111', '2001:4860:4860::8888'];
     for (final host in servers) {
@@ -118,12 +134,16 @@ class HostNetwork {
         );
         socket.destroy();
         _ipv6Ok = true;
+        _ipv6Cached = true;
+        _ipv6At = now;
         return true;
       } catch (_) {
         continue;
       }
     }
     _ipv6Ok = false;
+    _ipv6Cached = false;
+    _ipv6At = now;
     return false;
   }
   /// 宿主是否开着 TUN/虚拟网卡（用于 UI 提示与自动绑定）。
