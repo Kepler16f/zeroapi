@@ -199,6 +199,10 @@ class NodeHealth {
   /// 才知道。成功的节点记在这里，优先复用，别每次盲选。
   String? quotaOkDay;
 
+  /// 该节点的额度冷却截止时刻（上游明确告知的恢复时间，v2 的 retryAfterMs
+  /// ≈几小时后额度自动回来）。到期前不进候选，到期自动恢复。
+  DateTime? quotaUntil;
+
   NodeHealth();
 
   Map<String, dynamic> toJson() => {
@@ -207,6 +211,7 @@ class NodeHealth {
     if (lastChecked != null) 'lastChecked': lastChecked!.toIso8601String(),
     if (quotaDay != null) 'quotaDay': quotaDay,
     if (quotaOkDay != null) 'quotaOkDay': quotaOkDay,
+    if (quotaUntil != null) 'quotaUntil': quotaUntil!.toIso8601String(),
   };
 
   factory NodeHealth.fromJson(Map<String, dynamic> j) {
@@ -218,6 +223,7 @@ class NodeHealth {
     h.quotaDay = qd.isEmpty ? null : qd;
     final okd = _s(j['quotaOkDay']);
     h.quotaOkDay = okd.isEmpty ? null : okd;
+    h.quotaUntil = DateTime.tryParse(_s(j['quotaUntil']));
     return h;
   }
 }
@@ -301,6 +307,7 @@ class ProxyPool extends ChangeNotifier {
               directiveOf(n) == c.directive &&
               !_inCooldown(n, now) &&
               !isQuotaSpent(n.id) &&
+              !inQuotaCooldown(n.id) &&
               targetUsable(n.id, purpose);
         }).toList();
         final pinned = candidates
@@ -366,6 +373,9 @@ class ProxyPool extends ChangeNotifier {
           final h = health.putIfAbsent(n.id, () => NodeHealth());
           h.failCount = 0;
           h.lastChecked = DateTime.now();
+          // 额度冷却中（上游给了确切重置时刻）的出口不作为候选：到点自动
+          // 恢复，不必整日拉黑，也不必反复去撞它。
+          if (inQuotaCooldown(n.id)) continue;
           measured.add((candidate: PoolCandidate(directive, n.id), ms: ms));
         } else {
           markTargetFailed(n.id, purpose);
@@ -1398,6 +1408,27 @@ class ProxyPool extends ChangeNotifier {
     h.quotaDay = quotaToday();
     h.quotaOkDay = null; // 烧穿了，之前记的「可用」作废
     notifyListeners();
+  }
+
+  /// 按「确切重置时刻」冷却一个出口（v2 上游给的 retryAfterMs，≈几小时后
+  /// 额度自动回来）。到期前该出口不进候选，到期后自动恢复。
+  ///
+  /// 与 [markQuotaSpent]（当天整日拉黑）的区别：后者是「额度按天算」的粗粒度
+  /// 结论；前者是上游明确告知的恢复时刻——按它冷却，既不误伤（到点自动可用）
+  /// 也不空转（到点前不反复撞）。取更晚的那个冷却点。
+  void markQuotaCooldown(String nodeId, DateTime until) {
+    final h = health.putIfAbsent(nodeId, () => NodeHealth());
+    final cur = h.quotaUntil;
+    if (cur == null || cur.isBefore(until)) {
+      h.quotaUntil = until;
+      notifyListeners();
+    }
+  }
+
+  /// 该出口是否处于额度冷却中（v2 报告了确切重置时刻的场景）。
+  bool inQuotaCooldown(String nodeId) {
+    final u = health[nodeId]?.quotaUntil;
+    return u != null && u.isAfter(DateTime.now());
   }
 
   /// 记录节点当天被真 opencode CLI 身份验证过额度可用（换出口时优先选它）。

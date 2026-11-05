@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'opencode_serve.dart';
 import 'zen.dart';
 
 /// opencode serve 原生协议的客户端 + OpenAI/Anthropic 翻译层。
@@ -20,7 +21,7 @@ import 'zen.dart';
 ///     后一次包含前一次全部内容。翻译成 OpenAI 增量时按 diff 取新增片段。
 ///   * 同步返回的 message.parts[] 含 step-start / text / step-finish，
 ///     text part 即最终答案；finish 字段为 stop / tool-calls / length 等。
-class OpenCodeApi {
+class OpenCodeApi implements OpenCodeServeApi {
   OpenCodeApi(this.baseUrl, {HttpClient? client})
     : _client = client ?? HttpClient() {
     // SSE 事件流是长连接：模型思考期间可能几十秒无数据，Dart 默认
@@ -35,6 +36,7 @@ class OpenCodeApi {
 
   /// retry 事件回调（可选）：CLI 重试上游失败时通知（网关记日志用）。
   static void Function(String message)? onRetryEvent;
+  @override
   void Function(String message)? onRetry;
 
   /// 首次有效输出的等待窗口，不是整轮生成的时间上限。
@@ -44,14 +46,24 @@ class OpenCodeApi {
   static Duration generationIdleTimeout = const Duration(minutes: 10);
   static Duration requestTimeout = const Duration(hours: 2);
   static Duration completionGrace = const Duration(seconds: 2);
+  @override
   void Function(String message)? onActivity;
   final _cancellations = <void Function()>{};
+  @override
   bool generationStarted = false;
 
   /// 最近一轮的真实 token 用量（serve 的 info.tokens）；流完成前读到 0。
+  @override
   ({int input, int output}) lastUsage = (input: 0, output: 0);
+  @override
   int cachedReadTokens = 0;
+  @override
   int cachedWriteTokens = 0;
+
+  /// v1 上游不回报重试时机（只有文案），恒 null——网关按「换出口」而非
+  /// 「等到几点」处理 v1 的额度错误。
+  @override
+  int? get retryAfterSeconds => null;
 
   static const _model = {'providerID': 'opencode'};
 
@@ -90,6 +102,7 @@ class OpenCodeApi {
   /// 单独传入时由调用方合并进 messages）。
   /// 返回的 Stream 元素是文本增量片段；完成时正常结束。
   /// 出错时 Stream 抛异常（由上层转成客户端可见的错误）。
+  @override
   Stream<String> chat({
     required String model,
     required List<Map<String, dynamic>> messages,
@@ -600,6 +613,7 @@ class OpenCodeApi {
     return const [];
   }
 
+  @override
   void close() {
     for (final cancel in _cancellations.toList()) {
       cancel();

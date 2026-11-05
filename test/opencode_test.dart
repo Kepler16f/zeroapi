@@ -23,7 +23,8 @@ void main() {
     test('平台包名随架构变化', () {
       final pkg = OpenCodeRuntime.platformPackage;
       if (Platform.isWindows) {
-        expect(pkg, startsWith('opencode-windows-'));
+        // 2.x 线走 scoped 平台分包（opencode-ai 的 1.x meta 包 exe 只是占位脚本）
+        expect(pkg, startsWith('@opencode/cli-windows-'));
         expect(pkg, anyOf(endsWith('arm64'), endsWith('x64')));
       }
     });

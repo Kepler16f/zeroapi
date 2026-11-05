@@ -422,7 +422,7 @@ void main() {
   test('额度耗尽 → 换出口后同一请求重试并成功', () async {
     injectError = 'Free usage exceeded, subscribe to Go';
     var rotated = 0;
-    proxy.onRotateEgress = (id) async {
+    proxy.onRotateEgress = (id, _) async {
       rotated++;
       // 换到新出口后上游恢复正常（真实场景是换 IP 后额度可用）。
       injectError = null;
@@ -448,12 +448,12 @@ void main() {
     injectError = 'Cannot connect to API: Unable to connect';
     var rotated = 0;
     var quotaCalls = 0;
-    proxy.onRotateEgress = (id) async {
+    proxy.onRotateEgress = (id, _) async {
       rotated++;
       injectError = null;
       return true;
     };
-    proxy.onQuotaExhausted = (_) => quotaCalls++;
+    proxy.onQuotaExhausted = (_, _) => quotaCalls++;
     final resp = await gw('/v1/chat/completions', {
       'model': 'zen/deepseek-v4.1-flash-free',
       'messages': [
@@ -468,7 +468,7 @@ void main() {
 
   test('出口连不通 → 换出口失败时如实报 502', () async {
     injectError = 'Cannot connect to API: Unable to connect';
-    proxy.onRotateEgress = (id) async => false;
+    proxy.onRotateEgress = (id, _) async => false;
     addTearDown(() => proxy.onRotateEgress = null);
 
     final resp = await gw('/v1/chat/completions', {
@@ -486,7 +486,7 @@ void main() {
   test('前两个出口连接失败，第三个成功且不再轮换', () async {
     injectRetry = 'Cannot connect to API: Unable to connect';
     var rotations = 0;
-    proxy.onRotateEgress = (_) async {
+    proxy.onRotateEgress = (_, _) async {
       rotations++;
       if (rotations == 2) injectRetry = null;
       return true;
@@ -504,10 +504,12 @@ void main() {
     injectRetry = null;
   });
 
-  test('三个出口均失败：返回错误，绝不发起第四次调用', () async {
+  test('六个出口均失败：返回错误，绝不发起第七次调用', () async {
+    // 额度按出口 IP 隔离（2026-11-05 实测：池里约一半出口有额度），
+    // 只试 3 次命中率不够——尝试预算放宽到 6 次。
     injectRetry = 'Cannot connect to API: Unable to connect';
     var rotations = 0;
-    proxy.onRotateEgress = (_) async {
+    proxy.onRotateEgress = (_, _) async {
       rotations++;
       return true;
     };
@@ -519,8 +521,8 @@ void main() {
     });
     final raw = await utf8.decodeStream(response);
     expect(response.statusCode, 502, reason: raw);
-    expect(rotations, 2);
-    expect(messageCount, 3);
+    expect(rotations, 5, reason: '首发 + 5 次轮换 = 6 个出口');
+    expect(messageCount, 6);
     injectRetry = null;
   });
 
@@ -688,7 +690,7 @@ void main() {
       OpenCodeApi.generationIdleTimeout = const Duration(milliseconds: 500);
       addTearDown(() => OpenCodeApi.generationIdleTimeout = previous);
       var rotations = 0;
-      proxy.onRotateEgress = (_) async {
+      proxy.onRotateEgress = (_, _) async {
         rotations++;
         return true;
       };

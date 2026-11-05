@@ -11,6 +11,13 @@ import 'package:zeroapi/gateway/upstream.dart';
 /// 真机端到端：拉起真 opencode serve，经 ProxyServer 的 OpenAI 入口
 /// 真实调用免费模型（验证 managed 探活 + 协议翻译 + 记账全链路）。
 /// 需要本机有 CLI 且能出网（连 opencode.ai）；否则自动跳过。
+///
+/// 兼容两代 serve 协议（2026-11-05）：
+/// - v2（@opencode/cli 2.x，现行）：Basic 鉴权（用户名 opencode + 密码），
+///   健康 /api/info，目录 /api/model；
+/// - v1（opencode-ai 1.x，UA 已被免费层拉黑、无额度）：健康 /global/health，
+///   目录 /config/providers，且**绝不能**设 OPENCODE_SERVER_PASSWORD
+///   （设了 POST message 会挂死）。
 void main() {
   final exe = OpenCodeRuntime.findExecutable();
   group('真机 e2e（需 CLI + 网络）', () {
@@ -19,12 +26,21 @@ void main() {
     test('serve → 网关 chat/completions 出真实内容', () async {
       final def = OpenCode.seed();
       expect(def, isNotNull, reason: '本机未找到 opencode CLI');
+      // 认二进制大版本：v2 要鉴权密码 + /api/*，v1 反过来（设密码会挂死）。
+      final version = await OpenCodeRuntime.probeVersion(def!.command!);
+      final v2 = OpenCodeRuntime.isV2(version ?? '');
+      if (v2) {
+        def.env = {
+          ...def.env,
+          OpenCode.serverPasswordEnv: 'zeroapi-e2e-local',
+        };
+      }
       // --port 0：serve 自选端口并打印到 stdout。不用 pickPort——两个
       // e2e 文件并行时「先 bind 再放开」的端口会被对方抢占
       final Process proc;
       try {
         proc = await Process.start(
-            def!.command!, ['serve', '--hostname', '127.0.0.1', '--port', '0'],
+            def.command!, ['serve', '--hostname', '127.0.0.1', '--port', '0'],
             environment: def.env);
       } on ProcessException catch (e) {
         // 找到了 CLI 但当前平台跑不了（如非本机架构的二进制）：与本机回归
@@ -48,7 +64,8 @@ void main() {
       final port = await bound.future.timeout(const Duration(seconds: 30));
       def
         ..baseUrl = 'http://127.0.0.1:$port'
-        ..healthUrl = 'http://127.0.0.1:$port/global/health'
+        ..healthUrl = 'http://127.0.0.1:$port/${v2 ? 'api/info' : 'global/health'}'
+        ..catalogPaths = [v2 ? '/api/model' : '/config/providers']
         ..command = ''; // serve 已在跑：managed 生命周期不再重复拉起
       final runtime = UpstreamRuntime(def);
       var healthy = false;

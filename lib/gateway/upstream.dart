@@ -6,6 +6,7 @@ import 'config.dart';
 import 'modelsdev.dart';
 import 'opencode.dart';
 import 'opencode_api.dart';
+import 'opencode_api_v2.dart';
 import 'proxypool.dart';
 import 'socksrelay.dart';
 import 'zen.dart';
@@ -78,6 +79,10 @@ class UpstreamRuntime {
   /// 与旧的「zen 直连」共用 id=zen（模型前缀 zen/xxx 保持不变），
   /// 靠 type 区分：直连是 type='zen'，CLI 通路是 type='managed'。
   bool get isOpenCode => def.id == OpenCode.id && def.type == 'managed';
+
+  /// 探活协商出的 serve 线协议版本：true=v2（@opencode/cli 2.x），
+  /// false=v1（opencode-ai 1.x）。proxy.dart 的转发路径据此选适配器。
+  bool openCodeV2 = false;
 
   /// 内置供应商刚拉起、子进程尚未就绪的预热窗口：
   /// 期间连接拒绝是预期噪声，不显示为错误
@@ -216,28 +221,83 @@ class UpstreamRuntime {
     }
   }
 
-  /// OpenCode CLI（serve）探活：GET /global/health 判进程就绪；
-  /// 模型清单走 /config/providers（serve 无 OpenAI /models 端点，/v1/models
-  /// 返回 HTML）。只登记实测可用的免费档，beam-free（上游按国家拒绝）与
-  /// jev-1.13-free（上游 500）不展示，避免用户点了才报错。
+  /// 宽松 JSON 解析：非 JSON（如 v2 serve 返回的 SPA HTML）返回 null，
+  /// 而不是抛 FormatException。
+  static Map<String, dynamic>? _maybeJson(String s) {
+    final t = s.trimLeft();
+    if (!t.startsWith('{') && !t.startsWith('[')) return null;
+    try {
+      final j = jsonDecode(s);
+      return j is Map<String, dynamic> ? j : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// OpenCode CLI（serve）探活与协议协商。
+  ///
+  /// v1（opencode-ai 1.x，2026-11 起 UA 已被免费层拉黑）：
+  ///   GET /global/health → JSON {healthy:true}；目录 GET /config/providers。
+  /// v2（@opencode/cli 2.x，现行）：
+  ///   GET /api/info → JSON {version:"2.2.5",...}；v1 端点会返回 **200 + SPA
+  ///   HTML**（不是 404！判版本绝不能只看状态码）。目录 GET /api/model（扁平
+  ///   data 数组）。v2 默认开 Basic 鉴权（用户名 opencode，密码 = 我们写进
+  ///   serve 环境的 OPENCODE_SERVER_PASSWORD）。
+  ///
+  /// 协商结果缓存在 [openCodeV2]，proxy.dart 的转发路径据此选
+  /// OpenCodeApi（v1）/ OpenCodeApiV2（v2）。只登记实测可用的免费档，
+  /// beam-free（上游按国家拒绝）不展示，避免用户点了才报错。
   Future<bool> _probeOpenCode() async {
     try {
       final base = def.baseUrl.replaceAll(RegExp(r'/+$'), '');
       final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-      final req = await client.getUrl(Uri.parse('$base/global/health'));
-      final resp = await req.close().timeout(const Duration(seconds: 10));
-      final hbody = await resp.transform(utf8.decoder).join();
-      if (resp.statusCode != 200) {
+      Map<String, dynamic>? info;
+      List<String> ids = const [];
+      try {
+        final pw = def.env['OPENCODE_SERVER_PASSWORD'] ?? '';
+        // 先按 v2 探：/api/info 出 JSON 且有 version → v2
+        var v2 = false;
+        try {
+          final req2 = await client.getUrl(Uri.parse('$base/api/info'));
+          req2.headers.set('accept', 'application/json');
+          if (pw.isNotEmpty) {
+            req2.headers.set(
+              'authorization',
+              'Basic ${base64Encode(utf8.encode('opencode:$pw'))}',
+            );
+          }
+          final resp2 =
+              await req2.close().timeout(const Duration(seconds: 10));
+          final body2 = await resp2.transform(utf8.decoder).join();
+          final j2 = _maybeJson(body2);
+          if (resp2.statusCode == 200 && j2 != null && j2['version'] is String) {
+            v2 = true;
+            info = j2;
+          }
+        } catch (_) {
+          // 探测失败落 v1 路径
+        }
+        if (v2) {
+          ids = await OpenCodeApiV2.freeModels(base, client, password: pw);
+          openCodeV2 = true;
+        } else {
+          final req = await client.getUrl(Uri.parse('$base/global/health'));
+          final resp = await req.close().timeout(const Duration(seconds: 10));
+          final hbody = await resp.transform(utf8.decoder).join();
+          if (resp.statusCode != 200) throw HttpException('HTTP ${resp.statusCode}');
+          final hj = _maybeJson(hbody);
+          if (hj == null) {
+            // v2 serve 的 /global/health 返回 HTML：判成「未协商成功」
+            throw const HttpException('health 非 JSON（可能是 v2 未鉴权）');
+          }
+          if (hj['healthy'] != true) throw const HttpException('health 未就绪');
+          ids = await OpenCodeApi.freeModels(base, client);
+          openCodeV2 = false;
+        }
+      } finally {
         client.close(force: true);
-        throw HttpException('HTTP ${resp.statusCode}');
       }
-      final hj = jsonDecode(hbody) as Map<String, dynamic>;
-      if (hj['healthy'] != true) {
-        client.close(force: true);
-        throw const HttpException('health 未就绪');
-      }
-      final ids = await OpenCodeApi.freeModels(base, client);
-      client.close(force: true);
+      hostInfo = info;
       final usable = ids
           .where((id) => !OpenCode.unavailableFreeModels.containsKey(id))
           .toList();

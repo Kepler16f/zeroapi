@@ -6,7 +6,10 @@ import 'dart:math';
 import 'anthropic.dart';
 import 'config.dart';
 import 'modelsdev.dart';
+import 'opencode.dart';
 import 'opencode_api.dart';
+import 'opencode_api_v2.dart';
+import 'opencode_serve.dart';
 import 'progate.dart';
 import 'proxypool.dart';
 import 'socksrelay.dart';
@@ -232,11 +235,20 @@ class ProxyServer {
 
   /// zen/CLI 通路命中「免费额度耗尽」时回调：上层换一个出口 IP 并重启
   /// CLI 子进程（CLI 进程级绑定出口，换 IP 必须换进程）。
-  void Function(String upstreamId)? onQuotaExhausted;
+  ///
+  /// [retryAfterSeconds]：v2 上游报告的确切恢复时刻（retryAfterMs 换算，
+  /// ≈几小时后额度自动回来）。为 null 表示上游没给时机（v1 只有文案）。
+  /// 上层据此对该出口做**定时冷却**（到点自动恢复），而不是整日拉黑。
+  void Function(String upstreamId, int? retryAfterSeconds)? onQuotaExhausted;
 
   /// 出口连不通 → 换出口并等新进程就绪。返回是否成功换到新出口。
   /// 换成功后调用方可原样重发该请求。
-  Future<bool> Function(String upstreamId)? onRotateEgress;
+  ///
+  /// [retryAfterSeconds]：v2 上游报告的确切恢复时刻（≈几小时后额度回来）。
+  /// 上层据此对该出口做**定时冷却**（到点自动恢复），而不是整日拉黑——
+  /// 免费额度按出口 IP 隔离，盲拉黑会把当天还能用的出口也废掉。
+  Future<bool> Function(String upstreamId, int? retryAfterSeconds)?
+      onRotateEgress;
   Future<void> Function()? onPrepareOpenCode;
   void Function()? onOpenCodeFinished;
 
@@ -1502,11 +1514,21 @@ class ProxyServer {
   /// - 429/5xx 打开单模型熔断（冷却窗口），冷却期内同模型请求快速失败并
   ///   如实报错（不转投其他模型），尊重 Retry-After
   /// - 指数退避 + 抖动重试，仅未提交时进行
+/// 按探活协商的线协议版本实例化 serve 适配器：v2 = @opencode/cli 2.x
+  /// （/api/* + Basic 鉴权，密码在子进程 env 里）；v1 = opencode-ai 1.x。
+  /// 两代共用 OpenCodeServeApi 契约，转发主链路不感知差异。
+  OpenCodeServeApi _newServeApi(UpstreamRuntime u) {
+    if (u.openCodeV2) {
+      return OpenCodeApiV2(
+        u.def.baseUrl,
+        password: u.def.env[OpenCode.serverPasswordEnv] ?? '',
+      );
+    }
+    return OpenCodeApi(u.def.baseUrl);
+  }
+
   /// OpenCode CLI 通路转发：把 OpenAI/Anthropic 请求翻译成 serve 的
   /// session + message 协议，流式时把 SSE 增量转成 OpenAI chunk。
-  ///
-  /// 与 _forwardZen 的差别：上游不是 OpenAI 兼容端点，而是原生会话协议；
-  /// 没有 token 计数（opencode 不上报 usage），记账记 0。
   Future<void> _forwardOpenCode(
     HttpRequest req,
     ModelRoute route,
@@ -1541,7 +1563,7 @@ class ProxyServer {
     // 的 fast-rotation 同款：429 的 IP 立即 dustbin，同一请求换下一个出口
     // 重发，客户端无感；最多换 3 个，全烧穿才如实报 429。
     var committed = false;
-    var api = OpenCodeApi(u.def.baseUrl)
+    var api = _newServeApi(u)
       ..onRetry = ((msg) => _log('$publicName ⟳ CLI 重试上游失败：$msg'))
       ..onActivity = ((msg) => _log('$publicName · $msg'));
     Timer? keepAlive;
@@ -1765,17 +1787,25 @@ class ProxyServer {
               (e.isQuotaExhausted ||
                   e.isConnectionFailure ||
                   (e.isStall && completion == 0));
-          if (round < 2 && !committed && !api.generationStarted && rotatable) {
-            final rotated = await onRotateEgress?.call(u.id) ?? false;
+          // 额度按出口 IP 隔离（2026-11-05 实测：同一时刻同一模型，池里
+          // 30379/30380 有额度、30375/30376 没有）。池子有 77 个出口、
+          // 约一半带额度，只试 3 次命中率不够——放宽到 6 次，且优先挑
+          // 已验证有额度的出口。
+          if (round < 5 && !committed && !api.generationStarted && rotatable) {
+            final retryAfter = e is OpenCodeUpstreamV2Error
+                ? (e.retryAfterMs == null ? null : (e.retryAfterMs! / 1000).ceil())
+                : null;
+            final rotated =
+                await onRotateEgress?.call(u.id, retryAfter) ?? false;
             if (rotated) {
               final reason = e.isQuotaExhausted
                   ? '额度耗尽'
                   : e.isStall
                   ? '出口挂死'
                   : '出口不可达';
-              _log('$publicName ⟳ 换出口后重试（$reason，第 ${round + 2}/3 个出口）');
+              _log('$publicName ⟳ 换出口后重试（$reason，第 ${round + 2}/6 个出口）');
               api.close();
-              api = OpenCodeApi(u.def.baseUrl)
+              api = _newServeApi(u)
                 ..onRetry = ((msg) => _log('$publicName ⟳ CLI 重试上游失败：$msg'))
                 ..onActivity = ((msg) => _log('$publicName · $msg'));
               continue;
@@ -1818,12 +1848,18 @@ class ProxyServer {
         if (e.isQuotaExhausted) {
           // 额度按「最终到达 opencode.ai 的出口 IP × 天」计：这个出口烧穿了，
           // 换节点（换 IP）才有救。CLI 进程绑定了出口，得重启它才换 IP。
-          onQuotaExhausted?.call(u.id);
+          onQuotaExhausted?.call(u.id, api.retryAfterSeconds);
+          // v2 的额度错误带结构化 retryAfterMs（≈重置时刻）：换算成可读的
+          // 等待时长附在错误里，客户端（issue #52894 正是官方缺的能力）
+          // 与人都能据此决定「等重置」还是「切模型」，避免无效重试。
+          final retryAfter = api.retryAfterSeconds;
+          final tail = retryAfter == null
+              ? ''
+              : '，约 ${retryAfter >= 3600 ? '${retryAfter ~/ 3600} 小时' : '$retryAfter 秒'}后重置';
           return failJson({
             'message':
-                'OpenCode 免费额度已用完（上游原文：${e.message}）。'
-                '目录可达不代表模型额度可用；请检查当前出口及官方账号额度，'
-                '或稍后重试。',
+                'OpenCode 免费额度已用完（上游原文：${e.message}）$tail。'
+                '可稍后重试、切换其他免费模型，或订阅 OpenCode Go。',
             'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
             'code': 'free_quota_exhausted',
           }, 429);

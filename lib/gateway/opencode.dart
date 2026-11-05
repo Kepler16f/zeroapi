@@ -1,7 +1,9 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'config.dart';
 import 'ocruntime.dart';
+
 
 /// OpenCode Zen 的「真 CLI」接入。
 ///
@@ -55,6 +57,66 @@ class OpenCode {
   };
 
   static bool isOpenCode(UpstreamDef d) => d.id == id;
+
+  /// v2 serve 的 Basic 密码存放处（子进程 env）。serve 会强制
+  /// `opencode:<该值>` 的 HTTP Basic 鉴权；我们探活/转发都从这里读，
+  /// 保证「写入 env → 子进程拿到 → 客户端用同一个」三方一致。
+  static const serverPasswordEnv = 'OPENCODE_SERVER_PASSWORD';
+
+  /// 按当前 CLI 大版本把托管供应商 def 鉴权/端点调成对应线协议形态
+  /// （幂等；服务启动与更新 CLI 路径时调用，早于子进程第一次 spawn）。
+  ///
+  /// - v2（@opencode/cli 2.x，现行）：必须有密码否则 /api/* 全部 401；
+  ///   健康 GET /api/info（返回 {version,pid,...} JSON），目录 GET /api/model
+  ///   （扁平 data 数组）。
+  /// - v1（opencode-ai 1.x）：**绝不能设** OPENCODE_SERVER_PASSWORD——实测
+  ///   设了会让 POST /session/{id}/message 挂住不返回。健康 /global/health、
+  ///   目录 /config/providers。
+  static bool reconcileAuth(UpstreamDef def, {required bool v2}) {
+    final uri = Uri.tryParse(def.baseUrl);
+    final host = uri?.host.isNotEmpty == true ? uri!.host : '127.0.0.1';
+    final port = uri != null && uri.hasPort ? uri.port : defaultPort;
+    var changed = false;
+    final env = Map<String, String>.from(def.env);
+    if (v2) {
+      if ((env[serverPasswordEnv] ?? '').isEmpty) {
+        final rnd = Random.secure();
+        final pw = List.generate(16, (_) => rnd.nextInt(256))
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join();
+        env[serverPasswordEnv] = pw;
+        changed = true;
+      }
+    } else if (env.remove(serverPasswordEnv) != null) {
+      changed = true;
+    }
+    if (changed) def.env = env;
+    final wantHealth = 'http://$host:$port/${v2 ? 'api/info' : 'global/health'}';
+    final wantCatalog = [v2 ? '/api/model' : '/config/providers'];
+    if (def.healthUrl != wantHealth) {
+      def.healthUrl = wantHealth;
+      changed = true;
+    }
+    if (def.catalogPaths.join() != wantCatalog.join()) {
+      def.catalogPaths = wantCatalog;
+      changed = true;
+    }
+    return changed;
+  }
+
+  /// 探测本机 CLI 的大版本并把 def 调成对应线协议（见 [reconcileAuth]）。
+  /// 找不到可执行文件或版本解析不出来时按 v1 处理——v1 的旧端点行为
+  /// 与「未升级」一致，不会比现状更差。返回是否改动过 def（调用方落盘）。
+  static Future<bool> reconcileProtocol(UpstreamDef def) async {
+    final exe = def.command;
+    var v2 = false;
+    if (exe != null && exe.isNotEmpty) {
+      final ver = await OpenCodeRuntime.probeVersion(exe);
+      v2 = ver != null && OpenCodeRuntime.isV2(ver);
+    }
+    return reconcileAuth(def, v2: v2);
+  }
+
 
   /// 生成本机供应商定义。找不到 CLI 时返回 null（调用方提示下载）。
   ///

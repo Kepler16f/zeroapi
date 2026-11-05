@@ -145,5 +145,91 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('倍率 x3.50'), findsOneWidget);
     });
+
+    testWidgets('展开模型详情后供应商刷新通知不会让展开态回弹（不闪烁）',
+        (tester) async {
+      final s = GatewayService();
+      final def = UpstreamDef(
+        id: 'workbuddy',
+        type: 'managed',
+        label: 'WorkBuddy',
+        baseUrl: 'http://127.0.0.1:8788/v1',
+      );
+      final rt = UpstreamRuntime(def)
+        ..health = UpstreamHealth.healthy
+        ..models = const ['hy3'];
+      rt.modelInfo['hy3'] = const ModelInfo(contextWindow: 200000);
+      s.registry.rebuild([rt]);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: ModelsPage(service: s)),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 展开「hy3」详情
+      await tester.tap(find.textContaining('hy3').first);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('来源：WorkBuddy'), findsOneWidget);
+
+      // 模拟供应商探活完成后的通知：整页会重建
+      s.notifyListeners();
+      await tester.pumpAndSettle();
+
+      // 重建后详情必须仍然是展开的（此前 ExpansionTile 被重新实例化，
+      // 展开动画重放 → 视觉上就是「展开时闪烁」）
+      expect(
+        find.textContaining('来源：WorkBuddy'),
+        findsOneWidget,
+        reason: '父级重建后展开态必须保持，不能回弹',
+      );
+      // 再来一次通知，仍然稳定
+      s.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(find.textContaining('来源：WorkBuddy'), findsOneWidget);
+    });
+
+    testWidgets('展开后上游报错信息出现不会让详情面板高度跳变（不抖动）',
+        (tester) async {
+      final s = GatewayService();
+      final def = UpstreamDef(
+        id: 'workbuddy',
+        type: 'managed',
+        label: 'WorkBuddy',
+        baseUrl: 'http://127.0.0.1:8788/v1',
+      );
+      final rt = UpstreamRuntime(def)
+        ..health = UpstreamHealth.healthy
+        ..models = const ['hy3'];
+      rt.modelInfo['hy3'] = const ModelInfo(contextWindow: 200000);
+      s.registry.rebuild([rt]);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: ModelsPage(service: s)),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.textContaining('hy3').first);
+      await tester.pumpAndSettle();
+
+      final detail = find.textContaining('来源：WorkBuddy');
+      final h1 = tester.getSize(detail).height;
+
+      // 上游开始报错：详情里会多一行「最近调用错误」。高度变了不算 bug
+      // （信息量变了），但**必须一次性出现**——不能是每次重建都出现/消失，
+      // 那正是肉眼看到的抖动。
+      rt.modelCallErrors['hy3'] = 'boom';
+      s.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(find.textContaining('最近调用错误'), findsOneWidget);
+
+      s.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(find.textContaining('最近调用错误'), findsOneWidget,
+          reason: '错误行必须稳定存在，不能在重建时闪烁');
+      expect(tester.getSize(detail).height, greaterThanOrEqualTo(h1));
+    });
   });
 }

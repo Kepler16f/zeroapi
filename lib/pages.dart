@@ -313,8 +313,10 @@ Widget _workbuddyEntryCard(BuildContext context, GatewayService service) {
   );
 }
 
-/// OpenCode CLI（TLS 指纹通路）的接入入口：本机已有 CLI 就直接接入；
-/// 没有则给出按需下载（约 177MB，npm 官方包）的按钮与进度。
+/// OpenCode CLI（TLS 指纹通路）的接入入口：本机已有 2.x CLI 就直接接入；
+/// 1.x（opencode-ai 1.19.x）自 2026-10-26 起 UA 被上游拉黑、已无免费额度，
+/// 所以 1.x 或未找到时都给出按需下载 2.x 的按钮与进度（npm 平台包，
+/// tarball 约 116MB、解包约 240MB）。
 class _OpenCodeEntryCard extends StatefulWidget {
   final GatewayService service;
   const _OpenCodeEntryCard({required this.service});
@@ -329,7 +331,36 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
   int _received = 0;
   int _total = 0;
 
+  /// 探测到的本机 CLI 版本串（如 'opencode v2.2.5'）；null 表示还没探测到
+  /// 或探测失败，用 [_probeDone] 区分这两种情况。
+  String? _version;
+  bool _probeDone = false;
+
   bool get _ready => OpenCodeRuntime.isReady;
+
+  @override
+  void initState() {
+    super.initState();
+    _probe();
+  }
+
+  /// 异步探测本机 CLI 的真实版本，用于区分 2.x（有免费额度）/ 1.x（UA
+  /// 被上游拉黑，无额度）。失败不抛，[_version] 保持 null。
+  Future<void> _probe() async {
+    final path = OpenCodeRuntime.findExecutable();
+    if (path == null) {
+      // 无 CLI：直接记录（首帧 _ready 恒为 false，无需重建）
+      _version = null;
+      _probeDone = true;
+      return;
+    }
+    final v = await OpenCodeRuntime.probeVersion(path);
+    if (!mounted) return;
+    setState(() {
+      _version = v;
+      _probeDone = true;
+    });
+  }
 
   Future<void> _attach() async {
     final err = await widget.service.addOpenCode();
@@ -361,6 +392,7 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
       _downloading = false;
       _progress = null;
     });
+    if (err == null) _probe(); // 装好的是 2.x，重新探测以切到「接入」
     if (err != null) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
     }
@@ -369,20 +401,41 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final path = OpenCodeRuntime.findExecutable() ?? '';
+    final ready = _ready;
+    // 只有确认是 2.x 才认定有免费额度；1.x 的 UA 已被上游拉黑（2026-10-26
+    // 起），没有额度；未找到 / 校验中 / 版本无法确认都主推下载 2.x。
+    final isV2 = _version != null && OpenCodeRuntime.isV2(_version!);
+    final primaryDownload = !isV2;
+
+    final String subtitle;
+    if (!ready) {
+      // 情形 c：完全没找到，提示自动从 npm 下载 2.x
+      subtitle = 'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁。'
+          r'本机未检测到 opencode CLI，可自动从 npm 下载 2.x（@opencode/cli 2.2.5，'
+          r'tarball 约 116MB、解包约 240MB，存到 %APPDATA%\zeroapi\opencode\v2）。';
+    } else if (isV2) {
+      // 情形 a：已确认 2.x，可直接接入
+      subtitle = '已检测到 @opencode/cli 2.x（$path），'
+          '可用 ${OpenCode.freeModels.length} 个免费模型。';
+    } else if (_version != null) {
+      // 情形 b：确认是 1.x，明确提示没有免费额度
+      subtitle = '检测到的是 1.x（opencode-ai 1.19.x，$path）——'
+          '上游自 2026-10-26 起已拉黑其 UA，没有免费额度，请下载 2.x。';
+    } else if (!_probeDone) {
+      // 校验进行中（通常是首帧，很快结束）
+      subtitle = '检测到本机 opencode CLI（$path）。正在校验版本…';
+    } else {
+      // 校验完但解析不出版本：保守起见推荐下载 2.x
+      subtitle = '检测到本机 opencode CLI（$path），但无法确认其版本；'
+          '若为旧版 1.x 则已无免费额度，建议下载 2.x。';
+    }
+
     return Card(
       child: ListTile(
         leading: const Icon(Icons.terminal_outlined),
         title: const Text('接入 OpenCode Zen（CLI 通路）'),
-        subtitle: Text(
-          _ready
-              // 说明它为什么存在：上游按 TLS 指纹识别，只有真 CLI 能过免费层门禁
-              ? '检测到本机 opencode CLI（${OpenCodeRuntime.findExecutable()}）。'
-                    'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁，'
-                    '接入后可用 ${OpenCode.freeModels.length} 个免费模型。'
-              : 'Zen 免费层 2026-10-24 起按 TLS 指纹识别客户端，只有真 CLI 能过门禁。'
-                    r'本机未检测到 opencode CLI，可自动从 npm 下载对应平台的官方包'
-                    r'（约 177MB，存到 %APPDATA%\zeroapi\opencode）。',
-        ),
+        subtitle: Text(subtitle),
         trailing: _downloading
             ? SizedBox(
                 width: 120,
@@ -405,18 +458,32 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
                   ],
                 ),
               )
-            : Row(
+            : Column(
                 mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  // 自动探测优先，但允许用户手动指定 CLI 路径
-                  TextButton(
-                    onPressed: _downloading ? null : _pickCliPath,
-                    child: const Text('指定路径'),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // 自动探测优先，但允许用户手动指定 CLI 路径
+                      TextButton(
+                        onPressed: _downloading ? null : _pickCliPath,
+                        child: const Text('指定路径'),
+                      ),
+                      const SizedBox(width: 4),
+                      FilledButton.tonal(
+                        onPressed: primaryDownload ? _download : _attach,
+                        child: Text(
+                          primaryDownload ? '下载 2.x 运行时' : '接入',
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 4),
-                  FilledButton.tonal(
-                    onPressed: _ready ? _attach : _download,
-                    child: Text(_ready ? '接入' : '下载运行时'),
+                  const SizedBox(height: 2),
+                  // 手动指定同样要 2.x：1.x 的 UA 已被上游拉黑，没有免费额度
+                  Text(
+                    r'手动指定时请指向 2.x（@opencode/cli），1.x 无免费额度',
+                    style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant),
                   ),
                 ],
               ),
@@ -438,6 +505,7 @@ class _OpenCodeEntryCardState extends State<_OpenCodeEntryCard> {
     widget.service.config.opencodeCliPath = path;
     OpenCodeRuntime.overridePath = path;
     widget.service.config.save();
+    _probe(); // 重新探测新路径的版本，UI 立即按 2.x / 1.x 分类
     if (!mounted) return;
     final existing = widget.service.config.upstreams
         .where((u) => OpenCode.isOpenCode(u))
@@ -658,6 +726,25 @@ class _ModelsPageState extends State<ModelsPage> {
   /// false = 按模型聚合（默认）；true = 按来源聚合
   bool _bySource = false;
 
+  /// 已展开的逻辑模型名（自己持有展开态）。
+  ///
+  /// 为什么不用 ExpansionTile 自带状态：本页整体被 AnimatedBuilder 包着，
+  /// 供应商每探活一次就 notifyListeners → 整页重建 → ExpansionTile 被重新
+  /// 实例化，展开动画重放（视觉上就是「展开详情时闪烁」）。自己存展开集合 +
+  /// 用 [ExpansibleController] 驱动，重建时状态与动画都不丢。
+  final Set<String> _expandedModels = {};
+
+  /// 每个逻辑模型的展开控制器（重建时复用同一个，动画不重启）。
+  final Map<String, ExpansibleController> _expansionControllers = {};
+
+  ExpansibleController _controllerFor(String key) {
+    return _expansionControllers.putIfAbsent(key, () {
+      final c = ExpansibleController();
+      if (_expandedModels.contains(key)) c.expand();
+      return c;
+    });
+  }
+
   static String _fmtCtx(int? n) {
     if (n == null) return '';
     if (n >= 1048576 && n % 1048576 == 0) return '${n ~/ 1048576}M';
@@ -753,6 +840,16 @@ class _ModelsPageState extends State<ModelsPage> {
       children: [
         ExpansionTile(
           key: PageStorageKey<String>('model-group-$key'),
+          // 展开态与动画由我们持有：父级重建（探活通知）不再重放动画，
+          // 也就不会「展开时闪烁」。
+          controller: _controllerFor(key),
+          onExpansionChanged: (open) {
+            if (open) {
+              _expandedModels.add(key);
+            } else {
+              _expandedModels.remove(key);
+            }
+          },
           leading: Icon(
             Icons.circle,
             size: 10,

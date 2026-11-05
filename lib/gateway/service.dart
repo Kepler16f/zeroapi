@@ -93,8 +93,9 @@ class GatewayService extends ChangeNotifier {
           ..onPrepareOpenCode = _prepareZenRequest
           ..onOpenCodeFinished = _finishZenRequest
           ..onOpenCodeSuccess = _markZenQuotaOk
-          ..onRotateEgress = (id) =>
-              _serializeEgress(() => _rotateZenEgressAndWait(id));
+          ..onRotateEgress = (id, retryAfterSeconds) => _serializeEgress(
+              () => _rotateZenEgressAndWait(id, retryAfterSeconds),
+            );
     try {
       await server!.start();
       running = true;
@@ -189,6 +190,10 @@ class GatewayService extends ChangeNotifier {
       // zen CLI 通路：出口走池（自动探测优先；家宽直连仅兜底——免费额度
       // 按出口 IP × 天计，家宽单 IP 撑不住长上下文对话）
       if (def.id == OpenCode.id && def.type == 'managed') {
+        // 线协议按本机 CLI 大版本对齐（v2 必须 Basic 鉴权 + /api/*；v1 绝不能
+        // 设 OPENCODE_SERVER_PASSWORD——设了 POST message 会挂死）。必须在
+        // 子进程第一次 spawn 之前跑：env 会原样传给子进程。
+        if (await OpenCode.reconcileProtocol(def)) config.save();
         final url = _pickZenCliEgress(def.id);
         if (url != null) _setZenCliEgressEnv(def, url);
       }
@@ -564,7 +569,7 @@ class GatewayService extends ChangeNotifier {
     }
   }
 
-  void _markZenQuotaExhausted(String upstreamId) {
+  void _markZenQuotaExhausted(String upstreamId, int? retryAfterSeconds) {
     final rt = _runtimes.where((r) => r.id == upstreamId).firstOrNull;
     final pool = proxies;
     if (rt == null || pool == null) return;
@@ -572,7 +577,18 @@ class GatewayService extends ChangeNotifier {
     for (final candidate
         in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
       if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
-        pool.markQuotaSpent(candidate.nodeId!);
+        // v2 给了确切恢复时刻（≈几小时后额度自动回来）：按它定时冷却，到点
+        // 自动恢复——不整日拉黑（那样会误伤当天稍后可能有额度的出口），
+        // 也不反复去撞（冷却期内它不进候选）。
+        if (retryAfterSeconds != null && retryAfterSeconds > 0) {
+          pool.markQuotaCooldown(
+            candidate.nodeId!,
+            DateTime.now().add(Duration(seconds: retryAfterSeconds)),
+          );
+        } else {
+          // 上游没给时机（v1 只有文案）：按「出口 IP × 天」整日拉黑。
+          pool.markQuotaSpent(candidate.nodeId!);
+        }
       }
     }
     // 最终错误不另行启动第四个出口；下次请求重新按检测结果选择。
@@ -584,33 +600,58 @@ class GatewayService extends ChangeNotifier {
   /// CLI 进程的出口在启动时由 HTTP_PROXY 绑定，换 IP 必须换进程；新进程
   /// 还要等 serve 就绪（几秒），期间请求会被上游拒绝，因此调用方要用
   /// 「未提交响应」路径重试。
-  Future<bool> _rotateZenEgressAndWait(String upstreamId) async {
+  ///
+  /// 额度耗尽的出口必须记成**额度**标记而不是「目标站不可达」：后者会被下一
+  /// 轮全量测速清掉（首页探测成功就恢复候选）→ 又被挑中 → 又失败。
+  /// 实测（2026-11-05）池里 77 个出口约一半额度可用，按延迟排序盲选会连续
+  /// 撞到没额度的出口——这正是「实测还是不行」的机制。
+  Future<bool> _rotateZenEgressAndWait(
+    String upstreamId, [
+    int? retryAfterSeconds,
+  ]) async {
     final rt = _runtimes.where((r) => r.def.id == upstreamId).firstOrNull;
     if (rt == null) return false;
     final pool = proxies;
     if (pool == null) return false;
     final old = rt.def.env['HTTPS_PROXY'] ?? '';
-    if (!upstreamUsesPool(upstreamId) || _zenAttemptedNodes.length >= 3) {
+    if (!upstreamUsesPool(upstreamId) || _zenAttemptedNodes.length >= 6) {
       return false;
     }
     final purpose = ProxyPool.pUpstream(upstreamId);
     for (final candidate
         in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
       if (candidate.nodeId != null && _zenCandidateUrl(candidate) == old) {
-        pool.markTargetFailed(candidate.nodeId!, purpose);
+        // 本次是额度耗尽 → 记额度标记（当天不再选它）。
+        // 有确切恢复时刻（v2 的 retryAfterMs）就按时刻冷却，到点自动恢复；
+        // 没有就整日拉黑（v1 只有文案）。
+        if (retryAfterSeconds != null && retryAfterSeconds > 0) {
+          pool.markQuotaCooldown(
+            candidate.nodeId!,
+            DateTime.now().add(Duration(seconds: retryAfterSeconds)),
+          );
+        } else {
+          pool.markQuotaSpent(candidate.nodeId!);
+        }
       }
     }
     final candidates = await pool.measuredCandidatesFor(purpose);
     _zenMeasuredCandidates[upstreamId] = candidates;
-    final next = candidates
+    final usable = candidates
         .where(
           (c) =>
               c.nodeId != null &&
               !_zenAttemptedNodes.contains(c.nodeId) &&
               _zenCandidateUrl(c) != old,
         )
-        .firstOrNull;
-    if (next == null) return false;
+        .toList();
+    if (usable.isEmpty) return false;
+    // 优先挑「当天已被真 CLI 验证过有额度」的出口：额度按出口 IP 隔离，
+    // 而通用探针只能证明能出网、证明不了有额度（实测 30379/30380 有、
+    // 30375/30376 没有，同一时刻同一模型）。
+    final next = usable.firstWhere(
+      (c) => pool.isQuotaOk(c.nodeId!),
+      orElse: () => usable.first,
+    );
     _zenAttemptedNodes.add(next.nodeId!);
     final url = _zenCandidateUrl(next);
     _setZenCliEgressEnv(rt.def, url);
@@ -635,20 +676,24 @@ class GatewayService extends ChangeNotifier {
     final def = OpenCode.seed(port: port, proxyUrl: _zenProxyUrl());
     if (def == null) {
       return '本机未检测到 opencode CLI。可以在供应商页「下载运行时」自动获取'
-          '（约 177MB，来自 npm 官方包），或自行安装 opencode-ai 后重启应用。';
+          '（2.x 约 240MB 解包，来自 npm 官方平台分包），或自行安装'
+          ' @opencode/cli 后重启应用。';
     }
+    await OpenCode.reconcileProtocol(def);
     addUpstream(def);
     return null;
   }
 
-  /// 用户手动指定了新的 CLI 路径：更新 def.command 并重启 serve 子进程。
-  /// 返回 null=成功；否则为失败原因。
+  /// 用户手动指定了新的 CLI 路径：更新 def.command、按新二进制的线协议
+  /// 重配鉴权/端点，再重启 serve 子进程。返回 null=成功；否则为失败原因。
   Future<String?> updateOpenCodeCommand(String exePath) async {
     final rt = _runtimes.where((r) => r.def.id == OpenCode.id).firstOrNull;
     if (rt == null) return 'OpenCode CLI 尚未接入';
     rt.def
       ..command = exePath
       ..env['OPENCODE_API_KEY'] = '';
+    await OpenCode.reconcileProtocol(rt.def);
+    config.save();
     rt.restartChild();
     unawaited(Future.delayed(const Duration(milliseconds: 500), rt.ensure));
     return null;
