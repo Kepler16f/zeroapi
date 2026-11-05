@@ -19,6 +19,7 @@ class _TurnScript {
     this.heartbeat = false,
     this.removeWaitRoute = false,
     this.retryMessage,
+    this.transportRetryCount = 0,
     this.assistantText = 'reply OK',
     this.errorType,
     this.errorMessage,
@@ -49,6 +50,9 @@ class _TurnScript {
   /// session.retry.scheduled 的文案（软限流）。
   final String? retryMessage;
 
+  /// >0 时模拟传输重试风暴：连发 N 条 session.retry.scheduled（provider
+  /// .transport）。用于验证「连续 4 次传输重试且无输出 → 判出口不可达」。
+  final int transportRetryCount;
   final String? assistantText;
 
   /// assistant 消息的结构化 error（额度/传输）。
@@ -405,11 +409,17 @@ class _FakeServe {
 
     if (sc.retryMessage != null) {
       await Future<void>.delayed(const Duration(milliseconds: 20));
-      push('session.retry.scheduled', {
-        'message': sc.retryMessage,
-        'attempt': 1,
-        'nextRetryAt': 0,
-      });
+      // transportRetryCount>0 时模拟**传输风暴**：连发 N 条 provider.transport
+      // 重试事件（真实 CLI 对 ECONNRESET 会重试 10 次 / 148s，直到看门狗掐）。
+      final n = sc.transportRetryCount > 0 ? sc.transportRetryCount : 1;
+      for (var k = 1; k <= n; k++) {
+        push('session.retry.scheduled', {
+          'message': sc.retryMessage,
+          'attempt': k,
+          'nextRetryAt': 0,
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 15));
+      }
     }
     var ordinal = 0;
     for (final d in sc.deltas) {
@@ -632,8 +642,63 @@ void main() {
       );
     });
 
-    test('wrong password → 401 auth error, password never leaked', () async {
-      final fake = _FakeServe(password: 's3cr3t-pw');
+    test('传输重试风暴：连续 4 次 provider.transport 且无输出 → 判出口不可达',
+        () async {
+      // 回归 2026-11-06：死出口上 CLI 对 ECONNRESET 无限重试（实测 10 次 /
+      // 148s，直到看门狗 150s 掐掉）。同一 IP 上第 5 次连接不会有不同结果，
+      // 连续 4 次传输重试且无任何输出就应立即判失败换出口（148s → ~60s）。
+      final fake = _FakeServe();
+      fake.script = _TurnScript(
+        retryMessage:
+            '{type: provider.transport, message: ECONNRESET: The socket '
+            'connection was closed unexpectedly.}',
+        transportRetryCount: 6,
+        holdForever: true, // 没有恢复：等适配器主动判失败
+      );
+      await fake.start();
+      OpenCodeApiV2.stallTimeout = const Duration(seconds: 30);
+      final api = OpenCodeApiV2(fake.baseUrl, password: 'test-pw');
+      addTearDown(() async {
+        api.close();
+        await fake.close();
+      });
+      final retries = <String>[];
+      api.onRetry = retries.add;
+
+      final r = await _drain(api.chat(model: 'big-pickle', messages: _msgs()));
+      final e = r.error;
+      expect(e, isA<OpenCodeUpstreamError>());
+      expect((e! as OpenCodeUpstreamError).isConnectionFailure, isTrue,
+          reason: '传输风暴必须按「出口不可达」处理（网关据此换出口）');
+      expect(
+        (e as OpenCodeUpstreamError).message,
+        contains('连续 4 次'),
+        reason: '第 4 次就止损，不等看门狗',
+      );
+      expect(retries.length, greaterThanOrEqualTo(4));
+    }, timeout: const Timeout(Duration(seconds: 60)));
+
+    test('额度 retry（非传输类）不触发风暴止损：照常等 CLI 自愈', () async {
+      final fake = _FakeServe();
+      fake.script = _TurnScript(
+        retryMessage: 'Free usage exceeded, subscribing may help: retry in 17s',
+        transportRetryCount: 6, // 即使连发 6 次
+        deltas: ['恢复', '了'],
+        endWithExecution: true,
+      );
+      await fake.start();
+      final api = OpenCodeApiV2(fake.baseUrl, password: 'test-pw');
+      addTearDown(() async {
+        api.close();
+        await fake.close();
+      });
+
+      final r = await _drain(api.chat(model: 'big-pickle', messages: _msgs()));
+      expect(r.error, isNull, reason: '${r.error}');
+      expect(r.chunks.join(), '恢复了');
+    });
+
+    test('wrong password → 401 auth error, password never leaked', () async {      final fake = _FakeServe(password: 's3cr3t-pw');
       await fake.start();
       final api = OpenCodeApiV2(fake.baseUrl, password: 'WRONG-pw');
       addTearDown(() async {

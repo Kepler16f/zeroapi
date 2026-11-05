@@ -628,10 +628,14 @@ class OpenCodeUpstreamError implements Exception {
   final String message;
   final int? statusCode;
   final bool stalled;
+
+  /// 显式连接失败（如 v2 传输重试风暴）：绕过文案匹配直接判定。
+  final bool connectionFailure;
   const OpenCodeUpstreamError({
     required this.message,
     this.statusCode,
     this.stalled = false,
+    this.connectionFailure = false,
   });
 
   /// 上游文案里常见的额度耗尽关键词——命中时网关回 429 rate_limit_exceeded，
@@ -645,6 +649,7 @@ class OpenCodeUpstreamError implements Exception {
   /// 与额度耗尽要分开处理：额度是「这个出口今天用完了」，换出口有意义；
   /// 连不通是「这个出口根本到不了 API」，同样要换出口，但不该记成额度烧穿。
   bool get isConnectionFailure {
+    if (connectionFailure) return true;
     final m = message.toLowerCase();
     return m.contains('cannot connect') ||
         m.contains('unable to connect') ||

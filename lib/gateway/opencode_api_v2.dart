@@ -260,6 +260,11 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
     var successful = false;
     var done = false;
     var emittedAny = false;
+
+    /// 本轮的传输层重试计数（session.retry.scheduled 且 message 带
+    /// provider.transport）。连续 4 次即判出口不可达——CLI 对传输错误会无限
+    /// 重试（实测 10 次 / 148s），同一 IP 上第 5 次不会有不同结果。
+    var transportRetries = 0;
     var sawFailed = false;
     Object? failure;
     StackTrace? failureStack;
@@ -414,14 +419,31 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
               }
               if (type == 'session.retry.scheduled') {
                 // v1 的 session.status type=retry 在 v2 的对应物：**软限流**。
-                // CLI 会自己退避重试，实测 17–71s 后常自愈。这里只记日志，
-                // 绝不中止本轮——11-04 误杀回归教训（把软限流当额度烧穿掐死，
-                // 2 分钟烧光 62 个出口）。久等无输出由停滞看门狗兜底。
+                // CLI 会自己退避重试，额度类 3 次后自会放弃（AI_RetryError）。
+                // 这里只记日志，绝不把额度 retry 当烧穿——11-04 误杀回归教训。
+                //
+                // 但**传输层风暴**（ECONNRESET 等）不同：CLI 对传输错误会一直
+                // 重试下去（实测 10 次 / 148s，直到看门狗掐掉），而同一个出口
+                // IP 上第 5 次连接和第 4 次不会有不同结果。连续 4 次传输重试
+                // 且无任何输出 → 判定出口不可达，立即换（148s → ~60s）。
                 final msg =
                     (data['message'] ?? data['reason'] ?? data['error'] ?? '')
                         .toString();
                 if (msg.isNotEmpty) {
                   (onRetry ?? onRetryEvent)?.call(msg);
+                }
+                if (!generationStarted &&
+                    msg.contains('provider.transport') &&
+                    ++transportRetries >= 4) {
+                  fail(
+                    OpenCodeUpstreamError(
+                      message:
+                          'opencode v2 CLI 连续 $transportRetries 次连接上游'
+                          '失败（出口不可达）',
+                      statusCode: 502,
+                      connectionFailure: true,
+                    ),
+                  );
                 }
                 return;
               }
