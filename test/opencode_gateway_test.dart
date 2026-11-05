@@ -526,6 +526,34 @@ void main() {
     injectRetry = null;
   });
 
+  test('整池烧穿已知期内：快速 429 附恢复时刻，不再 6 轮轮换白等', () async {
+    // 回归 2026-11-06：共享出口的日额度被同网络其他用户烧穿时（6 轮轮换全
+    // free-limit），每个请求都要白等 2 分钟才报错。prepare 抛
+    // ZenQuotaExhausted 必须直接映射成快速 429。
+    proxy.onPrepareOpenCode = () async {
+      throw ZenQuotaExhausted(
+        '整池烧穿，预计 08:54 前后恢复',
+        DateTime.now().add(const Duration(hours: 8)),
+      );
+    };
+    addTearDown(() => proxy.onPrepareOpenCode = null);
+
+    final sw = Stopwatch()..start();
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/deepseek-v4.1-flash-free',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+    });
+    final raw = await utf8.decodeStream(resp);
+    final elapsed = sw.elapsedMilliseconds;
+    expect(resp.statusCode, 429, reason: raw);
+    final body = jsonDecode(raw);
+    expect(body['error']['code'], 'free_quota_exhausted');
+    expect(body['error']['message'], contains('08:54'));
+    expect(elapsed, lessThan(5000), reason: '烧穿期内必须快速失败（实测原为 2 分钟）');
+  });
+
   test('CLI 请求结束后释放出口保护（成功和失败）', () async {
     var prepared = 0;
     var finished = 0;

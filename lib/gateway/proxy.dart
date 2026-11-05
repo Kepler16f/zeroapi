@@ -1022,6 +1022,17 @@ class ProxyServer {
               'code': 'egress_unavailable',
             },
           }, 502);
+        } on ZenQuotaExhausted catch (e) {
+          // 整池烧穿已知期内：快速 429（附恢复时刻），绝不再走轮换白等。
+          _account(publicName, route.upstream.id, 0, 0, true);
+          _log('$publicName ⏳ ${route.upstream.id}: $e');
+          return _json(req, {
+            'error': {
+              'message': '$e',
+              'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
+              'code': 'free_quota_exhausted',
+            },
+          }, 429);
         }
         await _forwardOpenCode(
           req,

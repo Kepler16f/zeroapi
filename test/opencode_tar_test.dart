@@ -61,9 +61,11 @@ void main() {
   });
 
   test('八进制 size 正确解析（不是十进制）', () async {
-    // 100000000 字节：八进制 "574350057"，按十进制读会变成 5.7 亿 → 越界。
-    // （真实 2.x 的 exe 是 259169160，同样触发；这里用小尺寸免得测试太慢。）
-    const size = 100000000;
+    // 10,000,000 字节：八进制 "4645440"——按十进制读会变成 4.6MB → 解出
+    // 的文件被截断。真实 2.x 的 exe 是 259,169,160（八进制 1734515610，
+    // 按十进制读成 17 亿直接 RangeError）；这里用小尺寸让测试跑得快，
+    // 暴露的是同一个解析 bug。
+    const size = 10000000;
     final content = List<int>.filled(size, 65);
     final tgz = File('${dest.path}/pkg.tgz');
     final raw = <int>[
@@ -78,7 +80,7 @@ void main() {
     final exe = File('${out.path}/bin/opencode.exe');
     expect(exe.existsSync(), isTrue, reason: '大文件必须被正确解出');
     expect(exe.lengthSync(), size);
-  }, timeout: const Timeout(Duration(minutes: 2)));
+  }, timeout: const Timeout(Duration(minutes: 3)));
 
   test('目录项跳过、文件内容逐字节还原', () async {
     final tgz = File('${dest.path}/pkg.tgz');

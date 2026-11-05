@@ -673,3 +673,16 @@ class ZenExitUnavailable implements Exception {
   @override
   String toString() => message;
 }
+
+/// 整池免费额度烧穿（所有出口都报 free-limit）。与 [ZenExitUnavailable] 的
+/// 区别：这是**有时限的已知状态**（retryAfter 指向重置点），调用方应快速
+/// 返回 429 并附恢复时刻，而不是 502，更不该再走 6 轮轮换白等 2 分钟。
+class ZenQuotaExhausted implements Exception {
+  final String message;
+
+  /// 预计恢复时刻（本地时区）。
+  final DateTime until;
+  const ZenQuotaExhausted(this.message, this.until);
+  @override
+  String toString() => message;
+}

@@ -10,6 +10,7 @@ import 'hubactions.dart';
 import 'modelsdev.dart';
 import 'opencode.dart';
 import 'opencode_api.dart';
+import 'opencode_api_v2.dart';
 import 'ocruntime.dart';
 import 'proxy.dart';
 import 'proxycore.dart';
@@ -360,6 +361,18 @@ class GatewayService extends ChangeNotifier {
   /// 列表里 → 成功/失败的出口都记不上 → 每次都重新盲选（用户实测延迟
   /// 高达几分钟的根因之一）。
   final Map<String, String> _zenCurrentNodeId = {};
+
+  /// **整池免费额度烧穿**的已知截止时刻（本轮轮换所有出口都报 free-limit 时
+  /// 取观测到的最大 retryAfter）。
+  ///
+  /// 免费额度按「客户端身份 × 出口 IP × 天」计，共享机场 IP 的日额度会被
+  /// 同订阅其他用户烧穿；Worker 的 CF anycast 池同样被全球流量摊薄（实测
+  /// 两条路同时报 free-limit、retryAfter 都指向同一重置点）。此时**每个
+  /// 请求都重走 6 轮轮换 ≈ 2 分钟才报 429** 是纯粹的浪费——后续请求直接
+  /// 快速失败并给出恢复时刻，由后台探测在恢复后自动解除。
+  DateTime? _zenExhaustedUntil;
+  Timer? _zenRecoveryTimer;
+  bool _zenRecoveryProbing = false;
   bool _zenRequestPreparing = false;
   int _zenRequestsActive = 0;
   bool _zenSyncPending = false;
@@ -403,6 +416,19 @@ class GatewayService extends ChangeNotifier {
     if (pool == null || _disposed) return;
     final rt = _runtimes.where((r) => r.isOpenCode).firstOrNull;
     if (rt == null) return;
+    // 整池烧穿已知期内：快速失败（不再 6 轮轮换白等 2 分钟）。恢复由后台
+    // 探测负责（_scheduleZenRecoveryProbe），到点自动解除。
+    final exhausted = _zenExhaustedUntil;
+    if (exhausted != null && DateTime.now().isBefore(exhausted)) {
+      throw ZenQuotaExhausted(
+        'OpenCode 免费额度整池烧穿（共享出口的当日额度被同网络其他用户消耗，'
+        '与你的用量无关），预计 ${exhausted.hour.toString().padLeft(2, '0')}:'
+        '${exhausted.minute.toString().padLeft(2, '0')} 前后恢复；'
+        '期间可改用其他供应商的模型。',
+        exhausted,
+      );
+    }
+    if (exhausted != null) _zenExhaustedUntil = null;
     final purpose = ProxyPool.pUpstream(rt.id);
     if (upstreamUsesPool(rt.id)) {
       // 已有「当天被真 CLI 验证过额度可用」的出口时，**不必**为了选路而
@@ -424,7 +450,8 @@ class GatewayService extends ChangeNotifier {
           _zenRequestsActive++;
           return;
         }
-      }      // 先同步 listener，再等待全组检测；绝不从旧列表盲取三个。
+      }
+      // 先同步 listener，再等待全组检测；绝不从旧列表盲取三个。
       final sw = Stopwatch()..start();
       await ProxyCore.instance.sync(pool);
       server?.log('Zen 出口内核同步耗时 ${sw.elapsedMilliseconds}ms');
@@ -435,6 +462,28 @@ class GatewayService extends ChangeNotifier {
       server?.log('Zen 全量测速耗时 ${sw.elapsedMilliseconds}ms，候选 ${candidates.length} 个');
       _zenMeasuredCandidates[rt.id] = candidates;
       if (candidates.isEmpty) {
+        // 全部候选被剔除时，先看是不是额度冷却造成的——是就按「整池烧穿」
+        // 快速失败并附恢复时刻，而不是误导性的「没有出口」。
+        final cooldowns = pool.health.values
+            .map((h) => h.quotaUntil)
+            .whereType<DateTime>()
+            .where((t) => t.isAfter(DateTime.now()))
+            .toList();
+        if (cooldowns.isNotEmpty) {
+          final until = cooldowns.reduce(
+            (a, b) => a.isBefore(b) ? a : b,
+          );
+          _zenExhaustedUntil = until;
+          _scheduleZenRecoveryProbe(until);
+          throw ZenQuotaExhausted(
+            'OpenCode 免费额度整池烧穿（共享出口的当日额度被同网络其他用户'
+            '消耗，与你的用量无关），预计 '
+            '${until.hour.toString().padLeft(2, '0')}:'
+            '${until.minute.toString().padLeft(2, '0')} 前后恢复；'
+            '期间可改用其他供应商的模型。',
+            until,
+          );
+        }
         throw const ZenExitUnavailable(
           'Zen 全量测速完成：绑定分组没有通过目标站检测的出口（超时/失败均已剔除）',
         );
@@ -660,6 +709,117 @@ class GatewayService extends ChangeNotifier {
     server?.log('Zen 已标记出口 $nodeId 当天额度可用');
   }
 
+  /// 整池烧穿后的**后台恢复探测**：到预计恢复点前几分钟起，每隔几分钟用
+  /// 一个最小请求试一个出口；跑通即解除烧穿状态、标记该出口可用——用户
+  /// 无感知恢复。用户请求到来时探测会让路（不与真实请求抢 CLI）。
+  void _scheduleZenRecoveryProbe(DateTime until) {
+    _zenRecoveryTimer?.cancel();
+    // 比预计恢复点早 2 分钟开始试，每 4 分钟一轮
+    var next = until.subtract(const Duration(minutes: 2));
+    final now = DateTime.now();
+    if (next.isBefore(now.add(const Duration(seconds: 30)))) {
+      next = now.add(const Duration(minutes: 4));
+    }
+    _zenRecoveryTimer = Timer(next.difference(now), () {
+      unawaited(_zenRecoveryTick());
+    });
+  }
+
+  Future<void> _zenRecoveryTick() async {
+    if (_disposed) return;
+    if (_zenRequestsActive > 0 || _zenRequestPreparing) {
+      // 用户请求在跑：2 分钟后再看
+      _zenRecoveryTimer = Timer(
+        const Duration(minutes: 2),
+        () => unawaited(_zenRecoveryTick()),
+      );
+      return;
+    }
+    if (_zenRecoveryProbing) return;
+    _zenRecoveryProbing = true;
+    try {
+      final recovered = await _serializeEgress(_probeZenRecovery);
+      if (recovered) {
+        _zenExhaustedUntil = null;
+        server?.log('Zen 免费额度已恢复（后台探测跑通），解除烧穿状态');
+        return;
+      }
+      // 仍烧穿：4 分钟后再试
+      _zenRecoveryTimer = Timer(
+        const Duration(minutes: 4),
+        () => unawaited(_zenRecoveryTick()),
+      );
+    } finally {
+      _zenRecoveryProbing = false;
+    }
+  }
+
+  /// 恢复探测的一次尝试：挑一个未冷却的出口发最小请求。返回是否跑通。
+  Future<bool> _probeZenRecovery() async {
+    final pool = proxies;
+    if (pool == null || _disposed) return false;
+    final rt = _runtimes.where((r) => r.isOpenCode).firstOrNull;
+    if (rt == null) return false;
+    final purpose = ProxyPool.pUpstream(rt.id);
+    await ProxyCore.instance.sync(pool);
+    final candidates = await pool.measuredCandidatesFor(purpose);
+    _zenMeasuredCandidates[rt.id] = candidates;
+    final node = candidates
+        .where((c) => c.nodeId != null)
+        .firstOrNull;
+    if (node == null) return false;
+    _zenCurrentNodeId[rt.id] = node.nodeId!;
+    final url = _zenCandidateUrl(node);
+    _setZenCliEgressEnv(rt.def, url);
+    await rt.restartChild();
+    await rt.ensure();
+    for (var i = 0; i < 30 && !_disposed; i++) {
+      if (rt.health == UpstreamHealth.healthy) break;
+      await rt.ensure();
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    if (rt.health != UpstreamHealth.healthy) return false;
+    final model = rt.models.firstWhere(
+      (m) => m.endsWith('-free') || m == 'big-pickle',
+      orElse: () => rt.models.isNotEmpty ? rt.models.first : '',
+    );
+    if (model.isEmpty) return false;
+    final api = rt.openCodeV2
+        ? OpenCodeApiV2(
+            rt.def.baseUrl,
+            password: rt.def.env[OpenCode.serverPasswordEnv] ?? '',
+          )
+        : OpenCodeApi(rt.def.baseUrl)
+      ..onActivity = ((_) {});
+    try {
+      final pieces = api.chat(
+        model: model,
+        messages: [
+          {'role': 'user', 'content': 'reply with the single word OK'},
+        ],
+      );
+      final it = StreamIterator(pieces);
+      if (await it.moveNext().timeout(const Duration(seconds: 90))) {
+        pool.markQuotaOk(node.nodeId!);
+        return true;
+      }
+      return false;
+    } on OpenCodeUpstreamError catch (e) {
+      if (e.isQuotaExhausted) {
+        final wait = api.retryAfterSeconds ?? 300;
+        pool.markQuotaCooldown(
+          node.nodeId!,
+          DateTime.now().add(Duration(seconds: wait.clamp(60, 12 * 3600))),
+        );
+      }
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      api.close();
+    }
+  }
+
   void _markZenQuotaExhausted(String upstreamId, int? retryAfterSeconds) {
     final rt = _runtimes.where((r) => r.id == upstreamId).firstOrNull;
     final pool = proxies;
@@ -734,7 +894,27 @@ class GatewayService extends ChangeNotifier {
               c.nodeId != failedNode,
         )
         .toList();
-    if (usable.isEmpty) return false;
+    if (usable.isEmpty) {
+      // 没有可换的出口了：本轮全部撞上额度墙（或都已冷却）。记录整池烧穿
+      // 的预计恢复时刻，后续请求快速失败（不再 6 轮轮换白等 2 分钟），由
+      // 后台探测在恢复后自动解除。
+      final wait = retryAfterSeconds ?? 30 * 60;
+      final until = DateTime.now().add(
+        Duration(seconds: wait.clamp(60, 12 * 3600)),
+      );
+      if (_zenExhaustedUntil == null ||
+          _zenExhaustedUntil!.isBefore(DateTime.now())) {
+        _zenExhaustedUntil = until;
+        server?.log(
+          'Zen 整池额度烧穿（本轮 ${_zenAttemptedNodes.length} 个出口全部 '
+          'free-limit），预计 ${until.hour.toString().padLeft(2, '0')}:'
+          '${until.minute.toString().padLeft(2, '0')} 前后恢复；'
+          '后续请求将快速失败，恢复由后台探测自动完成',
+        );
+        _scheduleZenRecoveryProbe(until);
+      }
+      return false;
+    }
     // 优先挑「当天已被真 CLI 验证过有额度」的出口：额度按出口 IP 隔离，
     // 而通用探针只能证明能出网、证明不了有额度（实测 30379/30380 有、
     // 30375/30376 没有，同一时刻同一模型）。
@@ -1493,6 +1673,7 @@ class GatewayService extends ChangeNotifier {
     _generation++; // 让在途的后台初始化立刻作废
     ModelsDev.instance.stop();
     _refreshTimer?.cancel();
+    _zenRecoveryTimer?.cancel();
     for (final u in _runtimes) {
       u.stop();
     }
