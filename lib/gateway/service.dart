@@ -865,6 +865,24 @@ class GatewayService extends ChangeNotifier {
     final pool = proxies;
     if (pool == null) return false;
     if (!upstreamUsesPool(upstreamId) || _zenAttemptedNodes.length >= 6) {
+      // 预算用尽（本轮已试 6 个出口）：如果最后失败是额度类，同样记录整池
+      // 烧穿——否则下一个请求还会重走 6 轮（实测 #2/#3 各多花 ~90s）。
+      if (retryAfterSeconds != null && retryAfterSeconds > 0) {
+        final until = DateTime.now().add(
+          Duration(seconds: retryAfterSeconds.clamp(60, 12 * 3600)),
+        );
+        if (_zenExhaustedUntil == null ||
+            _zenExhaustedUntil!.isBefore(DateTime.now())) {
+          _zenExhaustedUntil = until;
+          server?.log(
+            'Zen 轮换预算用尽且全是额度错误，预计 '
+            '${until.hour.toString().padLeft(2, '0')}:'
+            '${until.minute.toString().padLeft(2, '0')} 前后恢复；'
+            '后续请求将快速失败',
+          );
+          _scheduleZenRecoveryProbe(until);
+        }
+      }
       return false;
     }
     final purpose = ProxyPool.pUpstream(upstreamId);

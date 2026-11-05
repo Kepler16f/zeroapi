@@ -174,6 +174,22 @@ void main() {
     expect(pool.health[a.id]?.quotaUntil, later);
   });
 
+  test('冷却会作废「额度可用」标记（否则每个请求都 fast-path 到刚烧穿的出口）',
+      () async {
+    final a = await node('a');
+    pool.groups.add(ProxyGroup(name: '飞鸟云', nodes: [a]));
+    // 刚被真 CLI 验证可用 → 立刻又烧穿（额度桶见底时一次请求就会触发）
+    pool.markQuotaOk(a.id);
+    expect(pool.isQuotaOk(a.id), isTrue);
+    pool.markQuotaCooldown(a.id, DateTime.now().add(const Duration(hours: 7)));
+    expect(
+      pool.isQuotaOk(a.id),
+      isFalse,
+      reason: '不清掉可用标记的话，后续请求会先 fast-path 到它再失败再轮换'
+          '（实测 11-06 每个请求多花 ~90s）',
+    );
+  });
+
   test('额度烧穿的节点会作废之前的「可用」标记', () async {
     final a = await node('a');
     pool.groups.add(ProxyGroup(name: '飞鸟云', nodes: [a]));

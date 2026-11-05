@@ -1453,13 +1453,18 @@ class ProxyPool extends ChangeNotifier {
   /// 与 [markQuotaSpent]（当天整日拉黑）的区别：后者是「额度按天算」的粗粒度
   /// 结论；前者是上游明确告知的恢复时刻——按它冷却，既不误伤（到点自动可用）
   /// 也不空转（到点前不反复撞）。取更晚的那个冷却点。
+  ///
+  /// **同时作废 quotaOk 标记**：刚被验证可用又立刻烧穿（额度桶见底时一次
+  /// 请求就能触发）的出口，若不清掉「可用」标记，后续每个请求都会先
+  /// fast-path 到它再失败再轮换（实测 11-06 #2/#3 请求各多花 ~90s）。
   void markQuotaCooldown(String nodeId, DateTime until) {
     final h = health.putIfAbsent(nodeId, () => NodeHealth());
     final cur = h.quotaUntil;
     if (cur == null || cur.isBefore(until)) {
       h.quotaUntil = until;
-      notifyListeners();
     }
+    h.quotaOkDay = null;
+    notifyListeners();
   }
 
   /// 该出口是否处于额度冷却中（v2 报告了确切重置时刻的场景）。
