@@ -107,14 +107,46 @@ class OpenCode {
   /// 探测本机 CLI 的大版本并把 def 调成对应线协议（见 [reconcileAuth]）。
   /// 找不到可执行文件或版本解析不出来时按 v1 处理——v1 的旧端点行为
   /// 与「未升级」一致，不会比现状更差。返回是否改动过 def（调用方落盘）。
+  ///
+  /// 同时**把 command 重新解析到当前最好的 CLI**：配置里的 command 是当初
+  /// 接入时写死的，升级 CLI（1.x → 2.x）后不会自动跟随——实测升级后网关
+  /// 仍在 spawn 旧路径的 1.19.3，UA 被拉黑 → 拿不到额度。这里按
+  /// 「用户手动指定 > v2 落地位 > 原路径」的顺序纠正。
   static Future<bool> reconcileProtocol(UpstreamDef def) async {
-    final exe = def.command;
+    var exe = def.command;
     var v2 = false;
     if (exe != null && exe.isNotEmpty) {
       final ver = await OpenCodeRuntime.probeVersion(exe);
       v2 = ver != null && OpenCodeRuntime.isV2(ver);
     }
-    return reconcileAuth(def, v2: v2);
+    final changed = reconcileAuth(def, v2: v2);
+    if (!v2) {
+      // 当前这个不是 2.x：看看有没有 2.x 可用（用户手动指定优先）。
+      final picked = await _bestCliPath();
+      if (picked != null && picked != exe) {
+        def.command = picked;
+        final ver2 = await OpenCodeRuntime.probeVersion(picked);
+        final v2b = ver2 != null && OpenCodeRuntime.isV2(ver2);
+        reconcileAuth(def, v2: v2b);
+        return true;
+      }
+    }
+    return changed;
+  }
+
+  /// 当前机器上最好的 CLI 路径：用户手动指定 > v2 落地位 > 其余候选。
+  /// 找不到 2.x 时返回 null（保持现状，不动用户配置）。
+  static Future<String?> _bestCliPath() async {
+    final override = OpenCodeRuntime.overridePath;
+    if (override != null && override.isNotEmpty && File(override).existsSync()) {
+      return override;
+    }
+    for (final p in OpenCodeRuntime.candidatePaths()) {
+      if (p.isEmpty || !File(p).existsSync()) continue;
+      final ver = await OpenCodeRuntime.probeVersion(p);
+      if (ver != null && OpenCodeRuntime.isV2(ver)) return p;
+    }
+    return null;
   }
 
 

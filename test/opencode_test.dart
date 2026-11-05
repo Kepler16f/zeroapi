@@ -2,6 +2,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zeroapi/gateway/config.dart';
 import 'package:zeroapi/gateway/opencode.dart';
 import 'package:zeroapi/gateway/opencode_api.dart';
 import 'package:zeroapi/gateway/ocruntime.dart';
@@ -57,12 +58,43 @@ void main() {
       expect(def.baseUrl, 'http://127.0.0.1:4321');
       expect(def.command, isNotNull);
       expect(def.args, ['serve', '--hostname', '127.0.0.1', '--port', '4321']);
-      expect(def.healthUrl, 'http://127.0.0.1:4321/global/health');
-      // 关键实测结论：设了 SERVER_PASSWORD 会让 POST message 挂住——env 里不能有
-      expect(def.env.containsKey('OPENCODE_SERVER_PASSWORD'), false);
       // 隔离 HOME：不读用户真实凭证
       expect(def.env['HOME'], contains('zeroapi'));
       expect(def.env['OPENCODE_DISABLE_AUTOUPDATE'], '1');
+    });
+
+    test('reconcileProtocol 按 CLI 大版本配鉴权与端点（v2 要密码+ /api/*）', () {
+      // v1（1.19.x，UA 已被免费层拉黑）：**绝不能**设
+      // OPENCODE_SERVER_PASSWORD——设了 POST message 会挂住。
+      final v1 = UpstreamDef(
+        id: 'zen',
+        type: 'managed',
+        label: 'zen',
+        baseUrl: 'http://127.0.0.1:4097',
+        command: '',
+      );
+      OpenCode.reconcileAuth(v1, v2: false);
+      expect(v1.env.containsKey('OPENCODE_SERVER_PASSWORD'), false);
+      expect(v1.healthUrl, contains('/global/health'));
+      expect(v1.catalogPaths, ['/config/providers']);
+
+      // v2（@opencode/cli 2.x）：serve 强制 Basic 鉴权，没密码 → /api/* 全 401。
+      final v2 = UpstreamDef(
+        id: 'zen',
+        type: 'managed',
+        label: 'zen',
+        baseUrl: 'http://127.0.0.1:4097',
+        command: '',
+      );
+      OpenCode.reconcileAuth(v2, v2: true);
+      expect((v2.env['OPENCODE_SERVER_PASSWORD'] ?? '').isNotEmpty, true);
+      expect(v2.healthUrl, contains('/api/info'));
+      expect(v2.catalogPaths, ['/api/model']);
+
+      // 幂等：重复调用不会换掉已生成的密码
+      final pw = v2.env['OPENCODE_SERVER_PASSWORD'];
+      OpenCode.reconcileAuth(v2, v2: true);
+      expect(v2.env['OPENCODE_SERVER_PASSWORD'], pw);
     });
 
     test('免费档清单：9 个可用、2 个标注原因且互斥', () {
