@@ -414,7 +414,13 @@ class ProxyServer {
     final line = '[${DateTime.now().toIso8601String().substring(11, 19)}] $s';
     _logLines.add(line);
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
-    _logFile?.writeln(line);
+    // 日志文件可能已被 stop() 关掉（多实例共享同一文件、或 stop 后仍有关联
+    // 请求在收尾）——写失败不能影响请求本身。
+    try {
+      _logFile?.writeln(line);
+    } catch (_) {
+      // 忽略
+    }
   }
 
   ProxyServer(
@@ -439,7 +445,11 @@ class ProxyServer {
               : '${Platform.environment['HOME']}/.config/zeroapi/logs');
       final d = Directory(dir);
       if (!d.existsSync()) d.createSync(recursive: true);
-      return File('$dir/gateway.log').openWrite(mode: FileMode.append);
+      final sink = File('$dir/gateway.log').openWrite(mode: FileMode.append);
+      // IOSink 的写错误是**异步**投递的（writeln 不会同步抛），不接住就是
+      // 未处理异步错误——stop() 之后仍有请求收尾写日志时就会把用例搞崩。
+      sink.done.catchError((Object _) => sink);
+      return sink;
     } catch (_) {
       return null;
     }
@@ -513,11 +523,13 @@ class ProxyServer {
     _zenUp?.close(force: true);
     _zenUp = null;
     _zenProxySig = '';
+    // 日志文件句柄：本实例独占（openWrite 各自打开），关闭自己那个即可；
+    // 关不掉也不影响停止流程（写失败已被 _log 吞掉）。
     try {
       await _logFile?.flush();
       await _logFile?.close();
     } catch (_) {
-      // 日志落盘失败不影响停止流程
+      // 忽略
     }
   }
 

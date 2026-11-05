@@ -537,8 +537,8 @@ class GatewayService extends ChangeNotifier {
     final purpose = ProxyPool.pUpstream(upstreamId);
     final valid = poolCandidatesFor(pool, purpose);
     final usable = <PoolCandidate>[];
-    for (final candidate
-        in _zenMeasuredCandidates[upstreamId] ?? <PoolCandidate>[]) {
+    final measured = _zenMeasuredCandidates[upstreamId];
+    for (final candidate in measured ?? <PoolCandidate>[]) {
       if (candidate.nodeId != null && pool.isQuotaSpent(candidate.nodeId!)) {
         continue;
       }
@@ -554,7 +554,11 @@ class GatewayService extends ChangeNotifier {
         .where((c) => c.nodeId != null && pool.isQuotaOk(c.nodeId!))
         .firstOrNull;
     final picked = ok ?? usable.firstOrNull;
-    return picked == null ? null : _zenCandidateUrl(picked);
+    if (picked != null) return _zenCandidateUrl(picked);
+    // 还没测速（应用刚启动）→ 退回**纯内存**的候选列表（poolCandidatesFor
+    // 不做网络探测）。否则启动后第一个请求会因「没有测速快照」而报
+    // 「暂无可用出口」并白等一轮测速。
+    return valid.isEmpty ? null : _zenCandidateUrl(valid.first);
   }
 
   /// 把出口写进 zen CLI 的 env（HTTP_PROXY 等）。返回是否发生变化。
