@@ -234,6 +234,14 @@ class GatewayService extends ChangeNotifier {
     if (pool != null) {
       unawaited(pool.autoProbeOnce());
       pool.startAutoProbe();
+      // zen 出口**预热测速**：启动后台立刻测一轮（87 个节点约 10s），
+      // 这样第一个用户请求命中的是热快照，而不是在请求关键路径上等全量扫描
+      // （实测冷启动第一个请求 25s，其中 10.8s 是那次扫描）。
+      unawaited(
+        pool
+            .measuredCandidatesFor(ProxyPool.pUpstream(OpenCode.id))
+            .catchError((Object _) => const <PoolCandidate>[]),
+      );
     }
     _refreshTimer ??= Timer.periodic(
       const Duration(seconds: 60),
