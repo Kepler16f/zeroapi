@@ -1189,4 +1189,57 @@ void _coreKernelCompatTests() {
       });
     }
   });
+
+  group('池文件健壮性（2026-11-07 数据丢失回归）', () {
+    test('save 是原子写：写完后不留 .tmp，损坏的主文件能从 .bak 恢复', () async {
+      final dir = await Directory.systemTemp.createTemp('zeroapi-pool-');
+      addTearDown(() {
+        if (dir.existsSync()) dir.deleteSync(recursive: true);
+      });
+      final path = '${dir.path}/proxies.json';
+
+      // 第一次：写入有节点的池
+      final pool = ProxyPool()..savePath = path;
+      pool.importFromText(
+        'http://10.0.0.1:3128#节点一\nhttp://10.0.0.2:3128#节点二\n',
+        groupName: '测试组',
+      );
+      pool.save();
+      expect(File('$path.bak').existsSync(), isTrue, reason: '健康主文件应同步 .bak');
+      expect(File('$path.tmp').existsSync(), isFalse, reason: '原子写不应残留 .tmp');
+
+      // 模拟强杀打断写入：主文件截断成坏 JSON
+      File(path).writeAsStringSync('{"groups": [{"name": "飞鸟云", "nod');
+
+      // load：应从 .bak 恢复，而不是静默空池
+      final restored = ProxyPool.load(path: path);
+      expect(restored.groups, isNotEmpty, reason: '损坏主文件必须从 .bak 恢复');
+      expect(restored.groups.single.nodes.length, 2);
+      // 主文件被修复
+      expect(File(path).existsSync(), isTrue);
+      expect(ProxyPool.load(path: path).groups.single.nodes.length, 2);
+    });
+
+    test('replaceGroupFromText 的 sanity 闸：错误页解析出 1 个垃圾节点不整组替换',
+        () async {
+      final pool = ProxyPool();
+      pool.importFromText(
+        [for (var i = 0; i < 20; i++) 'http://10.0.0.$i:3128#节点$i']
+            .join('\n'),
+        groupName: '测试组',
+      );
+      // 机场/CDN 的 HTTP 200 错误页：含一条像分享链接的行
+      final errPage =
+          '<html><body>流量已用完，请续费 see https://example.com/renew</body></html>';
+      final (added, removed) = pool.replaceGroupFromText('测试组', errPage);
+      expect(added, 0, reason: '错误页不该往池里加节点');
+      expect(removed, 0, reason: '错误页绝不能清掉原有节点');
+      expect(
+        pool.groups.single.nodes.length,
+        20,
+        reason: '刷新 sanity 闸必须保留原节点（用户实测刷新后只剩 1 个节点）',
+      );
+      expect(pool.parseErrors.join(), contains('错误页'));
+    });
+  });
 }

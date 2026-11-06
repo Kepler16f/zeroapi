@@ -682,6 +682,19 @@ class ProxyPool extends ChangeNotifier {
         (text.trim().isEmpty ? <ProxyNode>[] : parseNodesFromText(text))
             .where((n) => !g.excludedNodeIds.contains(n.id))
             .toList();
+    // **刷新 sanity 闸**：订阅拉取偶尔会拿到机场/CDN 的错误页（HTTP 200 的
+    // 「流量用完」「限流」HTML），里面偶尔有一条像分享链接的行——解析出 0~1
+    // 个垃圾节点。原组节点很多而新清单骤减时，几乎可以断定拉到的不是真订阅：
+    // 保留原节点并让调用方看到警告，绝不整组替换（用户实测：刷新后只剩
+    // 1 个节点就是这么来的）。
+    if (g.nodes.length >= 5 && incoming.length < 3) {
+      parseErrors.add(
+        '订阅刷新疑似拉到错误页（原 ${g.nodes.length} 个节点，新内容只解析出 '
+        '${incoming.length} 个），已保留原节点；正文开头：'
+        '${text.length > 120 ? text.substring(0, 120) : text}',
+      );
+      return (0, 0);
+    }
     final byId = <String, ProxyNode>{for (final n in allNodes) n.id: n};
     final fresh = <ProxyNode>[];
     final seen = <String>{};
@@ -1704,28 +1717,99 @@ class ProxyPool extends ChangeNotifier {
     return Directory('${base ?? '.'}/zeroapi');
   }
 
-  /// 从 JSON 文件加载。文件不存在或内容损坏时返回空池，不抛异常。
+  /// 从 JSON 文件加载。文件不存在时返回空池；**内容损坏时先尝试同目录的
+  /// `.bak` 备份**（见 [save] 的原子写与备份策略），损坏原件改名留档——
+  /// 绝不静默吞掉：曾发生过「安装器强杀进程打断 save → JSON 截断 → load
+  /// 返回空池 → 下一次 save 用空组覆盖原文件」的整池数据丢失（2026-11-07
+  /// 用户实测：更新后 77 个节点全没了）。
   static ProxyPool load({String? path}) {
-    final f = File(path == null || path.isEmpty ? defaultPath() : path);
+    final p = path == null || path.isEmpty ? defaultPath() : path;
+    final f = File(p);
     if (!f.existsSync()) return ProxyPool();
-    try {
-      return ProxyPool.fromJson(
-        _map(jsonDecode(f.readAsStringSync())) ?? const {},
-      );
-    } catch (_) {
-      return ProxyPool();
+    ProxyPool? tryParse(File file, {bool quarantine = false}) {
+      try {
+        return ProxyPool.fromJson(
+          _map(jsonDecode(file.readAsStringSync())) ?? const {},
+        );
+      } catch (_) {
+        if (quarantine) {
+          try {
+            final stamp = DateTime.now().millisecondsSinceEpoch;
+            file.renameSync('$p.corrupt-$stamp');
+          } catch (_) {}
+        }
+        return null;
+      }
     }
+
+    final main = tryParse(f, quarantine: true);
+    if (main != null) {
+      // 主文件健康：顺手维护一份 .bak（内容不同才写，避免每次启动都写盘）
+      final bak = File('$p.bak');
+      try {
+        if (!bak.existsSync() ||
+            bak.lengthSync() != f.lengthSync() ||
+            bak.readAsStringSync() != f.readAsStringSync()) {
+          bak.writeAsStringSync(f.readAsStringSync(), flush: true);
+        }
+      } catch (_) {}
+      return main;
+    }
+    // 主文件损坏：尝试备份
+    final bak = File('$p.bak');
+    if (bak.existsSync()) {
+      final restored = tryParse(bak);
+      if (restored != null) {
+        // 用备份内容把主文件修好（原子写，见 save）
+        try {
+          final tmp = File('$p.tmp');
+          tmp.writeAsStringSync(
+            const JsonEncoder.withIndent('  ').convert(restored.toJson()),
+            flush: true,
+          );
+          if (f.existsSync()) f.deleteSync();
+          tmp.renameSync(p);
+        } catch (_) {}
+        return restored;
+      }
+    }
+    return ProxyPool();
   }
 
-  /// 保存为缩进 JSON，自动创建父目录。未显式传 path 时写入 [savePath]
-  /// （运行态注入，不序列化；测试用它隔离到临时目录，生产为 null → 默认路径）。
+  /// 保存为缩进 JSON，自动创建父目录。**原子写**：先写临时文件再 rename——
+  /// 直接 writeAsStringSync 会被强杀（安装器 CloseApplications=force、断电、
+  /// 崩溃）打断在半截，下次 load 解析失败 → 静默空池 → 下一次 save 把整池
+  /// 数据永久覆盖掉。
+  ///
+  /// 未显式传 path 时写入 [savePath]（运行态注入，不序列化；测试用它隔离到
+  /// 临时目录，生产为 null → 默认路径）。
   String? savePath;
 
   void save({String? path}) {
     final p = path == null || path.isEmpty ? (savePath ?? defaultPath()) : path;
     final f = File(p);
     f.parent.createSync(recursive: true);
-    f.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(toJson()));
+    final body = const JsonEncoder.withIndent('  ').convert(toJson());
+    final tmp = File('$p.tmp');
+    tmp.writeAsStringSync(body, flush: true);
+    try {
+      if (f.existsSync()) f.deleteSync();
+      tmp.renameSync(p);
+    } catch (_) {
+      // rename 失败（目标被占用等）退回直接写，聊胜于无
+      tmp.copySync(p);
+      try {
+        tmp.deleteSync();
+      } catch (_) {}
+    }
+    // 同步维护 .bak（load 损坏恢复的数据源）。内容相同就跳过——save 在
+    // 额度标记等高频路径上被调用，别每次都白写 24KB。
+    try {
+      final bak = File('$p.bak');
+      if (!bak.existsSync() || bak.readAsStringSync() != body) {
+        bak.writeAsStringSync(body, flush: true);
+      }
+    } catch (_) {}
   }
 
   // ---- 导出 ----
