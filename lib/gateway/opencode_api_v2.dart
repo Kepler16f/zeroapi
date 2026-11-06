@@ -57,7 +57,11 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
   void Function(String message)? onActivity;
 
   /// 首次有效输出的等待窗口，不是整轮生成的时间上限。
-  static Duration stallTimeout = const Duration(minutes: 3);
+  ///
+  /// 90s 的取值权衡：健康出口 <20s 就有首字；CLI 对软限流的自愈窗口实测
+  /// 17–71s（要覆盖它，不能更短）；而死出口每轮卡满这个窗口——3 分钟的
+  /// 旧值让 6 轮换出口最坏挂 18 分钟（用户实测「好几分钟没反应」）。
+  static Duration stallTimeout = const Duration(seconds: 90);
 
   /// 已开始输出/思考后，每次有效进展重置这个窗口。
   static Duration generationIdleTimeout = const Duration(minutes: 10);

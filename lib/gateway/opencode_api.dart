@@ -40,7 +40,7 @@ class OpenCodeApi implements OpenCodeServeApi {
   void Function(String message)? onRetry;
 
   /// 首次有效输出的等待窗口，不是整轮生成的时间上限。
-  static Duration stallTimeout = const Duration(minutes: 3);
+  static Duration stallTimeout = const Duration(seconds: 90);
 
   /// 已开始输出/思考后，每次有效进展重置这个窗口。
   static Duration generationIdleTimeout = const Duration(minutes: 10);
