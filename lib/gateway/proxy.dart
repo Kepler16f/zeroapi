@@ -434,7 +434,13 @@ class ProxyServer {
     this.usageDir,
     this.onKeyUsed,
   }) : keys = keys ?? [GatewayKey('默认', apiKey)],
-       _logFile = _openLogFile(usageDir);
+       _logFile = fileLogEnabled ? _openLogFile(usageDir) : null;
+
+  /// 网关日志落盘开关：**生产启动时**由 service 置 true。测试构造的
+  /// ProxyServer（没有 usageDir 注入的）曾把测试日志写进真实的
+  /// `%APPDATA%\zeroapi\logs\gateway.log`（用户排障时看到一堆端口 0 的
+  /// 假实例），默认关闭。
+  static bool fileLogEnabled = false;
 
   /// 打开网关日志文件（追加写）。失败就静默降级为「只有 UI 环形日志」。
   static IOSink? _openLogFile(String? usageDir) {

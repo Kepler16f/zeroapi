@@ -98,6 +98,7 @@ class GatewayService extends ChangeNotifier {
               () => _rotateZenEgressAndWait(id, retryAfterSeconds),
             );
     try {
+      ProxyServer.fileLogEnabled = true; // 生产实例才落盘网关日志
       await server!.start();
       running = true;
       _notify();

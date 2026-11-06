@@ -1790,6 +1790,31 @@ class ProxyPool extends ChangeNotifier {
     final f = File(p);
     f.parent.createSync(recursive: true);
     final body = const JsonEncoder.withIndent('  ').convert(toJson());
+    // **擦除现场保护**：新内容一个节点都没有、而现有文件里有节点——这几乎
+    // 必然是「内存池被异常清空」（数据丢失事故的最后一环）。先把现有文件
+    // 留一份时间戳副本再落盘，事故可完整追责与恢复（2026-11-07 用户 77 节点
+    // 被清空，当时无任何现场可查）。
+    if (allNodes.isEmpty) {
+      try {
+        if (f.existsSync() &&
+            f.lengthSync() > 2000 &&
+            jsonDecode(f.readAsStringSync()) is Map) {
+          final existing = ProxyPool.fromJson(
+            _map(jsonDecode(f.readAsStringSync())) ?? const {},
+          );
+          if (existing.allNodes.isNotEmpty) {
+            final stamp = DateTime.now().millisecondsSinceEpoch;
+            f.copySync('$p.before-wipe-$stamp');
+            stderr.writeln(
+              '[zeroapi] 警告：proxies.json 即将被一个 0 节点的池覆盖，'
+              '原文件已留档 $p.before-wipe-$stamp',
+            );
+          }
+        }
+      } catch (_) {
+        // 现场保护失败不阻塞正常保存
+      }
+    }
     final tmp = File('$p.tmp');
     tmp.writeAsStringSync(body, flush: true);
     try {
