@@ -373,6 +373,9 @@ class GatewayService extends ChangeNotifier {
   DateTime? _zenExhaustedUntil;
   Timer? _zenRecoveryTimer;
   bool _zenRecoveryProbing = false;
+
+  /// 本轮请求是否已试过直连出口（每请求一次；池候选耗尽后作为最后一档）。
+  bool _zenDirectTried = false;
   bool _zenRequestPreparing = false;
   int _zenRequestsActive = 0;
   bool _zenSyncPending = false;
@@ -403,6 +406,7 @@ class GatewayService extends ChangeNotifier {
 
   Future<void> _prepareZenRequest() async {
     _zenAttemptedNodes.clear();
+    _zenDirectTried = false;
     _zenRequestPreparing = true;
     try {
       await _serializeEgress(_prepareZenRequestNow);
@@ -912,6 +916,23 @@ class GatewayService extends ChangeNotifier {
               c.nodeId != failedNode,
         )
         .toList();
+    if (usable.isEmpty && !_zenDirectTried) {
+      // 池内候选耗尽：**先试直连再宣布烧穿**。家宽/FlClash 出口是独立于
+      // 机场池的另一个额度桶（2026-11-07 实测：机场节点报传输错误时直连
+      // OK 31.3s 跑通）。直连也失败才算整池烧穿。
+      _zenDirectTried = true;
+      server?.log('⟳ zen 池内候选耗尽，回退直连出口（家宽，独立额度桶）');
+      _zenCurrentNodeId.remove(upstreamId);
+      _setZenCliEgressEnv(rt.def, '');
+      await rt.restartChild();
+      await rt.ensure();
+      for (var i = 0; i < 40; i++) {
+        if (rt.health == UpstreamHealth.healthy) return true;
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (rt.health != UpstreamHealth.healthy) await rt.probe();
+      }
+      return rt.health == UpstreamHealth.healthy;
+    }
     if (usable.isEmpty) {
       // 没有可换的出口了：本轮全部撞上额度墙（或都已冷却）。记录整池烧穿
       // 的预计恢复时刻，后续请求快速失败（不再 6 轮轮换白等 2 分钟），由

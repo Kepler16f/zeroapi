@@ -19,7 +19,9 @@ Future<void> main(List<String> args) async {
   } else {
     proxy = mode;
   }
-  final port = 4600 + Random().nextInt(300);
+  // 端口取自毫秒时钟对 2000 求余（4600-6599），连发也不易撞；serve 起不来
+  // 时由下面的 serverUp 等待兜底报错。
+  final port = 4600 + (DateTime.now().millisecondsSinceEpoch % 2000);
   const pw = 'probe-pw';
   final root = Directory.systemTemp.createTempSync('oc-path-');
   final env = Map<String, String>.from(Platform.environment);
@@ -64,8 +66,16 @@ Future<void> main(List<String> args) async {
   proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((l) {
     if (l.contains('listening')) serverUp = true;
   });
-  for (var i = 0; i < 40 && !serverUp; i++) {
+  for (var i = 0; i < 60 && !serverUp; i++) {
     await Future<void>.delayed(const Duration(milliseconds: 250));
+  }
+  if (!serverUp) {
+    stdout.writeln('[$mode] SERVE-FAILED（未监听）');
+    proc.kill();
+    try {
+      root.deleteSync(recursive: true);
+    } catch (_) {}
+    return;
   }
   final sw = Stopwatch()..start();
   try {
