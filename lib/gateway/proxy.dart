@@ -226,7 +226,10 @@ class ProxyServer {
   /// 网关日志同时落盘（%APPDATA%\zeroapi\logs\gateway.log）：UI 面板里的
   /// 环形日志只有 200 行、且进程退出就没了——排查「为什么慢」这类问题需要
   /// 能回看完整时间线（各阶段耗时、出口轮换、额度判定）。
-  final IOSink? _logFile;
+  /// 网关日志文件句柄（同步追加写）。IOSink 的缓冲让「运行中 tail 日志」
+  /// 什么都看不到（排障致命），改用 RandomAccessFile 同步追加——日志量
+  /// 低（每请求几行），同步开销可忽略。写失败静默（不影响请求）。
+  RandomAccessFile? _logFile;
   String _usageDay = DateTime.now().toIso8601String().substring(0, 10);
 
   /// 未知模型时的自救：由 GatewayService 注入"重探全部上游 + 重建路由"。
@@ -418,12 +421,13 @@ class ProxyServer {
     final line = '[${DateTime.now().toIso8601String().substring(11, 19)}] $s';
     _logLines.add(line);
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
-    // 日志文件可能已被 stop() 关掉（多实例共享同一文件、或 stop 后仍有关联
-    // 请求在收尾）——写失败不能影响请求本身。
     try {
-      _logFile?.writeln(line);
+      final f = _logFile ??= _openLogFile();
+      if (f == null) return; // 文件打不开：静默降级为只有 UI 环形日志
+      // 句柄以 FileMode.append 打开：写天然追加到尾部
+      f.writeStringSync('$line\n');
     } catch (_) {
-      // 忽略
+      // 写失败（含 stop 后句柄已关）：不影响请求本身
     }
   }
 
@@ -437,8 +441,7 @@ class ProxyServer {
     List<GatewayKey>? keys,
     this.usageDir,
     this.onKeyUsed,
-  }) : keys = keys ?? [GatewayKey('默认', apiKey)],
-       _logFile = fileLogEnabled ? _openLogFile(usageDir) : null;
+  }) : keys = keys ?? [GatewayKey('默认', apiKey)];
 
   /// 网关日志落盘开关：**生产启动时**由 service 置 true。测试构造的
   /// ProxyServer（没有 usageDir 注入的）曾把测试日志写进真实的
@@ -446,20 +449,18 @@ class ProxyServer {
   /// 假实例），默认关闭。
   static bool fileLogEnabled = false;
 
-  /// 打开网关日志文件（追加写）。失败就静默降级为「只有 UI 环形日志」。
-  static IOSink? _openLogFile(String? usageDir) {
+  /// 惰性打开网关日志（追加写、同步刷盘可见）。打不开返回 null，
+  /// 静默降级为「只有 UI 环形日志」。
+  static RandomAccessFile? _openLogFile() {
     try {
-      final dir = usageDir ??
-          (Platform.isWindows
-              ? '${Platform.environment['APPDATA']}/zeroapi/logs'
-              : '${Platform.environment['HOME']}/.config/zeroapi/logs');
+      final dir = Platform.isWindows
+          ? '${Platform.environment['APPDATA']}/zeroapi/logs'
+          : '${Platform.environment['HOME']}/.config/zeroapi/logs';
       final d = Directory(dir);
       if (!d.existsSync()) d.createSync(recursive: true);
-      final sink = File('$dir/gateway.log').openWrite(mode: FileMode.append);
-      // IOSink 的写错误是**异步**投递的（writeln 不会同步抛），不接住就是
-      // 未处理异步错误——stop() 之后仍有请求收尾写日志时就会把用例搞崩。
-      sink.done.catchError((Object _) => sink);
-      return sink;
+      final f = File('$dir/gateway.log');
+      if (!f.existsSync()) f.createSync(recursive: true);
+      return f.openSync(mode: FileMode.append);
     } catch (_) {
       return null;
     }
@@ -536,11 +537,11 @@ class ProxyServer {
     // 日志文件句柄：本实例独占（openWrite 各自打开），关闭自己那个即可；
     // 关不掉也不影响停止流程（写失败已被 _log 吞掉）。
     try {
-      await _logFile?.flush();
-      await _logFile?.close();
+      _logFile?.closeSync();
     } catch (_) {
       // 忽略
     }
+    _logFile = null;
   }
 
   Future<void> _handle(HttpRequest req) async {
