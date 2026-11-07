@@ -570,9 +570,14 @@ void main() {
     injectRetry = null;
   });
 
-  test('六个出口均失败：返回错误，绝不发起第七次调用', () async {
+  test('出口全部失败：试满三级通路的 7 次尝试后如实报错', () async {
     // 额度按出口 IP 隔离（2026-11-05 实测：池里约一半出口有额度），
-    // 只试 3 次命中率不够——尝试预算放宽到 6 次。
+    // 只试 3 次命中率不够——尝试预算放宽。
+    //
+    // 上限必须与三级通路状态机的动作数对齐（2026-11-08 修正）：状态机
+    // 有 6 个动作（Worker 重连×2 + 机场换节点×3 + 直连×1）+ 1 个「全部
+    // 耗尽」动作 = 7 次轮换请求。旧的 5 次轮换 → **直连档从没被用过**，
+    // 且「全部耗尽」永远轮不到 → 「整池烧穿」快速失败从未生效。
     injectRetry = 'Cannot connect to API: Unable to connect';
     var rotations = 0;
     proxy.onRotateEgress = (_, _, _) async {
@@ -587,8 +592,15 @@ void main() {
     });
     final raw = await utf8.decodeStream(response);
     expect(response.statusCode, 502, reason: raw);
-    expect(rotations, 5, reason: '首发 + 5 次轮换 = 6 个出口');
-    expect(messageCount, 6);
+    expect(
+      rotations,
+      7,
+      reason: '必须给满状态机的 7 个动作（Worker×2 + 机场×3 + 直连 + 耗尽探测）；'
+          '旧的 5 次上限让直连档从未被用过、「全部耗尽」也永远轮不到',
+    );
+    // 测试桩恒返回 true（生产里第 7 次是「全部耗尽」→ false → 就此打住），
+    // 所以这里多一次尝试。
+    expect(messageCount, 8);
     injectRetry = null;
   });
 

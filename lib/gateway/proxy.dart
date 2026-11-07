@@ -1881,10 +1881,18 @@ class ProxyServer {
               (e.isQuotaExhausted ||
                   e.isConnectionFailure ||
                   (e.isStall && completion == 0));
-          // 三级通路轮换（Worker→机场→直连）的轮次预算由上层状态机管，
-          // 这里只限制循环上限防失控；失败类别（额度/传输）决定各档内
-          // 的动作（Worker 重连换 CF IP / 机场换节点冷却）。
-          if (round < 5 && !committed && !api.generationStarted && rotatable) {
+          // 三级通路轮换（Worker→机场→直连）的动作序列由上层状态机给出，
+          // 这里只限制循环上限防失控；失败类别（额度/传输）决定各档内的
+          // 动作（Worker 重连换 CF IP / 机场换节点冷却）。
+          //
+          // **上限必须与状态机的动作数对齐**：状态机有 6 个动作
+          // （Worker 重连×2 + 机场换节点×3 + 直连×1）再加一个
+          // 「全部耗尽」动作，共 7 次。旧的 `round < 5` 只给了 5 次轮换 →
+          // 直连档（家宽，独立额度桶）**从来没被用过**，而且「全部耗尽」
+          // 动作也永远轮不到 → 「整池烧穿」快速失败从未生效，每个请求都
+          // 白跑一整轮再报错（2026-11-08 装机态日志证实：每请求 6 个出口
+          // 全 free-limit，下个请求照样重来）。
+          if (round < 7 && !committed && !api.generationStarted && rotatable) {
             final retryAfter = e is OpenCodeUpstreamV2Error
                 ? (e.retryAfterMs == null ? null : (e.retryAfterMs! / 1000).ceil())
                 : null;
@@ -1927,7 +1935,7 @@ class ProxyServer {
                   : e.isStall
                   ? '出口挂死'
                   : '出口不可达';
-              _log('$publicName ⟳ 换出口后重试（$reason，第 ${round + 2}/6 个出口）');
+              _log('$publicName ⟳ 换出口后重试（$reason，第 ${round + 2} 个出口）');
               api.close();
               api = _newServeApi(u)
                 ..onRetry = ((msg) => _log('$publicName ⟳ CLI 重试上游失败：$msg'))

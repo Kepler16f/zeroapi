@@ -64,7 +64,12 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
   static Duration stallTimeout = const Duration(seconds: 90);
 
   /// 已开始输出/思考后，每次有效进展重置这个窗口。
-  static Duration generationIdleTimeout = const Duration(minutes: 10);
+  ///
+  /// 旧值 10 分钟太长：2026-11-08 装机态实测——机场档在 2s 内吐了首个
+  /// 增量（此后 600s 一个字没有，上游过载把流掐在半路），客户端苦等
+  /// 10 分钟才收到 `generation_idle_timeout`。流式生成里超过 3 分钟没新
+  /// 增量基本等于上游死了；再等下去只是让用户盯着转圈。
+  static Duration generationIdleTimeout = const Duration(minutes: 3);
 
   /// 单轮安全上限（wait 阻塞、SSE 长连接都受它兜底）。
   static Duration requestTimeout = const Duration(hours: 2);
@@ -334,6 +339,17 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
         armStall();
       }
 
+      /// 上游还在动，但**没有面向客户端的文本**（例如推理模型的
+      /// reasoning 增量）。只刷新看门狗、不置 generationStarted：
+      /// - 刷新：模型确实在思考，不能当死出口掐掉；
+      /// - 不置：客户端还没拿到任何文本，首字超时照旧生效。
+      ///
+      /// 刻意**不**响应心跳（server.heartbeat）——心跳只证明进程活着，
+      /// 11-04 教训：看门狗被心跳骗过导致无限挂 7 分钟。
+      void activity() {
+        armStall();
+      }
+
       /// 已吐出的文本（用于收尾时与终态消息对账）。
       final emittedText = StringBuffer();
 
@@ -430,6 +446,15 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
                   type == 'session.execution.started') {
                 // 有活动但非文本进展：不置 generationStarted、不刷新看门狗，
                 // 免得空转的 step 循环把停滞计时无限续命。
+                return;
+              }
+              if (type == 'session.reasoning.delta' ||
+                  type == 'session.reasoning.started' ||
+                  type == 'session.reasoning.ended') {
+                // 推理增量：模型确实在思考（上游还活着），刷新看门狗即可。
+                // 但**不**当作文本进展——客户端还没拿到内容，首字超时照旧。
+                final rd = data['delta'] as String? ?? '';
+                if (rd.isNotEmpty) activity();
                 return;
               }
               if (type == 'session.retry.scheduled') {

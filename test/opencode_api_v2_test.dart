@@ -16,6 +16,7 @@ class _TurnScript {
     this.sendUsage = false,
     this.endWithExecution = false,
     this.holdForever = false,
+    this.reasoningTicks = 0,
     this.heartbeat = false,
     this.removeWaitRoute = false,
     this.retryMessage,
@@ -40,6 +41,10 @@ class _TurnScript {
 
   /// 永不结束本轮（测停滞看门狗）。
   final bool holdForever;
+
+  /// 推理增量跳数（每 100ms 一跳）：模拟模型在思考、上游还活着，
+  /// 但没有任何面向客户端的文本。
+  final int reasoningTicks;
 
   /// 事件连接上周期性写 `: heartbeat` 注释行。
   final bool heartbeat;
@@ -419,6 +424,16 @@ class _FakeServe {
           'nextRetryAt': 0,
         });
         await Future<void>.delayed(const Duration(milliseconds: 15));
+      }
+    }
+    if (sc.reasoningTicks > 0) {
+      // 推理增量（模型在思考、上游还活着）：每 100ms 一跳，不含文本。
+      for (var k = 0; k < sc.reasoningTicks; k++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        push('session.reasoning.delta', {
+          'messageID': 'msg_a1',
+          'delta': 'thinking…',
+        });
       }
     }
     var ordinal = 0;
@@ -836,6 +851,35 @@ void main() {
       // serve 心跳每 40ms 一跳：若看门狗被注释行骗过，这里会挂到测试超时。
       expect(sw.elapsed, lessThan(const Duration(seconds: 5)));
       expect(r.chunks, isEmpty);
+    });
+
+    test('reasoning deltas keep the request alive (model is thinking)', () async {
+      // 2026-11-08 装机态教训：上游过载时流只吐了一个增量就断了，客户端
+      // 苦等 600s（生成空闲超时）才失败。修法之一：推理增量说明**上游还
+      // 活着**（模型在思考），必须刷新看门狗，不能当死出口掐掉。
+      final fake = _FakeServe();
+      fake.script = _TurnScript(holdForever: true, reasoningTicks: 6);
+      await fake.start();
+      OpenCodeApiV2.stallTimeout = const Duration(milliseconds: 400);
+      final api = OpenCodeApiV2(fake.baseUrl, password: 'test-pw');
+      addTearDown(() async {
+        api.close();
+        await fake.close();
+      });
+
+      final sw = Stopwatch()..start();
+      final r = await _drain(api.chat(model: 'big-pickle', messages: _msgs()));
+      sw.stop();
+      // 推理增量每 100ms 一跳、总时长超过 400ms 的看门狗窗口 →
+      // 请求**没有**被提前掐掉（掐掉的话耗时 ≈ 400ms）。
+      expect(sw.elapsed, greaterThan(const Duration(milliseconds: 600)));
+      expect(r.error, isA<OpenCodeUpstreamError>());
+      expect((r.error! as OpenCodeUpstreamError).isStall, isTrue);
+    });
+
+    test('生成空闲超时 = 3 分钟（不再是 10 分钟）', () {
+      // 2026-11-08：用户在客户端干等 11.5 分钟才收到 generation_idle_timeout。
+      expect(OpenCodeApiV2.generationIdleTimeout, const Duration(minutes: 3));
     });
 
     test('CJK prompt survives as utf-8 (latin1 regression guard)', () async {
