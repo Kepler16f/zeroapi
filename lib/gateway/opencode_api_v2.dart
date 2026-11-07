@@ -270,6 +270,11 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
     /// 重试（实测 10 次 / 148s），同一 IP 上第 5 次不会有不同结果。
     var transportRetries = 0;
     var sawFailed = false;
+
+    /// 本轮最后一次 CLI 重试的原因（provider.rate-limit / provider.transport…）。
+    /// 看门狗中止时用它补上下文：**上游过载**导致的停滞不是出口死了，
+    /// 不能据此冷却档位/判节点失败（换出口只是给上游恢复时间）。
+    String? lastRetryReason;
     Object? failure;
     StackTrace? failureStack;
     try {
@@ -302,11 +307,17 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
         final timeout = hasProgress ? generationIdleTimeout : stallTimeout;
         stall = Timer(timeout, () {
           if (done || finished.isCompleted || upstreamError.isCompleted) return;
+          // 上游过载时 CLI 只是在退避重试、没有输出 → 看门狗照样会掐。
+          // 把最后的重试原因带上：这样上层能分清「出口死了」与「上游在限流
+          // （所有出口都打同一个上游，换出口只是给它恢复时间）」。
+          final hint = lastRetryReason == null
+              ? ''
+              : '（上游最后报告：${lastRetryReason!.length > 160 ? '${lastRetryReason!.substring(0, 160)}…' : lastRetryReason}）';
           fail(
             OpenCodeUpstreamError(
               message: hasProgress
-                  ? 'opencode v2 CLI 已开始生成，但连续 ${timeout.inSeconds}s 无有效进展，正在停止本轮'
-                  : 'opencode v2 CLI ${timeout.inSeconds}s 无任何响应（未收到模型有效输出），正在停止本轮',
+                  ? 'opencode v2 CLI 已开始生成，但连续 ${timeout.inSeconds}s 无有效进展，正在停止本轮$hint'
+                  : 'opencode v2 CLI ${timeout.inSeconds}s 无任何响应（未收到模型有效输出），正在停止本轮$hint',
               statusCode: 504,
               stalled: true,
             ),
@@ -434,6 +445,7 @@ class OpenCodeApiV2 implements OpenCodeServeApi {
                     (data['message'] ?? data['reason'] ?? data['error'] ?? '')
                         .toString();
                 if (msg.isNotEmpty) {
+                  lastRetryReason = msg;
                   (onRetry ?? onRetryEvent)?.call(msg);
                 }
                 if (!generationStarted &&

@@ -1872,9 +1872,12 @@ class ProxyServer {
         } catch (e) {
           keepAlive?.cancel();
           if (clientDisconnected) return;
+          // 上游过载**也轮换**：所有出口都打同一个推理服务，换出口本身没用，
+          // 但轮换过程正好给上游恢复时间（实测 11-07 装机态：Worker 档
+          // 被过载拖死 → 轮换到机场档 → 上游恢复 → 请求成功）。真正不能
+          // 做的是「把出口判死」——那是 service 层按 failureKind 决定的。
           final rotatable =
               e is OpenCodeUpstreamError &&
-              !e.isUpstreamOverloaded &&
               (e.isQuotaExhausted ||
                   e.isConnectionFailure ||
                   (e.isStall && completion == 0));
@@ -1907,7 +1910,11 @@ class ProxyServer {
                 statusCode: code,
               );
             }
-            final failureKind = e.isQuotaExhausted ? 'quota' : 'transport';
+            final failureKind = e.isQuotaExhausted
+                ? 'quota'
+                : e.isUpstreamOverloaded
+                ? 'overload'
+                : 'transport';
             final rotated = await onRotateEgress?.call(
                   u.id,
                   retryAfter,
@@ -1955,24 +1962,9 @@ class ProxyServer {
       // 上游额度耗尽 → 429 rate_limit（客户端会退避重试）；
       // 其余上游错误 → 502。凭证/地域类不映射 4xx，避免客户端误判认证失败。
       if (e is OpenCodeUpstreamError) {
-        // 上游过载**先判**：CLI 放弃本轮时消息里带「已中止本轮」，会被
-        // isStall 命中 → 误报成 504 挂死。实际上它该报 429 限流。
-        if (e.isUpstreamOverloaded) {
-          return failJson({
-            'message':
-                'OpenCode 上游过载（${e.message}）。这是推理服务侧的容量问题，'
-                '与你的出口无关，换出口也不会变好；请稍后重试或换个模型。',
-            'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
-            'code': 'upstream_overloaded',
-          }, 429);
-        }
-        if (e.isStall) {
-          return failJson({
-            'message': e.message,
-            'type': anthropic ? 'api_error' : 'upstream_error',
-            'code': 'generation_idle_timeout',
-          }, 504);
-        }
+        // 判定顺序：额度 → 上游过载 → 挂死 → 连不通。
+        // 额度最具体（要换出口换 IP）；上游过载是推理服务侧的容量问题，
+        // 换出口只是给它恢复时间，报 429 让客户端退避重试；挂死才报 504。
         if (e.isQuotaExhausted) {
           // 额度按「最终到达 opencode.ai 的出口 IP × 天」计：这个出口烧穿了，
           // 换节点（换 IP）才有救。CLI 进程绑定了出口，得重启它才换 IP。
@@ -1991,6 +1983,23 @@ class ProxyServer {
             'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
             'code': 'free_quota_exhausted',
           }, 429);
+        }
+        if (e.isUpstreamOverloaded) {
+          return failJson({
+            'message':
+                'OpenCode 上游过载（${e.message}）。这是推理服务侧的容量问题，'
+                '与你的出口无关（换出口也不会变好，但能给它恢复时间）；'
+                '请稍后重试或换个模型。',
+            'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
+            'code': 'upstream_overloaded',
+          }, 429);
+        }
+        if (e.isStall) {
+          return failJson({
+            'message': e.message,
+            'type': anthropic ? 'api_error' : 'upstream_error',
+            'code': 'generation_idle_timeout',
+          }, 504);
         }
         if (e.isConnectionFailure) {
           // 出口连不通：如实报 502，并把「连不通」记到模型上（UI 可见）。

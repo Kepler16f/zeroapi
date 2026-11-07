@@ -920,6 +920,8 @@ class GatewayService extends ChangeNotifier {
     // 只冷却 **Worker 档**：它整档共用同一条 CF 通路，挂死多半是边缘 IP
     // 不行。机场档的挂死通常是「单个节点坏了」——换节点即可（下面已按
     // 节点记失败），不该把整档停掉。
+    // **'overload'（上游过载）不冷却**：所有出口都打同一个推理服务，
+    // 出口没坏（实测：Worker 档被过载拖死后换机场档就成功了）。
     final failedTier = _zenPlan.tier;
     if (failureKind == 'transport' && failedTier == ZenEgressTier.worker) {
       _markZenTierStalled(failedTier);
@@ -965,7 +967,8 @@ class GatewayService extends ChangeNotifier {
           );
         }
         // 额度耗尽的节点当天冷却（有 retryAfter 按时刻，没有整日拉黑）；
-        // 传输挂掉的节点记目标失败。
+        // 传输挂掉的节点记目标失败；**上游过载的节点不记任何失败**——
+        // 出口本身是好的（所有出口都打同一个推理服务），不能冤枉节点。
         final failedNode = _zenCurrentNodeId[upstreamId];
         if (failedNode != null) {
           if (failureKind == 'quota') {
@@ -977,7 +980,7 @@ class GatewayService extends ChangeNotifier {
             } else {
               pool.markQuotaSpent(failedNode);
             }
-          } else {
+          } else if (failureKind == 'transport') {
             pool.markTargetFailed(failedNode, purpose);
           }
         }

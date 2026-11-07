@@ -500,6 +500,38 @@ void main() {
     expect(body['error']['code'], 'upstream_overloaded');
   });
 
+  test('上游过载导致的停滞 → 仍轮换出口（给上游恢复时间），但不当成额度烧穿', () async {
+    // 装机态实测：Worker 档被过载拖到看门狗中止 → 轮换到机场档 → 上游
+    // 恢复 → 请求成功。轮换本身有用（只是买时间），但**不能**因此把出口
+    // 判死、也不能记成额度烧穿。
+    injectError =
+        'Upstream request failed: [overloaded] the server is overloaded; 已中止本轮';
+    var rotated = 0;
+    var quotaCalls = 0;
+    proxy.onRotateEgress = (id, _, _) async {
+      rotated++;
+      injectError = null;
+      return true;
+    };
+    proxy.onQuotaExhausted = (_, _) => quotaCalls++;
+    addTearDown(() {
+      proxy.onRotateEgress = null;
+      proxy.onQuotaExhausted = null;
+    });
+
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+      'stream': false,
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 200, reason: raw);
+    expect(rotated, 1, reason: '过载导致的停滞仍应轮换（给上游恢复时间）');
+    expect(quotaCalls, 0, reason: '过载不是额度耗尽');
+  });
+
   test('出口连不通 → 换出口失败时如实报 502', () async {
     injectError = 'Cannot connect to API: Unable to connect';
     proxy.onRotateEgress = (id, _, _) async => false;
