@@ -1247,7 +1247,11 @@ class GatewayService extends ChangeNotifier {
     }
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15)
-      ..userAgent = 'ZeroApi/0.2.1 (proxy subscription import)';
+      // **UA 必须装成 clash 客户端**：机场按 UA 决定返回格式——clash 系 UA
+      // 返回完整 YAML（81 节点），未知 UA 返回 base64 的「剩余流量」假节点
+      // （ss://…@127.0.0.1:443#剩余流量：xxx GB，实测 2026-11-07）。这是
+      // 订阅接口的标准约定，clash-verge / Clash Meta 等客户端都这么发。
+      ..userAgent = 'clash-verge/1.0';
     try {
       final req = await client.getUrl(uri);
       // 机场常见 302 → 真实地址；HttpClient 默认自动跟随重定向

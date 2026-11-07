@@ -809,10 +809,15 @@ class ProxyPool extends ChangeNotifier {
   void _noteWarnings(List<ProxyNode> nodes) {
     var socks = 0;
     var unusable = 0;
+    var loopback = 0;
     for (final n in nodes) {
       final t = n.type.toLowerCase();
       if (t == 'socks5' || t == 'socks') socks++;
       if (!n.dartUsable) unusable++;
+      final host = n.host.trim().toLowerCase();
+      if (host == '127.0.0.1' || host == 'localhost' || host == '::1') {
+        loopback++;
+      }
     }
     if (socks > 0) {
       warnings.add(
@@ -827,6 +832,15 @@ class ProxyPool extends ChangeNotifier {
         'trojan / hysteria2 / tuic）已入池：由随包 mihomo 内核逐个建立 127.0.0.1 '
         '本地出口后参与轮换；若内核缺失，请外置 HTTP 混合口（mihomo HTTP 7890，'
         '不是 SOCKS 7891）再导入 http://127.0.0.1:<端口>',
+      );
+    }
+    if (loopback > 0) {
+      // 常见来源：机场对非 clash UA 返回的「剩余流量」桩（ss://…@127.0.0.1:443
+      // #剩余流量：xxx GB，实测 2026-11-07）。真连出去只会连到本机。
+      warnings.add(
+        '$loopback 个节点指向本机回环地址（127.0.0.1/localhost）——'
+        '常见于机场对非 clash 客户端 UA 返回的「剩余流量」假节点桩，'
+        '若非有意添加本机中转，请用 clash 客户端 UA 重新拉取订阅',
       );
     }
   }
