@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -33,6 +34,27 @@ class OpenCode {
 
   /// hub 默认端口；被占用时顺延（最多试 11 个）。
   static const defaultPort = 4097;
+
+  /// 三级通路的 Worker 档（2026-11-07，用户指定顺序
+  /// Worker(CF 边缘 IP) → 机场节点 → 直连）：
+  /// CLI 的 provider baseURL 切到 Worker，opencode.ai 看到的是 CF 边缘
+  /// 出口 IP——同一机场节点断开重连即换 CF IP（10-22 实测：同节点连开
+  /// 12 条新连接全 200），不消耗机场节点的额度桶。
+  ///
+  /// Worker 由应用内「一键部署」创建（deploy/cloudflare-worker），转发
+  /// /inference/* 到 opencode.ai。v2 的推理端点族是 /inference/openai/v1。
+  static const workerBaseUrl =
+      'https://zeroapi-opencode-zen.2428556060.workers.dev';
+  static const workerInferenceBaseUrl = '$workerBaseUrl/inference/openai/v1';
+
+  /// Worker 档的 provider 注入（OPENCODE_CONFIG_CONTENT）：v2.2.5 实测遵守
+  /// （把 baseURL 指向必然拒绝的地址，CLI 立即报 ECONNREFUSED）。
+  static String workerConfigContent() => jsonEncode({
+    '\$schema': 'https://opencode.ai/config.json',
+    'provider': {
+      'opencode': {'options': {'baseURL': workerInferenceBaseUrl}},
+    },
+  });
 
   /// 免费档模型（2026-11-04 实测：上游现返回 9 个；10-25 的 7 个之后新增
   /// crouton-alpha-free、pulse-alpha-free）。这只是静态兜底清单，运行时

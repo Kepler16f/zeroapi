@@ -422,7 +422,7 @@ void main() {
   test('额度耗尽 → 换出口后同一请求重试并成功', () async {
     injectError = 'Free usage exceeded, subscribe to Go';
     var rotated = 0;
-    proxy.onRotateEgress = (id, _) async {
+    proxy.onRotateEgress = (id, _, _) async {
       rotated++;
       // 换到新出口后上游恢复正常（真实场景是换 IP 后额度可用）。
       injectError = null;
@@ -448,7 +448,7 @@ void main() {
     injectError = 'Cannot connect to API: Unable to connect';
     var rotated = 0;
     var quotaCalls = 0;
-    proxy.onRotateEgress = (id, _) async {
+    proxy.onRotateEgress = (id, _, _) async {
       rotated++;
       injectError = null;
       return true;
@@ -468,7 +468,7 @@ void main() {
 
   test('出口连不通 → 换出口失败时如实报 502', () async {
     injectError = 'Cannot connect to API: Unable to connect';
-    proxy.onRotateEgress = (id, _) async => false;
+    proxy.onRotateEgress = (id, _, _) async => false;
     addTearDown(() => proxy.onRotateEgress = null);
 
     final resp = await gw('/v1/chat/completions', {
@@ -486,7 +486,7 @@ void main() {
   test('前两个出口连接失败，第三个成功且不再轮换', () async {
     injectRetry = 'Cannot connect to API: Unable to connect';
     var rotations = 0;
-    proxy.onRotateEgress = (_, _) async {
+    proxy.onRotateEgress = (_, _, _) async {
       rotations++;
       if (rotations == 2) injectRetry = null;
       return true;
@@ -509,7 +509,7 @@ void main() {
     // 只试 3 次命中率不够——尝试预算放宽到 6 次。
     injectRetry = 'Cannot connect to API: Unable to connect';
     var rotations = 0;
-    proxy.onRotateEgress = (_, _) async {
+    proxy.onRotateEgress = (_, _, _) async {
       rotations++;
       return true;
     };
@@ -718,7 +718,7 @@ void main() {
       OpenCodeApi.generationIdleTimeout = const Duration(milliseconds: 500);
       addTearDown(() => OpenCodeApi.generationIdleTimeout = previous);
       var rotations = 0;
-      proxy.onRotateEgress = (_, _) async {
+      proxy.onRotateEgress = (_, _, _) async {
         rotations++;
         return true;
       };

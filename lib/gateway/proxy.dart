@@ -246,14 +246,18 @@ class ProxyServer {
   /// 上层据此对该出口做**定时冷却**（到点自动恢复），而不是整日拉黑。
   void Function(String upstreamId, int? retryAfterSeconds)? onQuotaExhausted;
 
-  /// 出口连不通 → 换出口并等新进程就绪。返回是否成功换到新出口。
-  /// 换成功后调用方可原样重发该请求。
+  /// 出口连不通 → 按三级通路（Worker→机场→直连）换出口并等新进程就绪。
+  /// 返回是否成功换到新出口，换成功后调用方可原样重发该请求。
   ///
-  /// [retryAfterSeconds]：v2 上游报告的确切恢复时刻（≈几小时后额度回来）。
-  /// 上层据此对该出口做**定时冷却**（到点自动恢复），而不是整日拉黑——
-  /// 免费额度按出口 IP 隔离，盲拉黑会把当天还能用的出口也废掉。
-  Future<bool> Function(String upstreamId, int? retryAfterSeconds)?
-      onRotateEgress;
+  /// [failureKind]：'quota'（额度耗尽）/ 'transport'（连不上或挂死）——
+  /// Worker 档的额度失败走「重连换 CF IP」（新连接≠旧 IP，无需换节点），
+  /// 机场档的额度失败冷却该节点；[retryAfterSeconds]：v2 上游报告的确切
+  /// 恢复时刻，供机场档定时冷却。
+  Future<bool> Function(
+    String upstreamId,
+    int? retryAfterSeconds,
+    String failureKind,
+  )? onRotateEgress;
   Future<void> Function()? onPrepareOpenCode;
   void Function()? onOpenCodeFinished;
 
@@ -1845,16 +1849,20 @@ class ProxyServer {
               (e.isQuotaExhausted ||
                   e.isConnectionFailure ||
                   (e.isStall && completion == 0));
-          // 额度按出口 IP 隔离（2026-11-05 实测：同一时刻同一模型，池里
-          // 30379/30380 有额度、30375/30376 没有）。池子有 77 个出口、
-          // 约一半带额度，只试 3 次命中率不够——放宽到 6 次，且优先挑
-          // 已验证有额度的出口。
+          // 三级通路轮换（Worker→机场→直连）的轮次预算由上层状态机管，
+          // 这里只限制循环上限防失控；失败类别（额度/传输）决定各档内
+          // 的动作（Worker 重连换 CF IP / 机场换节点冷却）。
           if (round < 5 && !committed && !api.generationStarted && rotatable) {
             final retryAfter = e is OpenCodeUpstreamV2Error
                 ? (e.retryAfterMs == null ? null : (e.retryAfterMs! / 1000).ceil())
                 : null;
-            final rotated =
-                await onRotateEgress?.call(u.id, retryAfter) ?? false;
+            final failureKind = e.isQuotaExhausted ? 'quota' : 'transport';
+            final rotated = await onRotateEgress?.call(
+                  u.id,
+                  retryAfter,
+                  failureKind,
+                ) ??
+                false;
             if (rotated) {
               final reason = e.isQuotaExhausted
                   ? '额度耗尽'

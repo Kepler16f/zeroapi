@@ -1,0 +1,118 @@
+// 三级通路状态机回归（2026-11-07，用户指定顺序）：
+// Worker（CF 边缘 IP，同节点重连）→ 机场节点 → 直连。
+import 'package:flutter_test/flutter_test.dart';
+import 'package:zeroapi/gateway/zen_egress_plan.dart';
+
+void main() {
+  test('额度耗尽：Worker 档先重连换 CF IP（预算 2 次）', () {
+    final plan = ZenEgressPlan();
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.workerReconnect,
+    );
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.workerReconnect,
+      reason: '第二次重连 = 再换一个 CF 边缘 IP',
+    );
+    // Worker 预算用尽 → 机场档
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.airportNext,
+    );
+  });
+
+  test('传输失败：Worker 档直接降机场档（同节点重连到不了 workers.dev）', () {
+    final plan = ZenEgressPlan();
+    expect(
+      plan.next(lastFailureKind: 'transport', airportHasCandidate: true),
+      ZenEgressAction.airportNext,
+      reason: '节点连 workers.dev 都不通，同节点重连无意义',
+    );
+  });
+
+  test('机场档额度耗尽：节点冷却并换下一个，3 次后降直连', () {
+    final plan = ZenEgressPlan();
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true); // worker#1
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true); // worker#2
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true); // airport#1
+    expect(plan.tier, ZenEgressTier.airport);
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.airportNext,
+    );
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.airportNext,
+    );
+    // 机场 3 次用尽 → 直连
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.direct,
+    );
+    expect(plan.tier, ZenEgressTier.direct);
+  });
+
+  test('直连额度耗尽：三档全部耗尽 → exhausted', () {
+    final plan = ZenEgressPlan();
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+    plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.direct,
+    );
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: false),
+      ZenEgressAction.exhausted,
+      reason: '直连也烧穿 = 全部桶耗尽',
+    );
+  });
+
+  test('机场无候选（全冷却）：Worker 烧完预算后跳过机场档直达直连', () {
+    final plan = ZenEgressPlan();
+    // Worker 重连与机场候选无关：CF IP 桶独立于机场节点
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+      ZenEgressAction.workerReconnect,
+    );
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: false),
+      ZenEgressAction.workerReconnect,
+      reason: '第 2 次重连 = 再换一个 CF 边缘 IP',
+    );
+    // Worker 预算用尽 → 机场档无候选 → 跳过 → 直连
+    expect(
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: false),
+      ZenEgressAction.direct,
+    );
+  });
+
+  test('直连不可用（家宽也挂）：Worker 烧完预算后直接 exhausted', () {
+    final plan = ZenEgressPlan();
+    plan.next(
+      lastFailureKind: 'quota',
+      airportHasCandidate: false,
+      directUsable: false,
+    );
+    expect(
+      plan.next(
+        lastFailureKind: 'quota',
+        airportHasCandidate: false,
+        directUsable: false,
+      ),
+      ZenEgressAction.workerReconnect,
+    );
+    expect(
+      plan.next(
+        lastFailureKind: 'quota',
+        airportHasCandidate: false,
+        directUsable: false,
+      ),
+      ZenEgressAction.exhausted,
+      reason: 'Worker 预算用尽 + 机场无候选 + 直连不可用 = 全部桶耗尽',
+    );
+  });
+}
