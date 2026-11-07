@@ -16,6 +16,18 @@ import 'socksrelay.dart';
 import 'upstream.dart';
 import 'zen.dart';
 
+/// 单个请求的**换出口墙钟预算**（毫秒）。
+///
+/// 三级通路（Worker→机场→直连）最多换 6 次出口，但每次尝试最坏要等
+/// 90s 首字看门狗 → 理论最坏 9 分钟「一直没反应」（用户实测「一个你好
+/// 两分钟没反应」「一直没反应好几分钟」）。这个上限让「试遍所有出口」
+/// 在可接受时间内收敛：超过就直接如实失败，并把「整池烧穿」记到上层，
+/// 后续请求快速失败而不是每次重跑一遍。
+///
+/// 150s 的取法：首字本身可能合法地慢到 ~90s（推理模型 big-pickle 实测
+/// 首字 51s），留 60s 给两三次**快速**额度轮换（额度错误 ~1-3s 就返回）。
+const int _zenRotationBudgetMs = 150000;
+
 /// 上游流在"尚未向客户端提交响应"前断裂——调用方可透明重试，客户端无感知
 class _ZenEarlyReset implements Exception {
   final String why;
@@ -261,6 +273,13 @@ class ProxyServer {
     int? retryAfterSeconds,
     String failureKind,
   )? onRotateEgress;
+
+  /// 换出口**墙钟预算用尽**（本轮所有出口都没能完成请求）→ 通知上层
+  /// 记下「整池烧穿」：后续请求快速失败，而不是每次都重跑一遍 6 轮轮换
+  /// （用户实测「一个你好两分钟」「好几分钟没反应」= 每轮都在等 90s 看门狗）。
+  Future<void> Function(String upstreamId, int? retryAfterSeconds)?
+  onEgressBudgetExhausted;
+
   Future<void> Function()? onPrepareOpenCode;
   void Function()? onOpenCodeFinished;
 
@@ -422,6 +441,9 @@ class ProxyServer {
     _logLines.add(line);
     if (_logLines.length > _maxLog) _logLines.removeAt(0);
     try {
+      // 端口 0 = 系统随机分配（测试实例约定），生产监听固定端口。
+      // 这种实例不落盘：否则测试痕迹会混进用户真实的 gateway.log。
+      if (port == 0) return;
       final f = _logFile ??= _openLogFile();
       if (f == null) return; // 文件打不开：静默降级为只有 UI 环形日志
       // 句柄以 FileMode.append 打开：写天然追加到尾部
@@ -441,21 +463,23 @@ class ProxyServer {
     List<GatewayKey>? keys,
     this.usageDir,
     this.onKeyUsed,
+    this.logDir,
   }) : keys = keys ?? [GatewayKey('默认', apiKey)];
 
-  /// 网关日志落盘开关：**生产启动时**由 service 置 true。测试构造的
-  /// ProxyServer（没有 usageDir 注入的）曾把测试日志写进真实的
-  /// `%APPDATA%\zeroapi\logs\gateway.log`（用户排障时看到一堆端口 0 的
-  /// 假实例），默认关闭。
-  static bool fileLogEnabled = false;
+  /// 网关日志落盘目录（null = 不落盘）。
+  ///
+  /// **实例级**而非静态开关：测试直接 new ProxyServer 时若跟着生产实例
+  /// 落盘，会把「监听 127.0.0.1:0」这类测试实例日志写进用户真实的
+  /// gateway.log，污染排障现场（2026-11-07 连续踩两次）。只有生产实例
+  /// 显式传目录才落盘。
+  final String? logDir;
 
   /// 惰性打开网关日志（追加写、同步刷盘可见）。打不开返回 null，
   /// 静默降级为「只有 UI 环形日志」。
-  static RandomAccessFile? _openLogFile() {
+  RandomAccessFile? _openLogFile() {
+    final dir = logDir;
+    if (dir == null || dir.isEmpty) return null;
     try {
-      final dir = Platform.isWindows
-          ? '${Platform.environment['APPDATA']}/zeroapi/logs'
-          : '${Platform.environment['HOME']}/.config/zeroapi/logs';
       final d = Directory(dir);
       if (!d.existsSync()) d.createSync(recursive: true);
       final f = File('$dir/gateway.log');
@@ -1819,6 +1843,9 @@ class ProxyServer {
     }
 
     try {
+      // 换出口的墙钟预算：从第一次尝试开始计时（含首字等待），
+      // 超过 _zenRotationBudgetMs 就不再换出口，如实失败。
+      final rotBudget = Stopwatch()..start();
       for (var round = 0; ; round++) {
         try {
           await attempt();
@@ -1857,6 +1884,27 @@ class ProxyServer {
             final retryAfter = e is OpenCodeUpstreamV2Error
                 ? (e.retryAfterMs == null ? null : (e.retryAfterMs! / 1000).ceil())
                 : null;
+            // **墙钟预算**：只限轮次不够——每轮最坏要等 90s 看门狗，
+            // 6 轮 = 9 分钟「一直没反应」（用户实测「好几分钟没反应」）。
+            // 超过预算就不再换出口，如实失败，并通知上层记下「整池烧穿」，
+            // 让后续请求快速失败而不是每次重跑一遍轮换。
+            if (rotBudget.elapsedMilliseconds > _zenRotationBudgetMs) {
+              final secs = rotBudget.elapsedMilliseconds ~/ 1000;
+              _log(
+                '$publicName ✗ 换出口预算用尽（${secs}s 内未恢复），停止重试',
+              );
+              await onEgressBudgetExhausted?.call(u.id, retryAfter);
+              // 沿用原始错误的语义：额度类仍是 429（客户端按限流自动重试），
+              // 其余按网关超时 504。
+              final code = e.statusCode ?? 504;
+              throw OpenCodeUpstreamError(
+                message:
+                    '换出口重试 ${secs}s 仍未成功：Worker/机场/直连三档都无法'
+                    '完成本次请求（可能是免费额度被共享出口的其他用户耗尽，'
+                    '或出口全不可达）。请稍后重试，或在设置页更换 zen 出口。',
+                statusCode: code,
+              );
+            }
             final failureKind = e.isQuotaExhausted ? 'quota' : 'transport';
             final rotated = await onRotateEgress?.call(
                   u.id,

@@ -23,11 +23,23 @@ import 'zen_egress_plan.dart';
 
 /// 聚合所有组件的应用级服务，向 UI 广播状态变化
 class GatewayService extends ChangeNotifier {
-  GatewayService() : config = GatewayConfig.load(), _initializeProviders = true;
+  GatewayService()
+    : config = GatewayConfig.load(),
+      _initializeProviders = true,
+      _fileLog = true;
 
   /// 网关监听顺序测试只使用内存配置，不接触真实号池、配置或代理内核。
+  ///
+  /// 也不落盘网关日志：测试实例监听 127.0.0.1:0，若跟着写用户的真实
+  /// gateway.log，会把「监听 http://127.0.0.1:0/v1」这类测试痕迹混进
+  /// 排障现场（2026-11-07 连续踩两次，害我误判现场）。
   @visibleForTesting
-  GatewayService.listenerTest(this.config) : _initializeProviders = false;
+  GatewayService.listenerTest(this.config)
+    : _initializeProviders = false,
+      _fileLog = false;
+
+  /// 是否把网关日志落盘到用户目录（仅生产实例 true）。
+  final bool _fileLog;
 
   GatewayConfig config;
   final bool _initializeProviders;
@@ -86,6 +98,8 @@ class GatewayService extends ChangeNotifier {
             allowLan: config.allowLan,
             keys: config.keys,
             onKeyUsed: _touchKey,
+            // 生产实例才落盘网关日志（测试实例不写用户的真实日志文件）
+            logDir: _fileLog ? _zenLogDir : null,
           )
           ..onUnknownModel = _refreshRoutes
           ..onIpBan = (id) {
@@ -95,12 +109,12 @@ class GatewayService extends ChangeNotifier {
           ..onPrepareOpenCode = _prepareZenRequest
           ..onOpenCodeFinished = _finishZenRequest
           ..onOpenCodeSuccess = _markZenQuotaOk
-          ..onRotateEgress = (id, retryAfterSeconds, failureKind) =>
-              _serializeEgress(
-              () => _rotateZenEgressAndWait(id, retryAfterSeconds, failureKind),
-            );
+          ..onRotateEgress =
+              ((id, retryAfterSeconds, failureKind) => _serializeEgress(
+                () => _rotateZenEgressAndWait(id, retryAfterSeconds, failureKind),
+              ))
+          ..onEgressBudgetExhausted = _markZenEgressBudgetExhausted;
     try {
-      ProxyServer.fileLogEnabled = true; // 生产实例才落盘网关日志
       await server!.start();
       running = true;
       _notify();
@@ -175,7 +189,7 @@ class GatewayService extends ChangeNotifier {
       'https://opencode.ai/',
     );
     // zen 池绑定孤儿自动修复（分组被删过 → 绑定丢了 → 三级轮换被绕过）
-    if (proxies != null) _ensureZenPoolBinding(proxies!);
+    if (proxies != null) ensureZenPoolBinding(proxies!);
     // 加密协议节点（ss/vmess/vless/trojan/hysteria2/tuic）交给随包 mihomo：
     // 每个节点一个 127.0.0.1 HTTP listener，端口写回 pool.corePorts。
     await ProxyCore.instance.sync(proxies!);
@@ -364,6 +378,34 @@ class GatewayService extends ChangeNotifier {
   /// 三级通路轮换状态机（Worker → 机场 → 直连，用户指定顺序）。
   ZenEgressPlan _zenPlan = ZenEgressPlan();
 
+  /// **档位冷却**：某档刚挂死（传输失败/停滞）时，短时间内不再从这档起步。
+  /// 挂死的档每次都要白等一轮 90s 看门狗（用户实测「一个你好两分钟没反应」
+  /// = 第一档挂死 → 90s → 才换档）。额度耗尽**不**冷却：Worker 额度用完
+  /// 重连就能换 CF 边缘 IP，值得再试。
+  final Map<ZenEgressTier, DateTime> _zenTierCooldown = {};
+
+  /// 档位冷却时长（挂死后多久再从这档起步）。
+  static const _zenTierCooldownSec = 5 * 60;
+
+  /// 当前处于冷却中的档位（已过期的不算）。
+  Set<ZenEgressTier> _zenSkippedTiers() {
+    final now = DateTime.now();
+    _zenTierCooldown.removeWhere((_, until) => until.isBefore(now));
+    return _zenTierCooldown.keys.toSet();
+  }
+
+  /// 记录某档挂死：冷却 5 分钟，期间的新请求直接从下一档起步。
+  void _markZenTierStalled(ZenEgressTier tier) {
+    final until = DateTime.now().add(
+      const Duration(seconds: _zenTierCooldownSec),
+    );
+    _zenTierCooldown[tier] = until;
+    server?.log(
+      'Zen ${tier.name} 档挂死，冷却 '
+      '${_zenTierCooldownSec ~/ 60} 分钟（期间请求直接从下一档起步）',
+    );
+  }
+
   /// **当前 CLI 正在用的出口节点 id**（直接记录，不再从 env 里的代理 URL
   /// 反查候选列表）。Worker/直连档无对应池节点（CF 边缘 IP / 家宽）。
   final Map<String, String> _zenCurrentNodeId = {};
@@ -416,7 +458,8 @@ class GatewayService extends ChangeNotifier {
 
   Future<void> _prepareZenRequest() async {
     _zenAttemptedNodes.clear();
-    _zenPlan = ZenEgressPlan(); // 每请求重开一轮三档轮换
+    // 每请求重开一轮三档轮换；刚挂死的档位直接跳过（不白等 90s 看门狗）
+    _zenPlan = ZenEgressPlan(skipTiers: _zenSkippedTiers());
     _zenRequestPreparing = true;
     try {
       await _serializeEgress(_prepareZenRequestNow);
@@ -502,6 +545,9 @@ class GatewayService extends ChangeNotifier {
       // 初始档 = Worker：出口 IP 归 CF 边缘池，同一节点断开重连即换 CF IP
       // （10-22 实测 12 连接全 200），不消耗机场节点的额度桶。机场档的
       // quotaOk 优先在此仍适用——隧道节点选已验证可用的最稳。
+      //
+      /// 例外：Worker 档刚挂死且在冷却中 → 这一轮直接从机场档起步，
+      /// 不再白等一轮 90s 首字看门狗（用户实测「一个你好两分钟没反应」）。
       final verified = candidates
           .where((c) => c.nodeId != null && pool.isQuotaOk(c.nodeId!))
           .toList();
@@ -512,10 +558,16 @@ class GatewayService extends ChangeNotifier {
         _zenWorkerTunnelNode[rt.id] = selected.nodeId!;
       }
       final url = _zenCandidateUrl(selected);
-      if (_setZenTierEnv(rt, ZenEgressTier.worker, url)) {
+      final startTier = _zenPlan.tier;
+      if (_setZenTierEnv(rt, startTier, url)) {
         await rt.restartChild();
       }
-      server?.log('Zen Worker 档（CF 边缘 IP）→ 隧道 ${selected.nodeId}');
+      server?.log(
+        startTier == ZenEgressTier.worker
+            ? 'Zen Worker 档（CF 边缘 IP）→ 隧道 ${selected.nodeId}'
+            : 'Zen 机场档起步 → ${selected.nodeId}'
+                  '（Worker 档冷却中，不再从它起步）',
+      );
       await rt.ensure();
     }
     // 出口是否可用：CLI 进程活着就说明代理口是通的（进程启动时已经连上过）。
@@ -863,6 +915,15 @@ class GatewayService extends ChangeNotifier {
     if (!upstreamUsesPool(upstreamId)) return false;
 
     final purpose = ProxyPool.pUpstream(upstreamId);
+    // 挂死（传输失败）的档位先记下来：冷却 5 分钟，期间的新请求直接从
+    // 下一档起步，不再在这个死档上白等一轮 90s 看门狗。
+    // 只冷却 **Worker 档**：它整档共用同一条 CF 通路，挂死多半是边缘 IP
+    // 不行。机场档的挂死通常是「单个节点坏了」——换节点即可（下面已按
+    // 节点记失败），不该把整档停掉。
+    final failedTier = _zenPlan.tier;
+    if (failureKind == 'transport' && failedTier == ZenEgressTier.worker) {
+      _markZenTierStalled(failedTier);
+    }
     final action = _zenPlan.next(
       lastFailureKind: failureKind,
       airportHasCandidate: _zenAirportHasNext(upstreamId, purpose),
@@ -965,20 +1026,37 @@ class GatewayService extends ChangeNotifier {
     }
   }
 
-  /// zen 池绑定孤儿检查：zen 走池但 `upstream:zen` 的绑定不存在（用户删过
-  /// 分组——removeGroup 会把指向它的用途绑定一起清掉，重新导入不会恢复），
-  /// 且池里**恰好只有一个订阅分组**时，自动重新绑定。没有绑定 = 三级轮换
-  /// 整个被绕过，zen 静默直连家宽（2026-11-07 用户实测「删了重新导入也不行」
-  /// 的直接机制）。多个订阅分组时不猜（让用户在代理页手动选）。
-  void _ensureZenPoolBinding(ProxyPool pool) {
+  /// zen 池绑定孤儿检查：zen 走池但 `upstream:zen` 的绑定失效（用户删过
+  /// 分组——removeGroup 会把指向它的用途绑定一起清掉，重新导入不会恢复；
+  /// 或绑定指向已删除的分组，groupFor 返回 null），且池里**恰好只有一个
+  /// 订阅分组**时，自动重新绑定。没有绑定 = 三级轮换整个被绕过，zen 静默
+  /// 直连家宽（2026-11-07 用户实测「删了重新导入也不行」的直接机制）。
+  /// 多个订阅分组时不猜（让用户在代理页手动选）。
+  ///
+  /// 判定只用 [config]，**不依赖运行时实例**：本方法在 bootstrap 里
+  /// 早于运行时创建调用，早期版本按「runtime 存在吗」判断 → 永远拿不到
+  /// runtime → 修复从未生效（2026-11-07 实测：池里 89 个节点躺着，
+  /// assignments 里却没有 upstream:zen，zen 一直直连）。
+  void ensureZenPoolBinding(ProxyPool pool) {
     final purpose = ProxyPool.pUpstream(OpenCode.id);
-    if (pool.assignments.containsKey(purpose)) return;
-    final rt = _runtimes.where((r) => r.isOpenCode).firstOrNull;
-    if (rt == null || !rt.def.enabled) return;
+    // 绑定仍然有效 → 什么都不用做
+    if (pool.groupFor(purpose) != null) return;
+    // 用户显式关掉了「zen 走池」→ 尊重用户选择，不自动绑回
+    if (pool.isEnabled(purpose) == false) return;
+    final zenDef = config.upstreams.where((u) => u.id == OpenCode.id).firstOrNull;
+    if (zenDef == null || !zenDef.enabled) return;
     final subs = pool.groups
         .where((g) => g.sourceUrl.trim().isNotEmpty && g.nodes.isNotEmpty)
         .toList();
-    if (subs.length != 1) return;
+    if (subs.length != 1) {
+      if (subs.length > 1) {
+        server?.log(
+          'Zen 池绑定缺失，且池里有 ${subs.length} 个订阅分组，无法自动判断用哪个；'
+          '请在代理页为 zen 选择出口分组（不选则 zen 直连、三级轮换不生效）',
+        );
+      }
+      return;
+    }
     pool.assignments[purpose] = subs.single.name;
     pool.save();
     server?.log(
@@ -1013,8 +1091,7 @@ class GatewayService extends ChangeNotifier {
   }
 
   /// 机场档耗尽后的收尾：先直连（独立额度桶），直连也失败才记整池烧穿。
-  Future<bool> _rotateDirectOrExhaust(
-    UpstreamRuntime rt,
+  Future<bool> _rotateDirectOrExhaust(    UpstreamRuntime rt,
     String upstreamId,
     String failureKind,
     int? retryAfterSeconds,
@@ -1052,8 +1129,43 @@ class GatewayService extends ChangeNotifier {
     return false;
   }
 
+  /// 换出口墙钟预算用尽（网关层判定）：本轮所有出口都没能完成请求。
+  /// 记下「整池烧穿 + 恢复时刻」，让后续请求**快速失败**而不是每次都
+  /// 重跑一遍 6 轮轮换（每轮最坏等 90s 看门狗 → 用户看到的是「一个你好
+  /// 两分钟没反应」）。恢复由后台探测在到点后自动解除。
+  Future<void> _markZenEgressBudgetExhausted(
+    String upstreamId,
+    int? retryAfterSeconds,
+  ) async {
+    final wait = retryAfterSeconds ?? 30 * 60;
+    final until = DateTime.now().add(
+      Duration(seconds: wait.clamp(60, 12 * 3600)),
+    );
+    if (_zenExhaustedUntil != null &&
+        _zenExhaustedUntil!.isAfter(DateTime.now())) {
+      return; // 已有更晚的恢复点，保留
+    }
+    _zenExhaustedUntil = until;
+    server?.log(
+      'Zen 换出口预算用尽：本轮三级通路都没能完成请求。已暂停重试，'
+      '预计 ${until.hour.toString().padLeft(2, '0')}:'
+      '${until.minute.toString().padLeft(2, '0')} 前后自动恢复探测；'
+      '期间请求会快速失败（不再每次重跑整轮轮换）',
+    );
+    _scheduleZenRecoveryProbe(until);
+  }
+
   /// 接入 OpenCode CLI 供应商（TLS 指纹通路）。
   /// 成功返回 null；找不到运行时返回给 UI 展示的原因（UI 据此引导下载）。
+  /// 网关日志目录（生产实例）。null = 不落盘。
+  String? get _zenLogDir {
+    final base = Platform.isWindows
+        ? Platform.environment['APPDATA']
+        : '${Platform.environment['HOME']}/.config';
+    if (base == null || base.isEmpty) return null;
+    return '$base/zeroapi/logs';
+  }
+
   Future<String?> addOpenCode() async {
     if (config.upstreams.any((u) => u.id == OpenCode.id)) {
       return 'OpenCode CLI 已在供应商列表中';

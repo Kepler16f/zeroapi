@@ -35,12 +35,22 @@ enum ZenEgressAction {
 }
 
 class ZenEgressPlan {
-  ZenEgressPlan();
+  ZenEgressPlan({this.skipTiers = const {}}) {
+    // 档位冷却：某档刚刚挂死（传输失败）时，本轮直接从下一档起步，
+    // 免得每个请求都先在死档上白等一轮 90s 看门狗（用户实测「一个你好
+    // 两分钟没反应」= 第一档挂死 → 90s → 才换档）。
+    if (skipTiers.contains(ZenEgressTier.worker)) {
+      tier = ZenEgressTier.airport;
+    }
+  }
 
   ZenEgressTier tier = ZenEgressTier.worker;
   int workerAttempts = 0;
   int airportAttempts = 0;
   bool directTried = false;
+
+  /// 本轮要跳过的档位（调用方传入「刚挂死、冷却中」的档位）。
+  final Set<ZenEgressTier> skipTiers;
 
   /// 机场档在本轮的尝试预算（ Worker 2 次 + 机场 3 次 + 直连 1 次 = 6 轮，
   /// 与既有「最多 6 个出口」的总预算一致）。
@@ -60,18 +70,23 @@ class ZenEgressPlan {
     if (tier == ZenEgressTier.worker) {
       // 额度耗尽 → 重连换 CF IP；传输失败 → 该节点到不了 workers.dev，
       // 重连无意义，直接降档。
-      if (lastFailureKind == 'quota' && workerAttempts < workerBudget) {
+      if (lastFailureKind == 'quota' &&
+          workerAttempts < workerBudget &&
+          !skipTiers.contains(ZenEgressTier.worker)) {
         workerAttempts++;
         return ZenEgressAction.workerReconnect;
       }
       tier = ZenEgressTier.airport;
     }
     if (tier == ZenEgressTier.airport) {
-      if (airportAttempts < airportBudget && airportHasCandidate) {
+      if (skipTiers.contains(ZenEgressTier.airport)) {
+        tier = ZenEgressTier.direct;
+      } else if (airportAttempts < airportBudget && airportHasCandidate) {
         airportAttempts++;
         return ZenEgressAction.airportNext;
+      } else {
+        tier = ZenEgressTier.direct;
       }
-      tier = ZenEgressTier.direct;
     }
     if (tier == ZenEgressTier.direct && !directTried && directUsable) {
       directTried = true;

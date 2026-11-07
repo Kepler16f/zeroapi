@@ -115,4 +115,47 @@ void main() {
       reason: 'Worker 预算用尽 + 机场无候选 + 直连不可用 = 全部桶耗尽',
     );
   });
+
+  group('档位冷却（挂死后不再从死档起步）', () {
+    test('Worker 档在冷却中 → 本轮直接从机场档起步', () {
+      final plan = ZenEgressPlan(
+        skipTiers: {ZenEgressTier.worker},
+      );
+      expect(plan.tier, ZenEgressTier.airport);
+      expect(
+        plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+        ZenEgressAction.airportNext,
+        reason: '跳过挂死的 Worker 档，直接换机场节点',
+      );
+    });
+
+    test('冷却中的 Worker 档遇到额度失败也不重连（省 90s 看门狗）', () {
+      final plan = ZenEgressPlan(skipTiers: {ZenEgressTier.worker});
+      expect(
+        plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+        ZenEgressAction.airportNext,
+      );
+    });
+
+    test('机场档在冷却中 → 直接降直连档', () {
+      final plan = ZenEgressPlan(skipTiers: {ZenEgressTier.airport});
+      // 构造到机场档：先让 Worker 走完额度预算
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+      plan.next(lastFailureKind: 'quota', airportHasCandidate: true);
+      expect(
+        plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+        ZenEgressAction.direct,
+        reason: '机场档挂死 → 不再试机场节点，直接直连',
+      );
+    });
+
+    test('未冷却时行为不变（默认档仍是 Worker）', () {
+      final plan = ZenEgressPlan();
+      expect(plan.tier, ZenEgressTier.worker);
+      expect(
+        plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+        ZenEgressAction.workerReconnect,
+      );
+    });
+  });
 }
