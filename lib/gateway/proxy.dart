@@ -1874,6 +1874,7 @@ class ProxyServer {
           if (clientDisconnected) return;
           final rotatable =
               e is OpenCodeUpstreamError &&
+              !e.isUpstreamOverloaded &&
               (e.isQuotaExhausted ||
                   e.isConnectionFailure ||
                   (e.isStall && completion == 0));
@@ -1900,8 +1901,9 @@ class ProxyServer {
               throw OpenCodeUpstreamError(
                 message:
                     '换出口重试 ${secs}s 仍未成功：Worker/机场/直连三档都无法'
-                    '完成本次请求（可能是免费额度被共享出口的其他用户耗尽，'
-                    '或出口全不可达）。请稍后重试，或在设置页更换 zen 出口。',
+                    '完成本次请求（可能是上游过载、免费额度被共享出口的其他'
+                    '用户耗尽，或出口全不可达）。请稍后重试，或在设置页更换 '
+                    'zen 出口。',
                 statusCode: code,
               );
             }
@@ -1953,6 +1955,17 @@ class ProxyServer {
       // 上游额度耗尽 → 429 rate_limit（客户端会退避重试）；
       // 其余上游错误 → 502。凭证/地域类不映射 4xx，避免客户端误判认证失败。
       if (e is OpenCodeUpstreamError) {
+        // 上游过载**先判**：CLI 放弃本轮时消息里带「已中止本轮」，会被
+        // isStall 命中 → 误报成 504 挂死。实际上它该报 429 限流。
+        if (e.isUpstreamOverloaded) {
+          return failJson({
+            'message':
+                'OpenCode 上游过载（${e.message}）。这是推理服务侧的容量问题，'
+                '与你的出口无关，换出口也不会变好；请稍后重试或换个模型。',
+            'type': anthropic ? 'rate_limit_error' : 'rate_limit_exceeded',
+            'code': 'upstream_overloaded',
+          }, 429);
+        }
         if (e.isStall) {
           return failJson({
             'message': e.message,

@@ -466,6 +466,40 @@ void main() {
     expect(quotaCalls, 0);
   });
 
+  test('上游过载 → 快速 429，不做换出口轮换（所有出口打同一个上游）', () async {
+    injectError =
+        'Upstream request failed: [overloaded] the server is overloaded; retry shortly';
+    var rotated = 0;
+    var quotaCalls = 0;
+    proxy.onRotateEgress = (id, _, _) async {
+      rotated++;
+      return true;
+    };
+    proxy.onQuotaExhausted = (_, _) => quotaCalls++;
+    addTearDown(() {
+      proxy.onRotateEgress = null;
+      proxy.onQuotaExhausted = null;
+    });
+
+    final resp = await gw('/v1/chat/completions', {
+      'model': 'zen/big-pickle',
+      'messages': [
+        {'role': 'user', 'content': 'ping'},
+      ],
+      'stream': false,
+    });
+    final raw = await utf8.decodeStream(resp);
+    expect(resp.statusCode, 429, reason: raw);
+    expect(
+      rotated,
+      0,
+      reason: '上游过载不是出口问题——换出口无用，不该白等一轮 90s 看门狗',
+    );
+    expect(quotaCalls, 0, reason: '过载不是额度耗尽，不能记成整池烧穿');
+    final body = jsonDecode(raw);
+    expect(body['error']['code'], 'upstream_overloaded');
+  });
+
   test('出口连不通 → 换出口失败时如实报 502', () async {
     injectError = 'Cannot connect to API: Unable to connect';
     proxy.onRotateEgress = (id, _, _) async => false;

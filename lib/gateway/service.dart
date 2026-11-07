@@ -1137,7 +1137,9 @@ class GatewayService extends ChangeNotifier {
     String upstreamId,
     int? retryAfterSeconds,
   ) async {
-    final wait = retryAfterSeconds ?? 30 * 60;
+    // 预算用尽 ≠ 额度烧穿：常见成因是上游过载/网络抖动（几分钟内就恢复），
+    // 所以默认只锁 5 分钟，后台探测每 4 分钟试一次，恢复了立刻解除。
+    final wait = retryAfterSeconds ?? 5 * 60;
     final until = DateTime.now().add(
       Duration(seconds: wait.clamp(60, 12 * 3600)),
     );
@@ -1147,8 +1149,9 @@ class GatewayService extends ChangeNotifier {
     }
     _zenExhaustedUntil = until;
     server?.log(
-      'Zen 换出口预算用尽：本轮三级通路都没能完成请求。已暂停重试，'
-      '预计 ${until.hour.toString().padLeft(2, '0')}:'
+      'Zen 换出口预算用尽：本轮三级通路都没能完成请求（可能是上游过载或'
+      '出口全部不可达）。已暂停重试，预计 '
+      '${until.hour.toString().padLeft(2, '0')}:'
       '${until.minute.toString().padLeft(2, '0')} 前后自动恢复探测；'
       '期间请求会快速失败（不再每次重跑整轮轮换）',
     );

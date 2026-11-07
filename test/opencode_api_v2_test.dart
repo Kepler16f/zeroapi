@@ -1003,4 +1003,50 @@ void main() {
       expect(OpenCodeApiV2.completionGrace, isNotNull);
     });
   });
+
+  group('上游过载分类（换出口无用，应快速失败）', () {
+    test('provider.rate-limit → isUpstreamOverloaded', () {
+      const e = OpenCodeUpstreamV2Error(
+        message: 'Upstream request failed: [overloaded] the server is overloaded',
+        errorType: 'provider.rate-limit',
+        statusCode: 429,
+      );
+      expect(e.isUpstreamOverloaded, isTrue);
+      expect(
+        e.isQuotaExhausted,
+        isFalse,
+        reason: '过载不是额度耗尽——不能记成整池烧穿',
+      );
+    });
+
+    test('文案里带 overloaded 也算过载', () {
+      const e = OpenCodeUpstreamV2Error(
+        message: 'Upstream request failed: [overloaded] the server is overloaded',
+      );
+      expect(e.isUpstreamOverloaded, isTrue);
+    });
+
+    test('额度耗尽不算过载（仍要换出口）', () {
+      const e = OpenCodeUpstreamV2Error(
+        message: 'Free usage limit reached.',
+        errorType: 'provider.free-limit',
+      );
+      expect(e.isUpstreamOverloaded, isFalse);
+      expect(e.isQuotaExhausted, isTrue);
+    });
+
+    test('传输失败不算过载（仍要换出口）', () {
+      const e = OpenCodeUpstreamV2Error(
+        message: 'connect ECONNREFUSED',
+        errorType: 'provider.transport',
+      );
+      expect(e.isUpstreamOverloaded, isFalse);
+      expect(e.isConnectionFailure, isTrue);
+    });
+
+    test('基类默认不判过载（v1 适配器走原逻辑）', () {
+      const e = OpenCodeUpstreamError(message: 'boom');
+      expect(e.isUpstreamOverloaded, isFalse);
+    });
+  });
 }

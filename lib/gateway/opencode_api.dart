@@ -666,6 +666,14 @@ class OpenCodeUpstreamError implements Exception {
   bool get isStall =>
       stalled || message.contains('无任何响应') || message.contains('已中止本轮');
 
+  /// **上游过载**（推理服务侧容量不足，非出口问题）：所有出口都打同一个
+  /// 上游，换出口无用 → 应快速失败而不是轮换一轮（每个死路 90s）。
+  /// v2 适配器按结构化 error.type 覆盖本判定（更准），这里兜底文案判定。
+  bool get isUpstreamOverloaded {
+    final m = message.toLowerCase();
+    return m.contains('overloaded') || m.contains('server is overloaded');
+  }
+
   @override
   String toString() => message;
 }

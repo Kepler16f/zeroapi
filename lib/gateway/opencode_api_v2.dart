@@ -933,6 +933,27 @@ class OpenCodeUpstreamV2Error extends OpenCodeUpstreamError {
     'freeusagelimiterror',
   };
 
+  /// **上游过载**（推理服务侧容量不足）的结构化类型：provider.rate-limit。
+  ///
+  /// 这类错误**换出口没用**——所有出口最终都打同一个推理服务；CLI 内部
+  /// 退避重试（实测 3 次 / ~30s）后放弃。此时若再换出口轮换，只会在每个
+  /// 死路上白等一轮 90s 看门狗（用户实测「一个你好两分钟没反应」）。
+  /// 正确做法：如实报「上游过载，稍后重试」。
+  static const Set<String> overloadedTypes = {
+    'provider.rate-limit',
+    'provider.overloaded',
+    'overloaded',
+  };
+
+  @override
+  bool get isUpstreamOverloaded {
+    final t = (errorType ?? '').toLowerCase();
+    if (overloadedTypes.contains(t)) return true;
+    final raw = responseBody;
+    if (raw != null && raw.toLowerCase().contains('overloaded')) return true;
+    return super.isUpstreamOverloaded; // 兜底：文案判定
+  }
+
   static bool _quotaType(Object? s) =>
       s != null && quotaTypes.contains(s.toString().toLowerCase());
 
