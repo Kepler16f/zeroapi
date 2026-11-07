@@ -174,6 +174,8 @@ class GatewayService extends ChangeNotifier {
       ProxyPool.pUpstream(OpenCode.id),
       'https://opencode.ai/',
     );
+    // zen 池绑定孤儿自动修复（分组被删过 → 绑定丢了 → 三级轮换被绕过）
+    if (proxies != null) _ensureZenPoolBinding(proxies!);
     // 加密协议节点（ss/vmess/vless/trojan/hysteria2/tuic）交给随包 mihomo：
     // 每个节点一个 127.0.0.1 HTTP listener，端口写回 pool.corePorts。
     await ProxyCore.instance.sync(proxies!);
@@ -961,6 +963,29 @@ class GatewayService extends ChangeNotifier {
         }
         return false;
     }
+  }
+
+  /// zen 池绑定孤儿检查：zen 走池但 `upstream:zen` 的绑定不存在（用户删过
+  /// 分组——removeGroup 会把指向它的用途绑定一起清掉，重新导入不会恢复），
+  /// 且池里**恰好只有一个订阅分组**时，自动重新绑定。没有绑定 = 三级轮换
+  /// 整个被绕过，zen 静默直连家宽（2026-11-07 用户实测「删了重新导入也不行」
+  /// 的直接机制）。多个订阅分组时不猜（让用户在代理页手动选）。
+  void _ensureZenPoolBinding(ProxyPool pool) {
+    final purpose = ProxyPool.pUpstream(OpenCode.id);
+    if (pool.assignments.containsKey(purpose)) return;
+    final rt = _runtimes.where((r) => r.isOpenCode).firstOrNull;
+    if (rt == null || !rt.def.enabled) return;
+    final subs = pool.groups
+        .where((g) => g.sourceUrl.trim().isNotEmpty && g.nodes.isNotEmpty)
+        .toList();
+    if (subs.length != 1) return;
+    pool.assignments[purpose] = subs.single.name;
+    pool.save();
+    server?.log(
+      'Zen 池绑定缺失（分组被删过），已自动重新绑定 → ${subs.single.name}'
+      '（${subs.single.nodes.length} 节点）；如非预期请在代理页修改',
+    );
+    _notify();
   }
 
   /// 机场档是否还有没试过的候选节点（用最近一次测速快照判断，纯内存）。
