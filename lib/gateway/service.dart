@@ -113,7 +113,8 @@ class GatewayService extends ChangeNotifier {
               ((id, retryAfterSeconds, failureKind) => _serializeEgress(
                 () => _rotateZenEgressAndWait(id, retryAfterSeconds, failureKind),
               ))
-          ..onEgressBudgetExhausted = _markZenEgressBudgetExhausted;
+          ..onEgressBudgetExhausted = _markZenEgressBudgetExhausted
+          ..onStaleCli = _restartStaleZenCli;
     try {
       await server!.start();
       running = true;
@@ -1027,6 +1028,23 @@ class GatewayService extends ChangeNotifier {
         }
         return false;
     }
+  }
+
+  /// 停滞看门狗掐掉一轮后**重启 CLI**（出口不变）：CLI 的 provider 连接池
+  /// 里那条半路断流的连接还在，下一个请求复用它 → 又是一句之后卡死。
+  /// 用户实测「第一句对话正常，第二句说了一句话然后卡住」就是这个连锁
+  /// （2026-11-08 装机态：11:01:07 正常 → 11:01:47 卡 180s → 之后一直不健康）。
+  ///
+  /// 后台执行（不拖慢失败响应）；走出口队列，避免和换出口并发重启同一进程。
+  Future<void> _restartStaleZenCli(String upstreamId) async {
+    final rt = _runtimes.where((r) => r.def.id == upstreamId).firstOrNull;
+    if (rt == null || _disposed) return;
+    server?.log('⟳ zen 本轮被看门狗中止，重启 CLI 清理半死连接（出口不变）');
+    await _serializeEgress(() async {
+      if (_disposed) return;
+      await rt.restartChild();
+      await rt.ensure();
+    });
   }
 
   /// zen 池绑定孤儿检查：zen 走池但 `upstream:zen` 的绑定失效（用户删过

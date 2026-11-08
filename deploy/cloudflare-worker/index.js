@@ -44,6 +44,10 @@ const ALLOW = new Set([
   'authorization', 'x-api-key', 'anthropic-version',
   'x-opencode-client', 'x-opencode-project', 'x-opencode-session',
   'x-opencode-session-id', 'x-opencode-request',
+  // CLI 的会话亲和头（2.2.5 实测会带）：上游按它把会话绑到客户端 IP。
+  // 被剥掉时上游要么报 "Client IP address is required for free usage"，
+  // 要么直接挂住不返回（2026-11-08 装机态：第二句对话卡死就是它）。
+  'x-session-affinity', 'x-session-id',
 ]);
 
 const pick = (a) => a[(Math.random() * a.length) | 0];
@@ -96,10 +100,54 @@ export default {
     }
     if (!h.has('x-opencode-request')) h.set('x-opencode-request', msgId());
 
+    // **客户端 IP 必须显式转发**：上游按 client IP 做会话绑定与免费额度
+    // 记账。本 Worker 用显式 headers 构造出站请求 → Cloudflare 运行时
+    // 自动加的 CF-Connecting-IP 不会跟着走，上游看不到 client IP →
+    // 带 session 头的请求要么报 "Client IP address is required for free
+    // usage."，要么直接挂住不返回（2026-11-08 装机态：第二句对话卡死）。
+    // 转发进来时的 cf-connecting-ip（本机→机场节点的真实出口 IP）。
+    const clientIp =
+      request.headers.get('cf-connecting-ip') ||
+      request.headers.get('x-forwarded-for') ||
+      '';
+    if (clientIp) {
+      const ip = clientIp.split(',')[0].trim();
+      // 上游认哪个头不确定（cf-connecting-ip 是 CF 保留头，出站可能被改写），
+      // 常见的几个一起给：宁可多带，也别让上游判成「没有 client IP」。
+      h.set('cf-connecting-ip', ip);
+      h.set('x-forwarded-for', ip);
+      h.set('x-real-ip', ip);
+      h.set('true-client-ip', ip);
+      h.set('x-client-ip', ip);
+    }
+
+    // **剥掉 tools**（2026-11-08 实测）：opencode CLI 每次请求都带 64 个工具
+    // 定义（≈42KB）。带工具的请求，上游会要求「可归属的 client IP」来给
+    // 免费额度记账（代理拿不到 → 上游要么回
+    //   429 "Client IP address is required for free usage."
+    // 要么直接挂住不返回——正是装机态「第一句正常、第二句卡死」的现象）。
+    // 本网关的会话权限是全 deny，工具本来也用不上 → 直接剥掉，
+    // 请求变成普通补全（实测这样上游立刻走正常的额度判定）。
+    let body = request.method === 'GET' || request.method === 'HEAD' ? null : request.body;
+    if (body !== null && (request.headers.get('content-type') || '').includes('json')) {
+      const raw = await request.text();
+      body = raw;
+      try {
+        const j = JSON.parse(raw);
+        if (Array.isArray(j.tools) && j.tools.length) {
+          delete j.tools;
+          delete j.tool_choice;
+          body = JSON.stringify(j);
+        }
+      } catch (_) {
+        // 不是 JSON：原样转发
+      }
+    }
+
     const upstream = await fetch(new Request(target.toString(), {
       method: request.method,
       headers: h,
-      body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
+      body: body,
       redirect: 'follow',
     }));
 

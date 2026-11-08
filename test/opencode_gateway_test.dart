@@ -800,6 +800,11 @@ void main() {
         rotations++;
         return true;
       };
+      var staleCliCalls = 0;
+      proxy.onStaleCli = (_) async {
+        staleCliCalls++;
+      };
+      addTearDown(() => proxy.onStaleCli = null);
       final response = await gw(
         anthropic ? '/v1/messages' : '/v1/chat/completions',
         {
@@ -819,6 +824,9 @@ void main() {
       expect(abortCount, 1);
       expect(messageCount, 1);
       expect(rotations, 0);
+      // 半死连接必须被清理：否则 CLI 的连接池里那条断流连接会被下一个
+      // 请求复用 → 「第一句正常、第二句卡住」的连锁（2026-11-08 装机态）。
+      expect(staleCliCalls, 1, reason: '停滞后应通知上层重启 CLI');
       if (anthropic) {
         expect(raw, contains('event: error'));
         expect(raw, isNot(contains('event: message_stop')));

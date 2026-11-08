@@ -281,6 +281,18 @@ class ProxyServer {
   onEgressBudgetExhausted;
 
   Future<void> Function()? onPrepareOpenCode;
+
+  /// 本轮被**停滞看门狗**掐掉（上游半路断流/挂死）→ 通知上层把 CLI 进程
+  /// 重启一次。
+  ///
+  /// 为什么必须重启：CLI 的 provider 连接池里那条坏连接还在，下一个请求
+  /// 会复用它 → 又是一句之后卡死。用户实测「第一句对话正常，第二句说了
+  /// 一句话然后卡住」就是这个连锁（2026-11-08 装机态：11:01:07 正常、
+  /// 11:01:47 卡 180s，之后 CLI 一直不健康）。
+  ///
+  /// 只在**不换出口**时调用（换出口本来就会重启 CLI）；重启是后台做的，
+  /// 不拖慢这次失败的响应。
+  Future<void> Function(String upstreamId)? onStaleCli;
   void Function()? onOpenCodeFinished;
 
   /// CLI 通路**成功**返回时回调：只有真 opencode CLI 身份才带免费额度，
@@ -1942,6 +1954,12 @@ class ProxyServer {
                 ..onActivity = ((msg) => _log('$publicName · $msg'));
               continue;
             }
+          } else if (e is OpenCodeUpstreamError && e.isStall) {
+            // 停滞看门狗掐掉了这一轮，但**没换出口**（已提交 200 / 已开始
+            // 输出 / 轮次用尽）→ CLI 的 provider 连接池里那条坏连接还在，
+            // 下一个请求会复用它 → 又是一句之后卡死。让上层重启 CLI。
+            // 后台做，不拖慢这次失败的响应。
+            unawaited(onStaleCli?.call(u.id) ?? Future<void>.value());
           }
           rethrow;
         }

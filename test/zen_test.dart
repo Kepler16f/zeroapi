@@ -83,6 +83,15 @@ void main() {
       expect(Zen.isQuotaExhausted('too many requests'), false);
       expect(Zen.isQuotaExhausted('abusive traffic detected'), false);
       expect(Zen.isQuotaExhausted(''), false);
+      // 「这个出口拿不到可归属的 client IP」= 这个出口用不了免费额度
+      // （2026-11-08 实测：经 Worker 且请求带工具时上游的原文）→
+      // 换出口有意义 → 按额度类处理（冷却该出口并轮换）。
+      expect(
+        Zen.isQuotaExhausted(
+          'Client IP address is required for free usage.',
+        ),
+        true,
+      );
     });
   });
 
