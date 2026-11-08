@@ -157,5 +157,31 @@ void main() {
         ZenEgressAction.workerReconnect,
       );
     });
+
+    test('从上次成功的档起步（省掉前面已烧穿的档）', () {
+      // 装机态实测（2026-11-08）：Worker×2 + 机场×3 全是额度耗尽（每个
+      // 12-15s），走完 6 个出口才轮到直连档成功 → 每请求 90s；从上次
+      // 成功的档起步则只要 2s。
+      final plan = ZenEgressPlan(startTier: ZenEgressTier.direct);
+      expect(plan.tier, ZenEgressTier.direct);
+      expect(
+        plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+        ZenEgressAction.direct,
+        reason: '直连档起步时先试直连',
+      );
+      expect(
+        plan.next(lastFailureKind: 'quota', airportHasCandidate: true),
+        ZenEgressAction.exhausted,
+        reason: '直连也失败 = 全部桶耗尽',
+      );
+    });
+
+    test('起步档在冷却中 → 回落到默认顺序', () {
+      final plan = ZenEgressPlan(
+        startTier: ZenEgressTier.worker,
+        skipTiers: {ZenEgressTier.worker},
+      );
+      expect(plan.tier, ZenEgressTier.airport);
+    });
   });
 }

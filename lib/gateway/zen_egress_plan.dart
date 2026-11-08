@@ -35,12 +35,21 @@ enum ZenEgressAction {
 }
 
 class ZenEgressPlan {
-  ZenEgressPlan({this.skipTiers = const {}}) {
+  ZenEgressPlan({this.skipTiers = const {}, ZenEgressTier? startTier}) {
     // 档位冷却：某档刚刚挂死（传输失败）时，本轮直接从下一档起步，
     // 免得每个请求都先在死档上白等一轮 90s 看门狗（用户实测「一个你好
     // 两分钟没反应」= 第一档挂死 → 90s → 才换档）。
     if (skipTiers.contains(ZenEgressTier.worker)) {
       tier = ZenEgressTier.airport;
+    }
+    // **从上次成功的档起步**（优先于上面的默认顺序）：额度按「桶 × 天」计，
+    // 上次成功说明那个桶还有额度，而它前面的档位大概率已经烧穿。
+    // 装机态实测（2026-11-08）：Worker×2 + 机场×3 全是额度耗尽（每个
+    // 要 12-15s 才报错），走完 6 个出口才轮到直连档成功 → 每个请求 90s；
+    // 从上次成功的直连档起步则只要 2s。用户指定的 Worker→机场→直连顺序
+    // 仍然保留为**兜底**次序（这一档失败后依次往下退）。
+    if (startTier != null && !skipTiers.contains(startTier)) {
+      tier = startTier;
     }
   }
 

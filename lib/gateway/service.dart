@@ -388,6 +388,16 @@ class GatewayService extends ChangeNotifier {
   /// 档位冷却时长（挂死后多久再从这档起步）。
   static const _zenTierCooldownSec = 5 * 60;
 
+  /// 本轮的起步档：上次成功的那一档（如果它没在冷却中）。
+  ZenEgressTier? _zenStartTier() {
+    final last = _zenLastOkTier;
+    if (last == null) return null;
+    final tier = ZenEgressTier.values.where((t) => t.name == last).firstOrNull;
+    if (tier == null) return null;
+    if (_zenTierCooldown[tier]?.isAfter(DateTime.now()) == true) return null;
+    return tier;
+  }
+
   /// 当前处于冷却中的档位（已过期的不算）。
   Set<ZenEgressTier> _zenSkippedTiers() {
     final now = DateTime.now();
@@ -464,8 +474,13 @@ class GatewayService extends ChangeNotifier {
 
   Future<void> _prepareZenRequest() async {
     _zenAttemptedNodes.clear();
-    // 每请求重开一轮三档轮换；刚挂死的档位直接跳过（不白等 90s 看门狗）
-    _zenPlan = ZenEgressPlan(skipTiers: _zenSkippedTiers());
+    // 每请求重开一轮三档轮换；刚挂死的档位直接跳过（不白等 90s 看门狗）；
+    // 起步档 = 上次成功的那一档（额度按桶×天计，成功说明那个桶还有额度，
+    // 前面烧穿的档位不必每次重走一遍）。
+    _zenPlan = ZenEgressPlan(
+      skipTiers: _zenSkippedTiers(),
+      startTier: _zenStartTier(),
+    );
     _zenRequestPreparing = true;
     try {
       await _serializeEgress(_prepareZenRequestNow);
@@ -523,7 +538,9 @@ class GatewayService extends ChangeNotifier {
       final candidates = await pool.measuredCandidatesFor(purpose);
       server?.log('Zen 全量测速耗时 ${sw.elapsedMilliseconds}ms，候选 ${candidates.length} 个');
       _zenMeasuredCandidates[rt.id] = candidates;
-      if (candidates.isEmpty) {
+      // 起步档 = 直连（上次成功的就是家宽）时，池里有没有候选都无所谓：
+      // 这一档不走池。不能用「没有出口」把请求掐死。
+      if (candidates.isEmpty && _zenPlan.tier != ZenEgressTier.direct) {
         // 全部候选被剔除时，先看是不是额度冷却造成的——是就按「整池烧穿」
         // 快速失败并附恢复时刻，而不是误导性的「没有出口」。
         final cooldowns = pool.health.values
@@ -561,22 +578,35 @@ class GatewayService extends ChangeNotifier {
       final verified = candidates
           .where((c) => c.nodeId != null && pool.isQuotaOk(c.nodeId!))
           .toList();
-      final selected = verified.isNotEmpty ? verified.first : candidates.first;
+      // 直连档起步时可能一个候选都没有（池全冷却）——那一档不用池。
+      final selected = verified.isNotEmpty
+          ? verified.first
+          : (candidates.isNotEmpty
+                ? candidates.first
+                : const PoolCandidate('', null));
       if (selected.nodeId != null) {
         _zenAttemptedNodes.add(selected.nodeId!);
         _zenCurrentNodeId[rt.id] = selected.nodeId!;
         _zenWorkerTunnelNode[rt.id] = selected.nodeId!;
       }
-      final url = _zenCandidateUrl(selected);
       final startTier = _zenPlan.tier;
+      // 直连档不用任何代理（家宽出口，独立的额度桶）。
+      final url = startTier == ZenEgressTier.direct
+          ? ''
+          : _zenCandidateUrl(selected);
       if (_setZenTierEnv(rt, startTier, url)) {
         await rt.restartChild();
       }
       server?.log(
-        startTier == ZenEgressTier.worker
-            ? 'Zen Worker 档（CF 边缘 IP）→ 隧道 ${selected.nodeId}'
-            : 'Zen 机场档起步 → ${selected.nodeId}'
-                  '（Worker 档冷却中，不再从它起步）',
+        switch (startTier) {
+          ZenEgressTier.worker =>
+            'Zen Worker 档（CF 边缘 IP）→ 隧道 ${selected.nodeId}',
+          ZenEgressTier.airport =>
+            'Zen 机场档起步 → ${selected.nodeId}'
+                '（Worker 档冷却中/上次成功的档位在后面，不再从它起步）',
+          ZenEgressTier.direct =>
+            'Zen 直连档起步（家宽，独立额度桶；Worker/机场档已烧穿或冷却）',
+        },
       );
       await rt.ensure();
     }
