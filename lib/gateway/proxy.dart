@@ -782,7 +782,18 @@ class ProxyServer {
     }
     final u = route.upstream;
     if (u.health != UpstreamHealth.healthy) {
-      final ok = await u.probe();
+      // 进程型供应商（zen 的 opencode CLI）可能**正在重启**：上一次请求
+      // 换了出口就会重启 CLI（~4-5s 起步），紧接着的请求探活必然失败。
+      // 直接 503 会让用户以为服务坏了（实测 2026-11-08：上一个请求刚换完
+      // 出口，下一个请求 4.5s 就吃到 503）。所以先等它就绪，最多 20s。
+      final deadline = DateTime.now().add(const Duration(seconds: 20));
+      var ok = false;
+      while (DateTime.now().isBefore(deadline)) {
+        ok = await u.probe();
+        if (ok) break;
+        await u.ensure();
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+      }
       if (!ok) {
         fail(
           '供应商 ${u.id} 不可用: ${u.lastError ?? "未知"}',
