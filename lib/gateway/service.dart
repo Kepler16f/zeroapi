@@ -418,6 +418,11 @@ class GatewayService extends ChangeNotifier {
   /// 复用同档同出口（成功说明该桶有额度）。
   String? _zenLastOkTier;
 
+  /// 当前的「快速失败」是不是**轮换超时**（预算用尽）而不是真的额度烧穿。
+  /// 两种成因的恢复节奏与文案都不同：超时只锁 5 分钟（池里还有出口没试），
+  /// 额度烧穿按上游给的 retryAfter（≈UTC 零点）。
+  bool _zenExhaustedIsBudget = false;
+
   /// **整池免费额度烧穿**的已知截止时刻（本轮轮换所有出口都报 free-limit 时
   /// 取观测到的最大 retryAfter）。
   ///
@@ -478,13 +483,17 @@ class GatewayService extends ChangeNotifier {
     // 探测负责（_scheduleZenRecoveryProbe），到点自动解除。
     final exhausted = _zenExhaustedUntil;
     if (exhausted != null && DateTime.now().isBefore(exhausted)) {
-      throw ZenQuotaExhausted(
-        'OpenCode 免费额度整池烧穿（共享出口的当日额度被同网络其他用户消耗，'
-        '与你的用量无关），预计 ${exhausted.hour.toString().padLeft(2, '0')}:'
-        '${exhausted.minute.toString().padLeft(2, '0')} 前后恢复；'
-        '期间可改用其他供应商的模型。',
-        exhausted,
-      );
+      final clock =
+          '${exhausted.hour.toString().padLeft(2, '0')}:'
+          '${exhausted.minute.toString().padLeft(2, '0')}';
+      // 两种成因要给不同文案：额度烧穿 vs 轮换超时（后者池里还有出口没试）。
+      final msg = _zenExhaustedIsBudget
+          ? 'OpenCode 出口轮换超时（本轮试过的出口都没能完成请求，池里还有'
+                '出口没试完），约 $clock 前后自动恢复探测；期间请求会快速失败。'
+          : 'OpenCode 免费额度整池烧穿（共享出口的当日额度被同网络其他用户'
+                '消耗，与你的用量无关），预计 $clock 前后恢复；'
+                '期间可改用其他供应商的模型。';
+      throw ZenQuotaExhausted(msg, exhausted);
     }
     if (exhausted != null) _zenExhaustedUntil = null;
     final purpose = ProxyPool.pUpstream(rt.id);
@@ -1138,6 +1147,7 @@ class GatewayService extends ChangeNotifier {
     );
     if (_zenExhaustedUntil == null ||
         _zenExhaustedUntil!.isBefore(DateTime.now())) {
+      _zenExhaustedIsBudget = false;
       _zenExhaustedUntil = until;
       server?.log(
         'Zen 三级通路全部耗尽（Worker→机场→直连），预计 '
@@ -1158,9 +1168,12 @@ class GatewayService extends ChangeNotifier {
     String upstreamId,
     int? retryAfterSeconds,
   ) async {
-    // 预算用尽 ≠ 额度烧穿：常见成因是上游过载/网络抖动（几分钟内就恢复），
-    // 所以默认只锁 5 分钟，后台探测每 4 分钟试一次，恢复了立刻解除。
-    final wait = retryAfterSeconds ?? 5 * 60;
+    // 预算用尽 ≠ 整池烧穿：只是**时间**不够（每轮 40-70s，3 轮就撞到
+    // 150s 墙钟），池里几十个出口根本没试完。上游给的 retryAfter 是
+    // **某一个出口的额度桶**的恢复点（≈UTC 零点），拿它锁全池 = 因噎废食
+    // （实测 2026-11-08：只试了 3 个出口就把网关锁到 01:50，12 小时）。
+    // 所以这里固定锁 5 分钟，后台探测每 4 分钟试一个出口，恢复了立刻解除。
+    const wait = 5 * 60;
     final until = DateTime.now().add(
       Duration(seconds: wait.clamp(60, 12 * 3600)),
     );
@@ -1168,6 +1181,7 @@ class GatewayService extends ChangeNotifier {
         _zenExhaustedUntil!.isAfter(DateTime.now())) {
       return; // 已有更晚的恢复点，保留
     }
+    _zenExhaustedIsBudget = true;
     _zenExhaustedUntil = until;
     server?.log(
       'Zen 换出口预算用尽：本轮三级通路都没能完成请求（可能是上游过载或'
