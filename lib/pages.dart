@@ -2887,10 +2887,32 @@ class _ProxyPoolPageState extends State<ProxyPoolPage> {
   @override
   void initState() {
     super.initState();
-    // 冷却剩余时间按秒重绘，灰显才不会停在加载那一刻
+    // 冷却剩余时间按秒重绘，灰显才不会停在加载那一刻。
+    // **只在真的有倒计时可显示时才整页 setState**：空闲时每秒一帧整页
+    // 重绘是纯浪费（该页是全应用最重的页，60+ 节点列表），连续重绘叠加
+    // 服务层的高频 notify 也是闪烁感来源之一。
     _clock = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      if (!_hasLiveCountdown) return;
+      setState(() {});
     });
+  }
+
+  /// 当前是否有正在倒数的冷却/测速展示（有才需要每秒重绘）。
+  /// 注意多留 2 秒余量：最后一个倒计时归零后还要再刷一帧才能把
+  /// 「冷却中 0s」徽标清掉，否则会停在旧文案直到下一次外部刷新。
+  bool get _hasLiveCountdown {
+    final pool = _pool;
+    if (pool == null) return false;
+    final now = DateTime.now();
+    if (_probingGroup != null) return true;
+    return pool.health.values.any(
+      (h) =>
+          h.failCount >= ProxyPool.failLimit &&
+          h.lastChecked != null &&
+          now.difference(h.lastChecked!) <
+              ProxyPool.cooldown + const Duration(seconds: 2),
+    );
   }
 
   @override

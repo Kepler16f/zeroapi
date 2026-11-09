@@ -34,6 +34,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   flutter::DartProject project(L"data");
 
+  // **禁用 Impeller，回退 Skia**（2026-11-10）：Flutter 3.47 起把 Impeller
+  // 设为 Windows 桌面默认渲染器，随即出现整波「花屏/整窗闪烁/卡顿」的上游
+  // 回归报告（flutter/flutter#191538 macOS 同型、#192915 Linux 同型、社区
+  // Reddit 多例 Windows）。本机 3.47.9 + Windows ARM64（Adreno X1）正好命中
+  // 用户实测「有时花屏闪屏」。Skia 是 3.46 及以前 Windows 的默认渲染器，
+  // 本应用一直跑在它上面；等上游修复后可移除这一行再评估。
+  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);
+
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
 
